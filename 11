@@ -4,6 +4,7 @@ NB version
 No ZINB
 No start_date cut
 With auxiliary pinball calibration loss
+With extra covariates
 """
 
 import torch
@@ -42,16 +43,44 @@ def prepare_data_sample(data_raw1, n_asins=5000):
 
 
 # =====================================================
-# 1. Data Loading
+# 1. Data Loading with extra features
 # =====================================================
 
 def load_real_data(data_raw):
-    df = data_raw[['asin', 'order_week', 'fbi_demand', 'scot_oos']].copy()
-    df.columns = ['ASIN', 'Week', 'Demand', 'OOS']
+    feature_cols = [
+        'promotion_ratio',
+        'our_price',
+        'in_stock_dph',
+        'holiday_indicator_blackfriday',
+        'holiday_indicator_primeweek',
+    ]
+
+    base_cols = [
+        'asin',
+        'order_week',
+        'fbi_demand',
+        'scot_oos'
+    ]
+
+    df = data_raw[base_cols + feature_cols].copy()
+
+    df = df.rename(columns={
+        'asin': 'ASIN',
+        'order_week': 'Week',
+        'fbi_demand': 'Demand',
+        'scot_oos': 'OOS',
+    })
 
     df['Week'] = pd.to_datetime(df['Week'])
     df['Demand'] = df['Demand'].fillna(0).clip(lower=0)
     df['OOS'] = df['OOS'].fillna(0)
+
+    for c in feature_cols:
+        df[c] = pd.to_numeric(df[c], errors='coerce').fillna(0)
+
+    df['promotion_ratio'] = df['promotion_ratio'].clip(lower=0)
+    df['our_price'] = np.log1p(df['our_price'].clip(lower=0))
+    df['in_stock_dph'] = df['in_stock_dph'].clip(lower=0)
 
     df = df.sort_values(['ASIN', 'Week']).reset_index(drop=True)
     df['t'] = ((df['Week'] - df['Week'].min()).dt.days // 7).astype(int)
@@ -78,10 +107,23 @@ def load_real_data(data_raw):
                 last = i
             d_t[i] = (i - last) / 52.0 if last >= 0 else 1.0
 
+        promo_ratio = group['promotion_ratio'].values.astype(float)
+        our_price = group['our_price'].values.astype(float)
+        in_stock = group['in_stock_dph'].values.astype(float)
+        blackfriday = group['holiday_indicator_blackfriday'].values.astype(float)
+        primeweek = group['holiday_indicator_primeweek'].values.astype(float)
+
         features = np.stack([
             v_t,
             b_t,
             d_t,
+
+            promo_ratio,
+            our_price,
+            in_stock,
+            blackfriday,
+            primeweek,
+
             np.sin(2 * np.pi * t / 52),
             np.cos(2 * np.pi * t / 52),
         ], axis=1).astype(np.float32)
@@ -125,10 +167,7 @@ class DemandDataset(Dataset):
                     'x': torch.tensor(features[start:start+history], dtype=torch.float32),
                     'y': torch.tensor(demand[start+history:start+history+horizon], dtype=torch.float32),
                     'asin': asin,
-
-                    # important fix: convert datetime64 to string
                     'target_week': [str(w)[:10] for w in target_weeks],
-
                     'oos': torch.tensor(oos[start+history:start+history+horizon], dtype=torch.float32),
                 })
 
@@ -147,12 +186,7 @@ class CausalConv1d(nn.Module):
     def __init__(self, in_ch, out_ch, kernel_size, dilation):
         super().__init__()
         self.padding = (kernel_size - 1) * dilation
-        self.conv = nn.Conv1d(
-            in_ch,
-            out_ch,
-            kernel_size=kernel_size,
-            dilation=dilation
-        )
+        self.conv = nn.Conv1d(in_ch, out_ch, kernel_size=kernel_size, dilation=dilation)
 
     def forward(self, x):
         return self.conv(F.pad(x, (self.padding, 0)))
@@ -176,7 +210,7 @@ class SparseAttention(nn.Module):
 
 
 class TCNSparseAttnEncoder(nn.Module):
-    def __init__(self, input_dim=5, d_model=32, horizon=20):
+    def __init__(self, input_dim=10, d_model=32, horizon=20):
         super().__init__()
 
         self.horizon = horizon
@@ -277,26 +311,14 @@ class Epinet(nn.Module):
 # =====================================================
 
 class TCN_ENN(nn.Module):
-    def __init__(
-        self,
-        input_dim=5,
-        d_model=32,
-        d_z=16,
-        horizon=20,
-        prior_scale=0.3
-    ):
+    def __init__(self, input_dim=10, d_model=32, d_z=16, horizon=20, prior_scale=0.3):
         super().__init__()
 
         self.d_z = d_z
         self.horizon = horizon
 
         self.encoder = TCNSparseAttnEncoder(input_dim, d_model, horizon)
-        self.epinet = Epinet(
-            d_phi=d_model,
-            d_z=d_z,
-            horizon=horizon,
-            prior_scale=prior_scale
-        )
+        self.epinet = Epinet(d_phi=d_model, d_z=d_z, horizon=horizon, prior_scale=prior_scale)
 
     def forward(self, x, nZ=8):
         mu_base, alpha_base, h_t = self.encoder(x)
@@ -401,8 +423,10 @@ def train(model, tr_ld, va_ld, epochs=10, nZ=8, lr=1e-3, lambda_q=0.05):
                 for mu, alpha in preds
             ) / nZ
 
-            # differentiable quantile calibration over ENN mu samples
-            mu_stack = torch.stack([mu for mu, alpha in preds], dim=1)  # [B, nZ, H]
+            mu_stack = torch.stack(
+                [mu for mu, alpha in preds],
+                dim=1
+            )
 
             p50_train = mu_stack.quantile(0.5, dim=1)
             p70_train = mu_stack.quantile(0.7, dim=1)
@@ -578,7 +602,7 @@ def main(
     M_eval=50,
     lambda_q=0.05
 ):
-    print("TCN + SparseAttn + ENN | NB + Pinball Calibration")
+    print("TCN + SparseAttn + ENN | NB + Extra Features")
     print("=" * 60)
 
     data = load_real_data(data_raw1)
@@ -618,7 +642,7 @@ def main(
     print(f"Train samples: {len(tr_ld.dataset)} | Val samples: {len(va_ld.dataset)}")
 
     model = TCN_ENN(
-        input_dim=5,
+        input_dim=10,
         d_model=d_model,
         d_z=d_z,
         horizon=horizon,
