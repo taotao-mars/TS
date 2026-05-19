@@ -6,6 +6,7 @@ No start_date cut
 With auxiliary pinball calibration loss
 History encoder uses original 5 features
 Extra 4 covariates are used only to generate conditional z
+No Prime Week feature
 """
 
 import torch
@@ -52,12 +53,12 @@ def prepare_data_sample(data_raw1, n_asins=5000):
 
 def load_real_data(data_raw):
     # 4 extra features used only for conditional z
-    # Black Friday is intentionally excluded
+    # Prime Week is intentionally excluded
     context_cols = [
         'promotion_ratio',
         'our_price',
         'in_stock_dph',
-        'holiday_indicator_primeweek',
+        'holiday_indicator_blackfriday',
     ]
 
     base_cols = [
@@ -86,7 +87,7 @@ def load_real_data(data_raw):
     df['promotion_ratio'] = df['promotion_ratio'].clip(lower=0)
     df['our_price'] = np.log1p(df['our_price'].clip(lower=0))
     df['in_stock_dph'] = df['in_stock_dph'].clip(lower=0)
-    df['holiday_indicator_primeweek'] = df['holiday_indicator_primeweek'].clip(lower=0)
+    df['holiday_indicator_blackfriday'] = df['holiday_indicator_blackfriday'].clip(lower=0)
 
     df = df.sort_values(['ASIN', 'Week']).reset_index(drop=True)
     df['t'] = ((df['Week'] - df['Week'].min()).dt.days // 7).astype(int)
@@ -127,7 +128,7 @@ def load_real_data(data_raw):
             group['promotion_ratio'].values.astype(float),
             group['our_price'].values.astype(float),
             group['in_stock_dph'].values.astype(float),
-            group['holiday_indicator_primeweek'].values.astype(float),
+            group['holiday_indicator_blackfriday'].values.astype(float),
         ], axis=1).astype(np.float32)
 
         data[asin] = {
