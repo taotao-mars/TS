@@ -1,0 +1,574 @@
+"""
+TCN + SparseAttn + ENN + ZINB
+Sparse Demand Forecasting
+Zero-Inflated NegBin to reduce underbias
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+import pandas as pd
+from torch.utils.data import Dataset, DataLoader
+
+torch.manual_seed(42)
+np.random.seed(42)
+
+
+# =====================================================
+# 0. Optional: Cut recent data + sample ASINs
+# =====================================================
+
+def prepare_data_sample(data_raw1, start_date='2024-10-01', n_asins=5000):
+    data_raw1 = data_raw1.copy()
+    data_raw1['order_week'] = pd.to_datetime(data_raw1['order_week'])
+
+    data_recent = data_raw1[data_raw1['order_week'] >= start_date].copy()
+
+    sample_asins = np.random.choice(
+        data_recent['asin'].unique(),
+        size=min(n_asins, data_recent['asin'].nunique()),
+        replace=False
+    )
+
+    data_small = data_recent[data_recent['asin'].isin(sample_asins)].copy()
+
+    print("Recent rows:", len(data_recent))
+    print("Sample ASINs:", data_small['asin'].nunique())
+    print("Sample rows:", len(data_small))
+
+    return data_small
+
+
+# =====================================================
+# 1. Data Loading
+# =====================================================
+
+def load_real_data(data_raw):
+    df = data_raw[['asin', 'order_week', 'fbi_demand', 'scot_oos']].copy()
+    df.columns = ['ASIN', 'Week', 'Demand', 'OOS']
+
+    df['Week']   = pd.to_datetime(df['Week'])
+    df['Demand'] = df['Demand'].fillna(0).clip(lower=0)
+    df['OOS']    = df['OOS'].fillna(0)
+
+    df = df.sort_values(['ASIN', 'Week']).reset_index(drop=True)
+    df['t'] = ((df['Week'] - df['Week'].min()).dt.days // 7).astype(int)
+
+    data = {}
+
+    for asin, group in df.groupby('ASIN'):
+        group  = group.reset_index(drop=True)
+        demand = group['Demand'].values.astype(float)
+        oos    = group['OOS'].values.astype(float)
+        weeks  = group['Week'].values
+        t      = group['t'].values
+        T      = len(demand)
+
+        v_t  = np.log1p(demand)
+        b_t  = (demand > 0).astype(float)
+        d_t  = np.zeros(T)
+        last = -1
+
+        for i in range(T):
+            if b_t[i] > 0:
+                last = i
+            d_t[i] = (i - last) / 52.0 if last >= 0 else 1.0
+
+        features = np.stack([
+            v_t,
+            b_t,
+            d_t,
+            np.sin(2 * np.pi * t / 52),
+            np.cos(2 * np.pi * t / 52),
+        ], axis=1).astype(np.float32)
+
+        data[asin] = {
+            'features': features,
+            'demand':   demand.astype(np.float32),
+            'week':     weeks,
+            'oos':      oos.astype(np.float32),
+        }
+
+    return data
+
+
+# =====================================================
+# 2. Dataset
+# =====================================================
+
+class DemandDataset(Dataset):
+    def __init__(self, data, history=52, horizon=20, mode='train', val_weeks=20):
+        self.samples = []
+
+        for asin, d in data.items():
+            features = d['features']
+            demand   = d['demand']
+            weeks    = d['week']
+            oos      = d['oos']
+            T        = len(demand)
+
+            if mode == 'train':
+                max_start = T - val_weeks - horizon - history + 1
+                starts    = range(max(0, max_start))
+            else:
+                start  = T - history - horizon
+                starts = [start] if start >= 0 else []
+
+            for start in starts:
+                self.samples.append({
+                    'x':           torch.tensor(features[start:start+history], dtype=torch.float32),
+                    'y':           torch.tensor(demand[start+history:start+history+horizon], dtype=torch.float32),
+                    'asin':        asin,
+                    'target_week': weeks[start+history:start+history+horizon],
+                    'oos':         torch.tensor(oos[start+history:start+history+horizon], dtype=torch.float32),
+                })
+
+    def __len__(self):        return len(self.samples)
+    def __getitem__(self, i): return self.samples[i]
+
+
+# =====================================================
+# 3. Encoder  (TCN + SparseAttention)
+# =====================================================
+
+class CausalConv1d(nn.Module):
+    def __init__(self, in_ch, out_ch, kernel_size, dilation):
+        super().__init__()
+        self.padding = (kernel_size - 1) * dilation
+        self.conv    = nn.Conv1d(in_ch, out_ch, kernel_size=kernel_size, dilation=dilation)
+
+    def forward(self, x):
+        return self.conv(F.pad(x, (self.padding, 0)))
+
+
+class SparseAttention(nn.Module):
+    def __init__(self, d_model=32, n_heads=4):
+        super().__init__()
+        self.attn = nn.MultiheadAttention(d_model, n_heads, batch_first=True, dropout=0.1)
+        self.norm = nn.LayerNorm(d_model)
+
+    def forward(self, x, b_t):
+        mask = (b_t == 0) & ~(b_t == 0).all(dim=1, keepdim=True)
+        out, _ = self.attn(x, x, x, key_padding_mask=mask)
+        return self.norm(x + out)
+
+
+class TCNSparseAttnEncoder(nn.Module):
+    """
+    Three output heads for Zero-Inflated NegBin (ZINB):
+      mu    [B, H]: NegBin mean
+      alpha [B, H]: NegBin dispersion
+      pi    [B, H]: zero-inflation probability P(demand=0 | regime)
+    """
+    def __init__(self, input_dim=5, d_model=32, horizon=20):
+        super().__init__()
+        self.horizon    = horizon
+        self.input_proj = nn.Linear(input_dim, d_model)
+
+        dilations  = [1, 2, 3, 4, 8, 26, 52]
+        self.convs = nn.ModuleList([CausalConv1d(d_model, d_model, 2, d) for d in dilations])
+        self.norms = nn.ModuleList([nn.LayerNorm(d_model) for _ in dilations])
+
+        self.sparse_attn = SparseAttention(d_model, n_heads=4)
+        self.final_norm  = nn.LayerNorm(d_model)
+
+        self.base_head = nn.Sequential(nn.Linear(d_model, 64), nn.ReLU(), nn.Linear(64, horizon))
+        self.alpha_head = nn.Sequential(nn.Linear(d_model, 64), nn.ReLU(), nn.Linear(64, horizon))
+        # ZINB: zero-inflation probability head
+        self.pi_head   = nn.Sequential(nn.Linear(d_model, 64), nn.ReLU(), nn.Linear(64, horizon))
+
+    def forward(self, x):
+        b_t = x[:, :, 1]
+        h   = self.input_proj(x).permute(0, 2, 1)
+
+        for conv, norm in zip(self.convs, self.norms):
+            h = conv(h) + h
+            h = F.gelu(norm(h.permute(0, 2, 1))).permute(0, 2, 1)
+
+        h   = self.sparse_attn(h.permute(0, 2, 1), b_t)
+        h_t = self.final_norm(h[:, -1, :])
+
+        mu    = F.softplus(self.base_head(h_t))
+        alpha = F.softplus(self.alpha_head(h_t)) + 1e-4
+        pi    = torch.sigmoid(self.pi_head(h_t))   # [B, H] in (0,1)
+
+        return mu, alpha, pi, h_t
+
+
+# =====================================================
+# 4. Epinet  (ProjectedMLP, Osband et al. Eq.6)
+#    Output: corrections for (mu, alpha, pi) -> 3H total
+# =====================================================
+
+class Epinet(nn.Module):
+    def __init__(self, d_phi=32, d_z=16, horizon=20, prior_scale=0.3):
+        super().__init__()
+        self.d_z         = d_z
+        self.horizon     = horizon
+        self.prior_scale = prior_scale
+
+        # 3H: mu_correction, alpha_correction, pi_correction
+        self.learnable = nn.Sequential(
+            nn.Linear(d_z + d_phi, 64),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(64, 3 * horizon * d_z),
+        )
+        self.prior = nn.Sequential(
+            nn.Linear(d_z + d_phi, 64),
+            nn.ReLU(),
+            nn.Linear(64, 3 * horizon * d_z),
+        )
+        for p in self.prior.parameters():
+            p.requires_grad = False
+
+    def forward(self, phi, z):
+        inp = torch.cat([z, phi], dim=-1)
+
+        sl = self.learnable(inp).view(-1, 3*self.horizon, self.d_z)
+        sl = torch.einsum('bhd,bd->bh', sl, z)
+
+        sp = self.prior(inp).view(-1, 3*self.horizon, self.d_z)
+        sp = torch.einsum('bhd,bd->bh', sp, z) * self.prior_scale
+
+        out = sl + sp   # [B, 3H]
+        return out[:, :self.horizon], out[:, self.horizon:2*self.horizon], out[:, 2*self.horizon:]
+
+
+# =====================================================
+# 5. Full Model  (TCN_ENN with ZINB)
+# =====================================================
+
+class TCN_ENN(nn.Module):
+    def __init__(self, input_dim=5, d_model=32, d_z=16, horizon=20, prior_scale=0.3):
+        super().__init__()
+        self.d_z     = d_z
+        self.horizon = horizon
+        self.encoder = TCNSparseAttnEncoder(input_dim, d_model, horizon)
+        self.epinet  = Epinet(d_phi=d_model, d_z=d_z, horizon=horizon, prior_scale=prior_scale)
+
+    def forward(self, x, nZ=8):
+        mu_base, alpha_base, pi_base, h_t = self.encoder(x)
+        phi = h_t.detach()
+
+        preds = []
+        for _ in range(nZ):
+            z = torch.randn(x.shape[0], self.d_z, device=x.device)
+            mu_e, al_e, pi_e = self.epinet(phi, z)
+            mu    = F.softplus(mu_base + mu_e)
+            alpha = F.softplus(alpha_base + al_e) + 1e-4
+            pi    = torch.sigmoid(pi_base + pi_e)
+            preds.append((mu, alpha, pi))
+        return preds
+
+    def predict(self, x, M=50):
+        """
+        ZINB sampling:
+          with prob pi    -> demand = 0   (zero-inflation)
+          with prob 1-pi  -> demand ~ NegBin(mu, alpha)
+        z fixed across 20 weeks -> Joint prediction.
+        """
+        self.eval()
+        with torch.no_grad():
+            mu_base, alpha_base, pi_base, h_t = self.encoder(x)
+            phi = h_t.detach()
+            samples = []
+
+            for _ in range(M):
+                z = torch.randn(x.shape[0], self.d_z, device=x.device)
+                mu_e, al_e, pi_e = self.epinet(phi, z)
+                mu    = F.softplus(mu_base + mu_e)
+                alpha = F.softplus(alpha_base + al_e) + 1e-4
+                pi    = torch.sigmoid(pi_base + pi_e)
+
+                # NegBin sample
+                nb = torch.distributions.NegativeBinomial(
+                    total_count=(1.0 / alpha).clamp(min=1e-4),
+                    probs=(mu * alpha / (1 + mu * alpha)).clamp(1e-6, 1 - 1e-6),
+                )
+                nb_sample = nb.sample().float()
+
+                # Zero-inflation: Bernoulli(pi) -> 0
+                zero_mask = torch.bernoulli(pi).bool()
+                sample    = torch.where(zero_mask, torch.zeros_like(nb_sample), nb_sample)
+                samples.append(sample)
+
+            samples = torch.stack(samples, dim=1)   # [B, M, H]
+            p50 = samples.quantile(0.5, dim=1)
+            p70 = samples.quantile(0.7, dim=1)
+            p70 = torch.maximum(p70, p50)
+
+        return p50, p70
+
+
+# =====================================================
+# 6. Loss & Metrics
+# =====================================================
+
+def zinb_nll(y, mu, alpha, pi):
+    """
+    Zero-Inflated NegBin NLL.
+    P(y=0) = pi + (1-pi) * NegBin(0 | mu, alpha)
+    P(y>0) = (1-pi) * NegBin(y | mu, alpha)
+    """
+    eps = 1e-6
+    r   = (1.0 / alpha).clamp(min=eps)
+    p   = (mu * alpha / (1 + mu * alpha)).clamp(eps, 1 - eps)
+    pi  = pi.clamp(eps, 1 - eps)
+
+    nb_logp = (torch.lgamma(y + r) - torch.lgamma(r) - torch.lgamma(y + 1)
+               + r * torch.log(1 - p) + y * torch.log(p))
+
+    zero_mask   = (y == 0)
+    log_p_zero    = torch.log(pi + (1 - pi) * torch.exp(r * torch.log(1 - p)))
+    log_p_nonzero = torch.log(1 - pi + eps) + nb_logp
+
+    nll = -torch.where(zero_mask, log_p_zero, log_p_nonzero)
+    return nll.mean()
+
+
+def pinball(y, pred, q):
+    d = y - pred
+    return torch.mean(torch.max(q * d, (q - 1) * d))
+
+
+# =====================================================
+# 7. Training
+# =====================================================
+
+def train(model, tr_ld, va_ld, epochs=10, nZ=8, lr=1e-3):
+    opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
+    sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
+
+    best_val = float('inf')
+    best_sd  = None
+
+    for epoch in range(epochs):
+        model.train()
+        tr_loss = 0.0
+
+        for b in tr_ld:
+            x, y  = b['x'], b['y']
+            preds = model(x, nZ=nZ)
+            loss  = sum(zinb_nll(y, mu, alpha, pi) for mu, alpha, pi in preds) / nZ
+
+            opt.zero_grad()
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step()
+            tr_loss += loss.item()
+
+        sch.step()
+
+        model.eval()
+        vl = 0.0
+        with torch.no_grad():
+            for b in va_ld:
+                p50, p70 = model.predict(b['x'], M=30)
+                vl += (pinball(b['y'], p50, 0.5) + pinball(b['y'], p70, 0.7)).item()
+
+        vl /= max(1, len(va_ld))
+
+        if vl < best_val:
+            best_val = vl
+            best_sd  = {k: v.clone() for k, v in model.state_dict().items()}
+
+        print(f"Epoch {epoch+1:3d} | train={tr_loss/max(1,len(tr_ld)):.4f} | val={vl:.4f}")
+
+    if best_sd is not None:
+        model.load_state_dict(best_sd)
+
+    print(f"Best val: {best_val:.4f}")
+
+
+# =====================================================
+# 8. Evaluation
+# =====================================================
+
+def evaluate(model, va_ld, M=100):
+    all_y, all_p50, all_p70 = [], [], []
+    model.eval()
+
+    with torch.no_grad():
+        for b in va_ld:
+            p50, p70 = model.predict(b['x'], M=M)
+            all_y.append(b['y'].numpy())
+            all_p50.append(p50.numpy())
+            all_p70.append(p70.numpy())
+
+    y   = np.concatenate(all_y)
+    p50 = np.concatenate(all_p50)
+    p70 = np.concatenate(all_p70)
+    yt  = torch.tensor(y)
+
+    pl50 = pinball(yt, torch.tensor(p50), 0.5).item()
+    pl70 = pinball(yt, torch.tensor(p70), 0.7).item()
+    return pl50, pl70
+
+
+def hist_mean_baseline(va_ld):
+    all_y, all_hm = [], []
+    for b in va_ld:
+        y         = b['y']
+        hist_mean = (b['x'][:, :, 0].exp() - 1).mean(dim=1, keepdim=True).clamp(min=0)
+        all_y.append(y)
+        all_hm.append(hist_mean.expand_as(y))
+
+    y_all  = torch.cat(all_y)
+    hm_all = torch.cat(all_hm)
+    hm50   = pinball(y_all, hm_all, 0.5).item()
+    hm70   = pinball(y_all, hm_all * 1.25, 0.7).item()
+    return hm50, hm70
+
+
+def generate_forecast_df(model, va_ld, M=50):
+    rows = []
+    model.eval()
+
+    with torch.no_grad():
+        for b in va_ld:
+            x   = b['x']
+            y   = b['y']
+            oos = b['oos']
+
+            p50, p70 = model.predict(x, M=M)
+
+            hist_mean = (x[:, :, 0].exp() - 1).mean(dim=1, keepdim=True).clamp(min=0)
+            hm50 = hist_mean.expand_as(y)
+            hm70 = hm50 * 1.25
+
+            batch_size = y.shape[0]
+            horizon    = y.shape[1]
+
+            for i in range(batch_size):
+                asin_i = b['asin'][i]
+                for h in range(horizon):
+                    week_ih = b['target_week'][h][i]
+                    rows.append({
+                        'asin':            asin_i,
+                        'order_week':      pd.to_datetime(week_ih),
+                        'fcst_week_index': h + 1,
+                        'fbi_demand':      y[i, h].item(),
+                        'scot_oos':        oos[i, h].item(),
+                        'oos':             oos[i, h].item(),
+                        'oos_status':      oos[i, h].item(),
+                        'p50_amxl':        p50[i, h].item(),
+                        'p70_amxl':        p70[i, h].item(),
+                        'p50_scot':        hm50[i, h].item(),
+                        'p70_scot':        hm70[i, h].item(),
+                    })
+
+    return pd.DataFrame(rows)
+
+
+# =====================================================
+# 9. Main
+# =====================================================
+
+def main(
+    data_raw1,
+    prior_scale=0.3,
+    epochs=10,
+    history=52,
+    horizon=20,
+    d_model=32,
+    d_z=16,
+    batch_size=64,
+    M_eval=50
+):
+    print("TCN + SparseAttn + ENN (ZINB) | Sparse Demand Forecasting")
+    print("=" * 60)
+
+    data       = load_real_data(data_raw1)
+    all_demand = np.concatenate([d['demand'] for d in data.values()])
+
+    print(f"ASINs: {len(data)}")
+    print(f"Zero rate: {(all_demand == 0).mean():.1%}")
+
+    tr_ld = DataLoader(
+        DemandDataset(data, history=history, horizon=horizon, mode='train', val_weeks=horizon),
+        batch_size=batch_size, shuffle=True)
+    va_ld = DataLoader(
+        DemandDataset(data, history=history, horizon=horizon, mode='val', val_weeks=horizon),
+        batch_size=batch_size, shuffle=False)
+
+    print(f"Train samples: {len(tr_ld.dataset)} | Val samples: {len(va_ld.dataset)}")
+
+    model    = TCN_ENN(input_dim=5, d_model=d_model, d_z=d_z, horizon=horizon, prior_scale=prior_scale)
+    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Trainable params: {n_params:,}")
+    print(f"d_model: {d_model} | d_z: {d_z} | prior_scale: {prior_scale}")
+
+    print("\nTraining (ZINB NLL)...")
+    train(model, tr_ld, va_ld, epochs=epochs, nZ=8, lr=1e-3)
+
+    pl50, pl70 = evaluate(model, va_ld, M=100)
+    hm50, hm70 = hist_mean_baseline(va_ld)
+
+    print(f"\n{'Method':<20} {'Pinball-50':>12} {'Pinball-70':>12}")
+    print("-" * 46)
+    print(f"{'HistMean':<20} {hm50:>12.4f} {hm70:>12.4f}")
+    print(f"{'ENN (ZINB)':<20} {pl50:>12.4f} {pl70:>12.4f}")
+    print(f"{'ENN vs HistMean':<20} {(hm50-pl50)/hm50*100:>+11.1f}% {(hm70-pl70)/hm70*100:>+11.1f}%")
+
+    forecast_df = generate_forecast_df(model, va_ld, M=M_eval)
+    print("\nForecast dataframe preview:")
+    print(forecast_df.head())
+    print(f"Forecast rows: {len(forecast_df)}")
+
+    return model, forecast_df, tr_ld, va_ld
+
+
+# =====================================================
+# 10. Run
+# =====================================================
+
+# Step 1: recent data + sample
+data_small = prepare_data_sample(
+    data_raw1,
+    start_date='2024-10-01',
+    n_asins=5000
+)
+
+# Step 2: train model
+model, forecast_df, tr_ld, va_ld = main(
+    data_small,
+    prior_scale=0.3,
+    epochs=10,
+    history=52,
+    horizon=20,
+    d_model=32,
+    d_z=16,
+    batch_size=64,
+    M_eval=50
+)
+
+# Step 3: WAPE (using your existing functions)
+quantiles = [0.5, 0.7]
+
+wape_df = calculate_wape_using_lp_oos2(
+    forecast_df,
+    quantiles,
+    remove_oos_dp=True,
+    source='lp'
+)
+
+cols_p50 = ['p50_amxl_penalty', 'p50_scot_penalty',
+            'p50_amxl_overbias', 'p50_scot_overbias',
+            'p50_amxl_underbias', 'p50_scot_underbias', 'fbi_demand']
+
+cols_p70 = ['p70_amxl_penalty', 'p70_scot_penalty',
+            'p70_amxl_overbias', 'p70_scot_overbias',
+            'p70_amxl_underbias', 'p70_scot_underbias', 'fbi_demand']
+
+p50_wape, p50_penalty_diff = quick_error_check(wape_df, cols_p50)
+p70_wape, p70_penalty_diff = quick_error_check(wape_df, cols_p70)
+
+print("\nP50 WAPE / Penalty Summary:")
+print(p50_wape)
+print("P50 penalty diff:", p50_penalty_diff)
+
+print("\nP70 WAPE / Penalty Summary:")
+print(p70_wape)
+print("P70 penalty diff:", p70_penalty_diff)
