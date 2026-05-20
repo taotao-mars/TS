@@ -4,9 +4,8 @@ NB version
 No ZINB
 No start_date cut
 With auxiliary pinball calibration loss
-History encoder uses original 5 features
-Extra 4 covariates are used only to generate conditional z
-No Prime Week feature
+History encoder uses original 5 time-series features
+Conditional z context uses product/category/review/AMXL/holiday features
 """
 
 import torch
@@ -47,19 +46,51 @@ def prepare_data_sample(data_raw1, n_asins=5000):
 
 # =====================================================
 # 1. Data Loading
-#    Encoder: original 5 history features
-#    Context z-generator: 4 extra future covariates
+#    Encoder: original 5 time-series history features
+#    Conditional z context: product/category/review/AMXL/holiday features
 # =====================================================
 
+def _safe_numeric(df, col, default=0.0):
+    if col not in df.columns:
+        df[col] = default
+    df[col] = pd.to_numeric(df[col], errors='coerce').fillna(default)
+    return df
+
+
+def _safe_category_code(df, col):
+    if col not in df.columns:
+        df[col] = 'missing'
+    df[col] = df[col].astype(str).fillna('missing')
+    df[col] = df[col].astype('category').cat.codes.astype(float)
+    return df
+
+
 def load_real_data(data_raw):
-    # 4 extra features used only for conditional z
-    # Prime Week is intentionally excluded
-    context_cols = [
-        'promotion_ratio',
-        'our_price',
-        'in_stock_dph',
+    # Context features used only for conditional z.
+    # These do NOT enter the history encoder.
+    numeric_context_cols = [
+        'age_asin_birthday',
+        'asin_name_wordcount',
+        'customer_review_count',
+        'ind_amxl_hb',
+        'distance_blackfriday',
         'holiday_indicator_blackfriday',
+        'distance_christmasday',
+        'holiday_indicator_christmasday',
+        'distance_cybermonday',
+        'holiday_indicator_cybermonday',
+        'distance_primeday',
+        'holiday_indicator_primeday',
+        'distance_thanksgivingday',
+        'holiday_indicator_thanksgivingday',
     ]
+
+    categorical_context_cols = [
+        'category_code',
+        'gl_product_group',
+    ]
+
+    context_cols = numeric_context_cols + categorical_context_cols
 
     base_cols = [
         'asin',
@@ -68,7 +99,8 @@ def load_real_data(data_raw):
         'scot_oos'
     ]
 
-    df = data_raw[base_cols + context_cols].copy()
+    keep_cols = [c for c in base_cols + context_cols if c in data_raw.columns]
+    df = data_raw[keep_cols].copy()
 
     df = df.rename(columns={
         'asin': 'ASIN',
@@ -81,13 +113,51 @@ def load_real_data(data_raw):
     df['Demand'] = df['Demand'].fillna(0).clip(lower=0)
     df['OOS'] = df['OOS'].fillna(0)
 
-    for c in context_cols:
-        df[c] = pd.to_numeric(df[c], errors='coerce').fillna(0)
+    for c in numeric_context_cols:
+        df = _safe_numeric(df, c, default=0.0)
 
-    df['promotion_ratio'] = df['promotion_ratio'].clip(lower=0)
-    df['our_price'] = np.log1p(df['our_price'].clip(lower=0))
-    df['in_stock_dph'] = df['in_stock_dph'].clip(lower=0)
-    df['holiday_indicator_blackfriday'] = df['holiday_indicator_blackfriday'].clip(lower=0)
+    for c in categorical_context_cols:
+        df = _safe_category_code(df, c)
+
+    # Basic stabilization for skewed nonnegative count/age features
+    log_context_cols = [
+        'age_asin_birthday',
+        'asin_name_wordcount',
+        'customer_review_count',
+    ]
+
+    for c in log_context_cols:
+        df[c] = np.log1p(df[c].clip(lower=0))
+
+    # Clip binary/business indicators and holiday indicators
+    indicator_cols = [
+        'ind_amxl_hb',
+        'holiday_indicator_blackfriday',
+        'holiday_indicator_christmasday',
+        'holiday_indicator_cybermonday',
+        'holiday_indicator_primeday',
+        'holiday_indicator_thanksgivingday',
+    ]
+
+    for c in indicator_cols:
+        df[c] = df[c].clip(lower=0, upper=1)
+
+    # Distance features: keep nonnegative and mildly scaled
+    distance_cols = [
+        'distance_blackfriday',
+        'distance_christmasday',
+        'distance_cybermonday',
+        'distance_primeday',
+        'distance_thanksgivingday',
+    ]
+
+    for c in distance_cols:
+        df[c] = df[c].clip(lower=0) / 52.0
+
+    # Simple scaling for label-encoded categorical columns
+    for c in categorical_context_cols:
+        denom = max(df[c].max(), 1.0)
+        df[c] = df[c] / denom
 
     df = df.sort_values(['ASIN', 'Week']).reset_index(drop=True)
     df['t'] = ((df['Week'] - df['Week'].min()).dt.days // 7).astype(int)
@@ -114,7 +184,7 @@ def load_real_data(data_raw):
                 last = i
             d_t[i] = (i - last) / 52.0 if last >= 0 else 1.0
 
-        # Original 5 features for history encoder
+        # Original 5 time-series features for history encoder
         features = np.stack([
             v_t,
             b_t,
@@ -123,13 +193,8 @@ def load_real_data(data_raw):
             np.cos(2 * np.pi * t / 52),
         ], axis=1).astype(np.float32)
 
-        # 4 future covariates for conditional z only
-        future_context = np.stack([
-            group['promotion_ratio'].values.astype(float),
-            group['our_price'].values.astype(float),
-            group['in_stock_dph'].values.astype(float),
-            group['holiday_indicator_blackfriday'].values.astype(float),
-        ], axis=1).astype(np.float32)
+        # Conditional z context only
+        future_context = group[context_cols].values.astype(np.float32)
 
         data[asin] = {
             'features': features,
@@ -138,6 +203,11 @@ def load_real_data(data_raw):
             'week': weeks,
             'oos': oos.astype(np.float32),
         }
+
+    print(f"History encoder dim: 5")
+    print(f"Conditional z context dim: {len(context_cols)}")
+    print("Conditional z context columns:")
+    print(context_cols)
 
     return data
 
@@ -369,7 +439,7 @@ class TCN_ENN(nn.Module):
     def __init__(
         self,
         input_dim=5,
-        context_dim=4,
+        context_dim=16,
         d_model=32,
         d_z=16,
         horizon=20,
@@ -705,7 +775,7 @@ def main(
     M_eval=50,
     lambda_q=0.05
 ):
-    print("TCN + SparseAttn + ENN | NB + Conditional Z Context")
+    print("TCN + SparseAttn + ENN | NB + Rich Conditional Z Context")
     print("=" * 60)
 
     data = load_real_data(data_raw1)
@@ -746,7 +816,7 @@ def main(
 
     model = TCN_ENN(
         input_dim=5,
-        context_dim=4,
+        context_dim=16,
         d_model=d_model,
         d_z=d_z,
         horizon=horizon,
