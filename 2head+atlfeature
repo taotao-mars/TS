@@ -636,8 +636,8 @@ def train(
     nZ=8,
     lr=1e-3,
     lambda_q=0.05,
-    lambda_occ=0.05,
-    lambda_mag=0.02
+    lambda_occ=0.08,
+    lambda_mag=0.01
 ):
     opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
     sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
@@ -862,8 +862,8 @@ def main(
     batch_size=64,
     M_eval=50,
     lambda_q=0.05,
-    lambda_occ=0.05,
-    lambda_mag=0.02
+    lambda_occ=0.08,
+    lambda_mag=0.01
 ):
     print("TCN + SparseAttn + ENN | Hurdle NB + Conditional Z Context | No future in_stock_dph")
     print("=" * 60)
@@ -981,8 +981,8 @@ model, forecast_df, tr_ld, va_ld = main(
     batch_size=64,
     M_eval=50,
     lambda_q=0.05,
-    lambda_occ=0.05,
-    lambda_mag=0.02
+    lambda_occ=0.08,
+    lambda_mag=0.01
 )
 
 
