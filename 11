@@ -5,7 +5,9 @@ No ZINB
 No start_date cut
 With auxiliary pinball calibration loss
 History encoder uses original 5 time-series features
-Conditional z context uses product/category/review/AMXL/holiday features
+Conditional z context uses numeric product/review/AMXL/holiday features
+Categorical category_code / gl_product_group use embeddings
+Conditional z uses small KL regularization
 """
 
 import torch
@@ -57,12 +59,14 @@ def _safe_numeric(df, col, default=0.0):
     return df
 
 
-def _safe_category_code(df, col):
+def _safe_category_id(df, col):
     if col not in df.columns:
         df[col] = 'missing'
     df[col] = df[col].astype(str).fillna('missing')
-    df[col] = df[col].astype('category').cat.codes.astype(float)
-    return df
+    codes = df[col].astype('category').cat.codes.astype(int)
+    num_classes = int(codes.max()) + 1 if len(codes) > 0 else 1
+    df[col + '_id'] = codes
+    return df, num_classes
 
 
 def load_real_data(data_raw):
@@ -90,7 +94,9 @@ def load_real_data(data_raw):
         'gl_product_group',
     ]
 
-    context_cols = numeric_context_cols + categorical_context_cols
+    # Only numeric features are directly concatenated as context.
+    # Categorical features are passed as integer ids and embedded inside the model.
+    context_cols = numeric_context_cols
 
     base_cols = [
         'asin',
@@ -116,8 +122,10 @@ def load_real_data(data_raw):
     for c in numeric_context_cols:
         df = _safe_numeric(df, c, default=0.0)
 
+    num_category_classes = {}
     for c in categorical_context_cols:
-        df = _safe_category_code(df, c)
+        df, n_cls = _safe_category_id(df, c)
+        num_category_classes[c] = n_cls
 
     # Basic stabilization for skewed nonnegative count/age features
     log_context_cols = [
@@ -154,11 +162,6 @@ def load_real_data(data_raw):
     for c in distance_cols:
         df[c] = df[c].clip(lower=0) / 52.0
 
-    # Simple scaling for label-encoded categorical columns
-    for c in categorical_context_cols:
-        denom = max(df[c].max(), 1.0)
-        df[c] = df[c] / denom
-
     df = df.sort_values(['ASIN', 'Week']).reset_index(drop=True)
     df['t'] = ((df['Week'] - df['Week'].min()).dt.days // 7).astype(int)
 
@@ -193,23 +196,31 @@ def load_real_data(data_raw):
             np.cos(2 * np.pi * t / 52),
         ], axis=1).astype(np.float32)
 
-        # Conditional z context only
+        # Numeric conditional z context only
         future_context = group[context_cols].values.astype(np.float32)
+
+        # Categorical ids for embedding
+        category_id = group['category_code_id'].values.astype(np.int64)
+        gl_group_id = group['gl_product_group_id'].values.astype(np.int64)
 
         data[asin] = {
             'features': features,
             'future_context': future_context,
+            'category_id': category_id,
+            'gl_group_id': gl_group_id,
             'demand': demand.astype(np.float32),
             'week': weeks,
             'oos': oos.astype(np.float32),
         }
 
     print(f"History encoder dim: 5")
-    print(f"Conditional z context dim: {len(context_cols)}")
-    print("Conditional z context columns:")
+    print(f"Conditional z numeric context dim: {len(context_cols)}")
+    print("Conditional z numeric context columns:")
     print(context_cols)
+    print("Categorical embedding classes:")
+    print(num_category_classes)
 
-    return data
+    return data, num_category_classes
 
 
 # =====================================================
@@ -223,6 +234,8 @@ class DemandDataset(Dataset):
         for asin, d in data.items():
             features = d['features']
             future_context = d['future_context']
+            category_id = d['category_id']
+            gl_group_id = d['gl_group_id']
             demand = d['demand']
             weeks = d['week']
             oos = d['oos']
@@ -246,6 +259,14 @@ class DemandDataset(Dataset):
                     'future_context': torch.tensor(
                         future_context[start+history:start+history+horizon],
                         dtype=torch.float32
+                    ),
+                    'category_id': torch.tensor(
+                        category_id[start+history:start+history+horizon],
+                        dtype=torch.long
+                    ),
+                    'gl_group_id': torch.tensor(
+                        gl_group_id[start+history:start+history+horizon],
+                        dtype=torch.long
                     ),
                     'y': torch.tensor(
                         demand[start+history:start+history+horizon],
@@ -362,23 +383,48 @@ class TCNSparseAttnEncoder(nn.Module):
 # =====================================================
 
 class ContextZGenerator(nn.Module):
-    def __init__(self, d_phi=32, context_dim=4, d_z=16, horizon=20):
+    def __init__(
+        self,
+        d_phi=32,
+        context_dim=14,
+        d_z=16,
+        horizon=20,
+        num_category=1,
+        num_gl_group=1,
+        cat_emb_dim=8,
+        gl_emb_dim=8
+    ):
         super().__init__()
 
         self.d_z = d_z
         self.horizon = horizon
         self.context_dim = context_dim
 
+        self.category_emb = nn.Embedding(num_category, cat_emb_dim)
+        self.gl_group_emb = nn.Embedding(num_gl_group, gl_emb_dim)
+
+        total_context_dim = horizon * (context_dim + cat_emb_dim + gl_emb_dim)
+
         self.net = nn.Sequential(
-            nn.Linear(d_phi + horizon * context_dim, 64),
+            nn.Linear(d_phi + total_context_dim, 128),
             nn.ReLU(),
-            nn.Linear(64, 2 * d_z)
+            nn.Dropout(0.1),
+            nn.Linear(128, 2 * d_z)
         )
 
-    def forward(self, phi, future_context):
+    def forward(self, phi, future_context, category_id, gl_group_id):
         batch_size = phi.shape[0]
 
-        ctx = future_context.reshape(batch_size, -1)
+        category_emb = self.category_emb(category_id)
+        gl_group_emb = self.gl_group_emb(gl_group_id)
+
+        ctx = torch.cat([
+            future_context,
+            category_emb,
+            gl_group_emb,
+        ], dim=-1)
+
+        ctx = ctx.reshape(batch_size, -1)
         inp = torch.cat([phi, ctx], dim=-1)
 
         out = self.net(inp)
@@ -439,11 +485,15 @@ class TCN_ENN(nn.Module):
     def __init__(
         self,
         input_dim=5,
-        context_dim=16,
+        context_dim=14,
         d_model=32,
         d_z=16,
         horizon=20,
-        prior_scale=0.3
+        prior_scale=0.3,
+        num_category=1,
+        num_gl_group=1,
+        cat_emb_dim=8,
+        gl_emb_dim=8
     ):
         super().__init__()
 
@@ -460,7 +510,11 @@ class TCN_ENN(nn.Module):
             d_phi=d_model,
             context_dim=context_dim,
             d_z=d_z,
-            horizon=horizon
+            horizon=horizon,
+            num_category=num_category,
+            num_gl_group=num_gl_group,
+            cat_emb_dim=cat_emb_dim,
+            gl_emb_dim=gl_emb_dim
         )
 
         self.epinet = Epinet(
@@ -470,14 +524,19 @@ class TCN_ENN(nn.Module):
             prior_scale=prior_scale
         )
 
-    def forward(self, x, future_context, nZ=8):
+    def forward(self, x, future_context, category_id, gl_group_id, nZ=8):
         mu_base, alpha_base, h_t = self.encoder(x)
 
         # Keep the standard ENN style:
         # epinet uses a detached representation from the base encoder.
         phi = h_t.detach()
 
-        z_mean, z_std = self.z_generator(phi, future_context)
+        z_mean, z_std = self.z_generator(
+            phi,
+            future_context,
+            category_id,
+            gl_group_id
+        )
 
         preds = []
 
@@ -492,16 +551,23 @@ class TCN_ENN(nn.Module):
 
             preds.append((mu, alpha))
 
-        return preds
+        kl_loss = gaussian_kl_to_standard_normal(z_mean, z_std)
 
-    def predict(self, x, future_context, M=50):
+        return preds, kl_loss
+
+    def predict(self, x, future_context, category_id, gl_group_id, M=50):
         self.eval()
 
         with torch.no_grad():
             mu_base, alpha_base, h_t = self.encoder(x)
             phi = h_t.detach()
 
-            z_mean, z_std = self.z_generator(phi, future_context)
+            z_mean, z_std = self.z_generator(
+                phi,
+                future_context,
+                category_id,
+                gl_group_id
+            )
 
             samples = []
 
@@ -534,6 +600,15 @@ class TCN_ENN(nn.Module):
 # 7. Loss & Metrics
 # =====================================================
 
+def gaussian_kl_to_standard_normal(z_mean, z_std):
+    var = z_std ** 2
+    kl = 0.5 * torch.sum(
+        var + z_mean ** 2 - 1.0 - torch.log(var + 1e-8),
+        dim=-1
+    )
+    return kl.mean()
+
+
 def negbin_nll(y, mu, alpha):
     eps = 1e-6
 
@@ -560,7 +635,7 @@ def pinball(y, pred, q):
 # 8. Training
 # =====================================================
 
-def train(model, tr_ld, va_ld, epochs=10, nZ=8, lr=1e-3, lambda_q=0.05):
+def train(model, tr_ld, va_ld, epochs=10, nZ=8, lr=1e-3, lambda_q=0.05, beta_kl=1e-4):
     opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
     sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
 
@@ -574,9 +649,17 @@ def train(model, tr_ld, va_ld, epochs=10, nZ=8, lr=1e-3, lambda_q=0.05):
         for b in tr_ld:
             x = b['x']
             future_context = b['future_context']
+            category_id = b['category_id']
+            gl_group_id = b['gl_group_id']
             y = b['y']
 
-            preds = model(x, future_context, nZ=nZ)
+            preds, kl_loss = model(
+                x,
+                future_context,
+                category_id,
+                gl_group_id,
+                nZ=nZ
+            )
 
             nll_loss = sum(
                 negbin_nll(y, mu, alpha)
@@ -598,7 +681,7 @@ def train(model, tr_ld, va_ld, epochs=10, nZ=8, lr=1e-3, lambda_q=0.05):
                 pinball(y, p70_train, 0.7)
             )
 
-            loss = nll_loss + lambda_q * q_loss
+            loss = nll_loss + lambda_q * q_loss + beta_kl * kl_loss
 
             opt.zero_grad()
             loss.backward()
@@ -617,6 +700,8 @@ def train(model, tr_ld, va_ld, epochs=10, nZ=8, lr=1e-3, lambda_q=0.05):
                 p50, p70 = model.predict(
                     b['x'],
                     b['future_context'],
+                    b['category_id'],
+                    b['gl_group_id'],
                     M=50
                 )
 
@@ -638,7 +723,8 @@ def train(model, tr_ld, va_ld, epochs=10, nZ=8, lr=1e-3, lambda_q=0.05):
         print(
             f"Epoch {epoch + 1:3d} | "
             f"train={tr_loss / max(1, len(tr_ld)):.4f} | "
-            f"val={vl:.4f}"
+            f"val={vl:.4f} | "
+            f"kl={kl_loss.item():.4f}"
         )
 
     if best_sd is not None:
@@ -663,6 +749,8 @@ def evaluate(model, va_ld, M=100):
             p50, p70 = model.predict(
                 b['x'],
                 b['future_context'],
+                b['category_id'],
+                b['gl_group_id'],
                 M=M
             )
 
@@ -719,6 +807,8 @@ def generate_forecast_df(model, va_ld, M=50):
             p50, p70 = model.predict(
                 x,
                 future_context,
+                b['category_id'],
+                b['gl_group_id'],
                 M=M
             )
 
@@ -773,12 +863,13 @@ def main(
     d_z=16,
     batch_size=64,
     M_eval=50,
-    lambda_q=0.05
+    lambda_q=0.05,
+    beta_kl=1e-4
 ):
     print("TCN + SparseAttn + ENN | NB + Rich Conditional Z Context")
     print("=" * 60)
 
-    data = load_real_data(data_raw1)
+    data, num_category_classes = load_real_data(data_raw1)
 
     all_demand = np.concatenate([
         d['demand']
@@ -816,11 +907,15 @@ def main(
 
     model = TCN_ENN(
         input_dim=5,
-        context_dim=16,
+        context_dim=14,
         d_model=d_model,
         d_z=d_z,
         horizon=horizon,
-        prior_scale=prior_scale
+        prior_scale=prior_scale,
+        num_category=num_category_classes.get('category_code', 1),
+        num_gl_group=num_category_classes.get('gl_product_group', 1),
+        cat_emb_dim=8,
+        gl_emb_dim=8
     )
 
     n_params = sum(
@@ -830,7 +925,7 @@ def main(
     )
 
     print(f"Trainable params: {n_params:,}")
-    print(f"d_model: {d_model} | d_z: {d_z} | prior_scale: {prior_scale} | lambda_q: {lambda_q}")
+    print(f"d_model: {d_model} | d_z: {d_z} | prior_scale: {prior_scale} | lambda_q: {lambda_q} | beta_kl: {beta_kl}")
 
     print("\nTraining...")
     train(
@@ -840,7 +935,8 @@ def main(
         epochs=epochs,
         nZ=8,
         lr=1e-3,
-        lambda_q=lambda_q
+        lambda_q=lambda_q,
+        beta_kl=beta_kl
     )
 
     pl50, pl70 = evaluate(model, va_ld, M=100)
@@ -885,7 +981,8 @@ model, forecast_df, tr_ld, va_ld = main(
     d_z=16,
     batch_size=64,
     M_eval=50,
-    lambda_q=0.05
+    lambda_q=0.05,
+    beta_kl=1e-4
 )
 
 
