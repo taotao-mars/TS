@@ -5,10 +5,10 @@ No ZINB
 No start_date cut
 With auxiliary pinball calibration loss
 History encoder uses original 5 time-series features
-Conditional z context uses numeric product/review/AMXL/holiday features
-Categorical category_code / gl_product_group use embeddings
-Conditional z uses small KL regularization
-Positive-demand log-MSE auxiliary loss is added to improve magnitude learning
+Conditional z context uses rich product/category/review/AMXL/holiday features
+No embedding
+No KL
+No positive log-MSE
 """
 
 import torch
@@ -50,7 +50,7 @@ def prepare_data_sample(data_raw1, n_asins=5000):
 # =====================================================
 # 1. Data Loading
 #    Encoder: original 5 time-series history features
-#    Conditional z context: product/category/review/AMXL/holiday features
+#    Conditional z context: rich features, label encoding only
 # =====================================================
 
 def _safe_numeric(df, col, default=0.0):
@@ -60,19 +60,15 @@ def _safe_numeric(df, col, default=0.0):
     return df
 
 
-def _safe_category_id(df, col):
+def _safe_label_encode(df, col):
     if col not in df.columns:
         df[col] = 'missing'
     df[col] = df[col].astype(str).fillna('missing')
-    codes = df[col].astype('category').cat.codes.astype(int)
-    num_classes = int(codes.max()) + 1 if len(codes) > 0 else 1
-    df[col + '_id'] = codes
-    return df, num_classes
+    df[col] = df[col].astype('category').cat.codes.astype(float)
+    return df
 
 
 def load_real_data(data_raw):
-    # Context features used only for conditional z.
-    # These do NOT enter the history encoder.
     numeric_context_cols = [
         'age_asin_birthday',
         'asin_name_wordcount',
@@ -95,9 +91,7 @@ def load_real_data(data_raw):
         'gl_product_group',
     ]
 
-    # Only numeric features are directly concatenated as context.
-    # Categorical features are passed as integer ids and embedded inside the model.
-    context_cols = numeric_context_cols
+    context_cols = numeric_context_cols + categorical_context_cols
 
     base_cols = [
         'asin',
@@ -123,12 +117,66 @@ def load_real_data(data_raw):
     for c in numeric_context_cols:
         df = _safe_numeric(df, c, default=0.0)
 
-    num_category_classes = {}
     for c in categorical_context_cols:
-        df, n_cls = _safe_category_id(df, c)
-        num_category_classes[c] = n_cls
+        df = _safe_label_encode(df, c)
 
-    # Basic stabilization for skewed nonnegative count/age features
+        # =====================================================
+    # Historical demand capacity features
+    # These are history-only features (no leakage).
+    # They help the model learn potential positive demand magnitude.
+    # =====================================================
+
+    hist_feature_map = {}
+
+    for asin, group in df.groupby('ASIN'):
+        demand_hist = group['Demand'].values.astype(float)
+        T_hist = len(demand_hist)
+
+        hist_max_52w = np.zeros(T_hist)
+        hist_p90_52w = np.zeros(T_hist)
+        hist_positive_mean_52w = np.zeros(T_hist)
+
+        for i in range(T_hist):
+            start = max(0, i - 52)
+            hist_window = demand_hist[start:i]
+
+            if len(hist_window) == 0:
+                continue
+
+            hist_max_52w[i] = np.max(hist_window)
+            hist_p90_52w[i] = np.percentile(hist_window, 90)
+
+            pos_vals = hist_window[hist_window > 0]
+
+            if len(pos_vals) > 0:
+                hist_positive_mean_52w[i] = np.mean(pos_vals)
+
+        hist_feature_map[asin] = {
+            'hist_max_52w': np.log1p(hist_max_52w),
+            'hist_p90_52w': np.log1p(hist_p90_52w),
+            'hist_positive_mean_52w': np.log1p(hist_positive_mean_52w),
+        }
+
+    # Add history-only capacity features into dataframe
+    df['hist_max_52w'] = 0.0
+    df['hist_p90_52w'] = 0.0
+    df['hist_positive_mean_52w'] = 0.0
+
+    for asin, group in df.groupby('ASIN'):
+        idx = group.index
+
+        df.loc[idx, 'hist_max_52w'] = hist_feature_map[asin]['hist_max_52w']
+        df.loc[idx, 'hist_p90_52w'] = hist_feature_map[asin]['hist_p90_52w']
+        df.loc[idx, 'hist_positive_mean_52w'] = hist_feature_map[asin]['hist_positive_mean_52w']
+
+    # Add them into context columns
+    numeric_context_cols += [
+        'hist_max_52w',
+        'hist_p90_52w',
+        'hist_positive_mean_52w',
+    ]
+
+    # Stabilize skewed nonnegative features
     log_context_cols = [
         'age_asin_birthday',
         'asin_name_wordcount',
@@ -138,7 +186,7 @@ def load_real_data(data_raw):
     for c in log_context_cols:
         df[c] = np.log1p(df[c].clip(lower=0))
 
-    # Clip binary/business indicators and holiday indicators
+    # Clip binary / holiday indicators
     indicator_cols = [
         'ind_amxl_hb',
         'holiday_indicator_blackfriday',
@@ -151,7 +199,7 @@ def load_real_data(data_raw):
     for c in indicator_cols:
         df[c] = df[c].clip(lower=0, upper=1)
 
-    # Distance features: keep nonnegative and mildly scaled
+    # Distance features: nonnegative and scaled by 52 weeks
     distance_cols = [
         'distance_blackfriday',
         'distance_christmasday',
@@ -162,6 +210,11 @@ def load_real_data(data_raw):
 
     for c in distance_cols:
         df[c] = df[c].clip(lower=0) / 52.0
+
+    # Scale label-encoded categorical features to [0, 1]
+    for c in categorical_context_cols:
+        denom = max(df[c].max(), 1.0)
+        df[c] = df[c] / denom
 
     df = df.sort_values(['ASIN', 'Week']).reset_index(drop=True)
     df['t'] = ((df['Week'] - df['Week'].min()).dt.days // 7).astype(int)
@@ -197,31 +250,23 @@ def load_real_data(data_raw):
             np.cos(2 * np.pi * t / 52),
         ], axis=1).astype(np.float32)
 
-        # Numeric conditional z context only
+        # Rich conditional z context
         future_context = group[context_cols].values.astype(np.float32)
-
-        # Categorical ids for embedding
-        category_id = group['category_code_id'].values.astype(np.int64)
-        gl_group_id = group['gl_product_group_id'].values.astype(np.int64)
 
         data[asin] = {
             'features': features,
             'future_context': future_context,
-            'category_id': category_id,
-            'gl_group_id': gl_group_id,
             'demand': demand.astype(np.float32),
             'week': weeks,
             'oos': oos.astype(np.float32),
         }
 
     print(f"History encoder dim: 5")
-    print(f"Conditional z numeric context dim: {len(context_cols)}")
-    print("Conditional z numeric context columns:")
+    print(f"Conditional z context dim: {len(context_cols)}")
+    print("Conditional z context columns:")
     print(context_cols)
-    print("Categorical embedding classes:")
-    print(num_category_classes)
 
-    return data, num_category_classes
+    return data
 
 
 # =====================================================
@@ -235,8 +280,6 @@ class DemandDataset(Dataset):
         for asin, d in data.items():
             features = d['features']
             future_context = d['future_context']
-            category_id = d['category_id']
-            gl_group_id = d['gl_group_id']
             demand = d['demand']
             weeks = d['week']
             oos = d['oos']
@@ -260,14 +303,6 @@ class DemandDataset(Dataset):
                     'future_context': torch.tensor(
                         future_context[start+history:start+history+horizon],
                         dtype=torch.float32
-                    ),
-                    'category_id': torch.tensor(
-                        category_id[start+history:start+history+horizon],
-                        dtype=torch.long
-                    ),
-                    'gl_group_id': torch.tensor(
-                        gl_group_id[start+history:start+history+horizon],
-                        dtype=torch.long
                     ),
                     'y': torch.tensor(
                         demand[start+history:start+history+horizon],
@@ -384,48 +419,24 @@ class TCNSparseAttnEncoder(nn.Module):
 # =====================================================
 
 class ContextZGenerator(nn.Module):
-    def __init__(
-        self,
-        d_phi=32,
-        context_dim=14,
-        d_z=16,
-        horizon=20,
-        num_category=1,
-        num_gl_group=1,
-        cat_emb_dim=8,
-        gl_emb_dim=8
-    ):
+    def __init__(self, d_phi=32, context_dim=16, d_z=16, horizon=20):
         super().__init__()
 
         self.d_z = d_z
         self.horizon = horizon
         self.context_dim = context_dim
 
-        self.category_emb = nn.Embedding(num_category, cat_emb_dim)
-        self.gl_group_emb = nn.Embedding(num_gl_group, gl_emb_dim)
-
-        total_context_dim = horizon * (context_dim + cat_emb_dim + gl_emb_dim)
-
         self.net = nn.Sequential(
-            nn.Linear(d_phi + total_context_dim, 128),
+            nn.Linear(d_phi + horizon * context_dim, 128),
             nn.ReLU(),
             nn.Dropout(0.1),
             nn.Linear(128, 2 * d_z)
         )
 
-    def forward(self, phi, future_context, category_id, gl_group_id):
+    def forward(self, phi, future_context):
         batch_size = phi.shape[0]
 
-        category_emb = self.category_emb(category_id)
-        gl_group_emb = self.gl_group_emb(gl_group_id)
-
-        ctx = torch.cat([
-            future_context,
-            category_emb,
-            gl_group_emb,
-        ], dim=-1)
-
-        ctx = ctx.reshape(batch_size, -1)
+        ctx = future_context.reshape(batch_size, -1)
         inp = torch.cat([phi, ctx], dim=-1)
 
         out = self.net(inp)
@@ -486,15 +497,11 @@ class TCN_ENN(nn.Module):
     def __init__(
         self,
         input_dim=5,
-        context_dim=14,
+        context_dim=16,
         d_model=32,
         d_z=16,
         horizon=20,
-        prior_scale=0.3,
-        num_category=1,
-        num_gl_group=1,
-        cat_emb_dim=8,
-        gl_emb_dim=8
+        prior_scale=0.3
     ):
         super().__init__()
 
@@ -511,11 +518,7 @@ class TCN_ENN(nn.Module):
             d_phi=d_model,
             context_dim=context_dim,
             d_z=d_z,
-            horizon=horizon,
-            num_category=num_category,
-            num_gl_group=num_gl_group,
-            cat_emb_dim=cat_emb_dim,
-            gl_emb_dim=gl_emb_dim
+            horizon=horizon
         )
 
         self.epinet = Epinet(
@@ -525,19 +528,14 @@ class TCN_ENN(nn.Module):
             prior_scale=prior_scale
         )
 
-    def forward(self, x, future_context, category_id, gl_group_id, nZ=8):
+    def forward(self, x, future_context, nZ=8):
         mu_base, alpha_base, h_t = self.encoder(x)
 
         # Keep the standard ENN style:
         # epinet uses a detached representation from the base encoder.
         phi = h_t.detach()
 
-        z_mean, z_std = self.z_generator(
-            phi,
-            future_context,
-            category_id,
-            gl_group_id
-        )
+        z_mean, z_std = self.z_generator(phi, future_context)
 
         preds = []
 
@@ -552,23 +550,16 @@ class TCN_ENN(nn.Module):
 
             preds.append((mu, alpha))
 
-        kl_loss = gaussian_kl_to_standard_normal(z_mean, z_std)
+        return preds
 
-        return preds, kl_loss
-
-    def predict(self, x, future_context, category_id, gl_group_id, M=50):
+    def predict(self, x, future_context, M=50):
         self.eval()
 
         with torch.no_grad():
             mu_base, alpha_base, h_t = self.encoder(x)
             phi = h_t.detach()
 
-            z_mean, z_std = self.z_generator(
-                phi,
-                future_context,
-                category_id,
-                gl_group_id
-            )
+            z_mean, z_std = self.z_generator(phi, future_context)
 
             samples = []
 
@@ -601,15 +592,6 @@ class TCN_ENN(nn.Module):
 # 7. Loss & Metrics
 # =====================================================
 
-def gaussian_kl_to_standard_normal(z_mean, z_std):
-    var = z_std ** 2
-    kl = 0.5 * torch.sum(
-        var + z_mean ** 2 - 1.0 - torch.log(var + 1e-8),
-        dim=-1
-    )
-    return kl.mean()
-
-
 def negbin_nll(y, mu, alpha):
     eps = 1e-6
 
@@ -632,30 +614,11 @@ def pinball(y, pred, q):
     return torch.mean(torch.max(q * d, (q - 1) * d))
 
 
-def positive_log_mse(y, pred_mu):
-    pos_mask = (y > 0).float()
-
-    log_diff = torch.log1p(pred_mu.clamp(min=0)) - torch.log1p(y)
-    loss = (log_diff ** 2) * pos_mask
-
-    return loss.sum() / pos_mask.sum().clamp(min=1.0)
-
-
 # =====================================================
 # 8. Training
 # =====================================================
 
-def train(
-    model,
-    tr_ld,
-    va_ld,
-    epochs=10,
-    nZ=8,
-    lr=1e-3,
-    lambda_q=0.05,
-    beta_kl=1e-4,
-    lambda_mse=0.05
-):
+def train(model, tr_ld, va_ld, epochs=10, nZ=8, lr=1e-3, lambda_q=0.05):
     opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
     sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
 
@@ -669,17 +632,9 @@ def train(
         for b in tr_ld:
             x = b['x']
             future_context = b['future_context']
-            category_id = b['category_id']
-            gl_group_id = b['gl_group_id']
             y = b['y']
 
-            preds, kl_loss = model(
-                x,
-                future_context,
-                category_id,
-                gl_group_id,
-                nZ=nZ
-            )
+            preds = model(x, future_context, nZ=nZ)
 
             nll_loss = sum(
                 negbin_nll(y, mu, alpha)
@@ -701,17 +656,7 @@ def train(
                 pinball(y, p70_train, 0.7)
             )
 
-            # Positive-demand magnitude auxiliary loss.
-            # This directly targets underestimation on nonzero demand weeks.
-            mu_mean = mu_stack.mean(dim=1)
-            mse_loss = positive_log_mse(y, mu_mean)
-
-            loss = (
-                nll_loss
-                + lambda_q * q_loss
-                + beta_kl * kl_loss
-                + lambda_mse * mse_loss
-            )
+            loss = nll_loss + lambda_q * q_loss
 
             opt.zero_grad()
             loss.backward()
@@ -730,8 +675,6 @@ def train(
                 p50, p70 = model.predict(
                     b['x'],
                     b['future_context'],
-                    b['category_id'],
-                    b['gl_group_id'],
                     M=50
                 )
 
@@ -753,9 +696,7 @@ def train(
         print(
             f"Epoch {epoch + 1:3d} | "
             f"train={tr_loss / max(1, len(tr_ld)):.4f} | "
-            f"val={vl:.4f} | "
-            f"kl={kl_loss.item():.4f} | "
-            f"pos_log_mse={mse_loss.item():.4f}"
+            f"val={vl:.4f}"
         )
 
     if best_sd is not None:
@@ -780,8 +721,6 @@ def evaluate(model, va_ld, M=100):
             p50, p70 = model.predict(
                 b['x'],
                 b['future_context'],
-                b['category_id'],
-                b['gl_group_id'],
                 M=M
             )
 
@@ -838,8 +777,6 @@ def generate_forecast_df(model, va_ld, M=50):
             p50, p70 = model.predict(
                 x,
                 future_context,
-                b['category_id'],
-                b['gl_group_id'],
                 M=M
             )
 
@@ -894,14 +831,12 @@ def main(
     d_z=16,
     batch_size=64,
     M_eval=50,
-    lambda_q=0.05,
-    beta_kl=1e-4,
-    lambda_mse=0.05
+    lambda_q=0.05
 ):
-    print("TCN + SparseAttn + ENN | NB + Rich Conditional Z Context")
+    print("TCN + SparseAttn + ENN | NB + Rich Conditional Z Context + History Capacity Features")
     print("=" * 60)
 
-    data, num_category_classes = load_real_data(data_raw1)
+    data = load_real_data(data_raw1)
 
     all_demand = np.concatenate([
         d['demand']
@@ -939,15 +874,11 @@ def main(
 
     model = TCN_ENN(
         input_dim=5,
-        context_dim=14,
+        context_dim=16,
         d_model=d_model,
         d_z=d_z,
         horizon=horizon,
-        prior_scale=prior_scale,
-        num_category=num_category_classes.get('category_code', 1),
-        num_gl_group=num_category_classes.get('gl_product_group', 1),
-        cat_emb_dim=8,
-        gl_emb_dim=8
+        prior_scale=prior_scale
     )
 
     n_params = sum(
@@ -957,9 +888,10 @@ def main(
     )
 
     print(f"Trainable params: {n_params:,}")
-    print(f"d_model: {d_model} | d_z: {d_z} | prior_scale: {prior_scale} | lambda_q: {lambda_q} | beta_kl: {beta_kl} | lambda_mse: {lambda_mse}")
+    print(f"d_model: {d_model} | d_z: {d_z} | prior_scale: {prior_scale} | lambda_q: {lambda_q}")
 
-    print("\nTraining...")
+    print("
+Training...")
     train(
         model,
         tr_ld,
@@ -967,15 +899,14 @@ def main(
         epochs=epochs,
         nZ=8,
         lr=1e-3,
-        lambda_q=lambda_q,
-        beta_kl=beta_kl,
-        lambda_mse=lambda_mse
+        lambda_q=lambda_q
     )
 
     pl50, pl70 = evaluate(model, va_ld, M=100)
     hm50, hm70 = hist_mean_baseline(va_ld)
 
-    print(f"\n{'Method':<20} {'Pinball-50':>12} {'Pinball-70':>12}")
+    print(f"
+{'Method':<20} {'Pinball-50':>12} {'Pinball-70':>12}")
     print("-" * 46)
     print(f"{'HistMean':<20} {hm50:>12.4f} {hm70:>12.4f}")
     print(f"{'ENN':<20} {pl50:>12.4f} {pl70:>12.4f}")
@@ -988,7 +919,8 @@ def main(
 
     forecast_df = generate_forecast_df(model, va_ld, M=M_eval)
 
-    print("\nForecast dataframe preview:")
+    print("
+Forecast dataframe preview:")
     print(forecast_df.head())
     print(f"Forecast rows: {len(forecast_df)}")
 
@@ -1014,9 +946,7 @@ model, forecast_df, tr_ld, va_ld = main(
     d_z=16,
     batch_size=64,
     M_eval=50,
-    lambda_q=0.05,
-    beta_kl=1e-4,
-    lambda_mse=0.05
+    lambda_q=0.05
 )
 
 
@@ -1056,10 +986,12 @@ cols_p70 = [
 p50_wape, p50_penalty_diff = quick_error_check(wape_df, cols_p50)
 p70_wape, p70_penalty_diff = quick_error_check(wape_df, cols_p70)
 
-print("\nP50 WAPE / Penalty Summary:")
+print("
+P50 WAPE / Penalty Summary:")
 print(p50_wape)
 print("P50 penalty diff:", p50_penalty_diff)
 
-print("\nP70 WAPE / Penalty Summary:")
+print("
+P70 WAPE / Penalty Summary:")
 print(p70_wape)
 print("P70 penalty diff:", p70_penalty_diff)
