@@ -432,7 +432,7 @@ class TCN_ENN(nn.Module):
                 sigma  = F.softplus(sigma_base + sig_e).clamp(min=1e-4)
 
                 # Step 1: occurrence
-                active = torch.bernoulli(occ).bool()         # [B, H]
+                active = torch.bernoulli(occ.clamp(0, 1)).bool()    # [B, H]
 
                 # Step 2: log-normal magnitude sample
                 dist   = torch.distributions.LogNormal(mu_log, sigma)
