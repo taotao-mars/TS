@@ -5,7 +5,7 @@ No ZINB
 No start_date cut
 With auxiliary pinball calibration loss
 History encoder uses original 5 time-series features
-Conditional z context uses only 2 covariates: our_price and in_stock_dph
+Conditional z context uses our_price, in_stock_dph, and all holiday/distance columns found in data
 No two-head
 No embedding
 No KL
@@ -52,7 +52,7 @@ def prepare_data_sample(data_raw1, n_asins=5000):
 # =====================================================
 # 1. Data Loading
 #    Encoder: original 5 time-series history features
-#    Conditional z context: our_price + in_stock_dph
+#    Conditional z context: our_price + in_stock_dph + all holiday/distance columns
 # =====================================================
 
 def _safe_numeric(df, col, default=0.0):
@@ -63,10 +63,20 @@ def _safe_numeric(df, col, default=0.0):
 
 
 def load_real_data(data_raw):
+    # Automatically include all holiday indicator columns in the data.
+    # Example:
+    # holiday_indicator_blackfriday
+    # holiday_indicator_primeday
+    # holiday_indicator_christmas
+    holiday_cols = [
+        c for c in data_raw.columns
+        if c.startswith('holiday_indicator_')
+    ]
+
     context_cols = [
         'our_price',
         'in_stock_dph',
-    ]
+    ] + holiday_cols
 
     base_cols = [
         'asin',
@@ -94,6 +104,10 @@ def load_real_data(data_raw):
 
     df['our_price'] = np.log1p(df['our_price'].clip(lower=0))
     df['in_stock_dph'] = df['in_stock_dph'].clip(lower=0)
+
+    # Normalize holiday indicator features.
+    for c in holiday_cols:
+        df[c] = df[c].clip(lower=0, upper=1)
 
     df = df.sort_values(['ASIN', 'Week']).reset_index(drop=True)
     df['t'] = ((df['Week'] - df['Week'].min()).dt.days // 7).astype(int)
@@ -129,7 +143,7 @@ def load_real_data(data_raw):
             np.cos(2 * np.pi * t / 52),
         ], axis=1).astype(np.float32)
 
-        # Conditional z context: our_price + in_stock_dph
+        # Conditional z context: our_price + in_stock_dph + holiday indicator features
         future_context = group[context_cols].values.astype(np.float32)
 
         data[asin] = {
@@ -145,7 +159,7 @@ def load_real_data(data_raw):
     print("Conditional z context columns:")
     print(context_cols)
 
-    return data
+    return data, len(context_cols), context_cols
 
 
 # =====================================================
@@ -882,10 +896,10 @@ def main(
     lambda_q=0.05,
     beta_tail=0.5
 ):
-    print("TCN + SparsePeakAttn + ENN | Tail-aware NB + Conditional Z: our_price + in_stock_dph | No Two-Head")
+    print("TCN + SparsePeakAttn + ENN | Tail-aware NB + Conditional Z: price + DPH + holidays | No Two-Head")
     print("=" * 60)
 
-    data = load_real_data(data_raw1)
+    data, context_dim, context_cols = load_real_data(data_raw1)
 
     all_demand = np.concatenate([
         d['demand']
@@ -923,7 +937,7 @@ def main(
 
     model = TCN_ENN(
         input_dim=5,
-        context_dim=2,
+        context_dim=context_dim,
         d_model=d_model,
         d_z=d_z,
         horizon=horizon,
