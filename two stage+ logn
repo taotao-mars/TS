@@ -427,12 +427,14 @@ class TCN_ENN(nn.Module):
                 z   = z_mean + z_std * eps
 
                 occ_e, mu_e, sig_e = self.epinet(phi, z)
-                occ    = torch.sigmoid(occ_logit_base + occ_e).clamp(1e-6, 1-1e-6)
-                mu_log = mu_log_base + mu_e
-                sigma  = F.softplus(sigma_base + sig_e).clamp(min=1e-4)
+                occ    = torch.sigmoid(occ_logit_base + occ_e)
+                occ    = torch.nan_to_num(occ, nan=0.5).clamp(1e-6, 1-1e-6)
+                mu_log = torch.nan_to_num(mu_log_base + mu_e, nan=0.0)
+                sigma  = F.softplus(sigma_base + sig_e) + 1e-4
+                sigma  = torch.nan_to_num(sigma, nan=1.0).clamp(1e-4, 10.0)
 
                 # Step 1: occurrence
-                active = torch.bernoulli(occ.clamp(0, 1)).bool()    # [B, H]
+                active = torch.bernoulli(occ).bool()         # [B, H]
 
                 # Step 2: log-normal magnitude sample
                 dist   = torch.distributions.LogNormal(mu_log, sigma)
