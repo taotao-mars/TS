@@ -296,9 +296,9 @@ class TCNSparseAttnEncoder(nn.Module):
 
 class ContextZGenerator(nn.Module):
     """
-    z ~ q(z | phi, future_context)
-    Generates z_mean and z_std from encoder state + future context.
-    Note: KL loss should be added in training if full VAE-style regularization needed.
+    z ~ q(z | phi, future_context) = N(mu_z, sigma_z^2)
+    KL(q || N(0,I)) = -0.5 * sum(1 + 2*log_sigma - mu^2 - sigma^2)
+    KL prevents sigma_z collapse -> z maintains variance -> epinet can correct magnitude
     """
     def __init__(self, d_phi=32, context_dim=2, d_z=16, horizon=20):
         super().__init__()
@@ -313,9 +313,14 @@ class ContextZGenerator(nn.Module):
         B   = phi.shape[0]
         ctx = future_context.reshape(B, -1)
         out = self.net(torch.cat([phi, ctx], dim=-1))
-        z_mean, z_logstd = out.chunk(2, dim=-1)
-        z_std = F.softplus(z_logstd) + 1e-4
-        return z_mean, z_std
+        mu_z, log_sigma_z = out.chunk(2, dim=-1)
+        log_sigma_z = log_sigma_z.clamp(-4, 2)
+        sigma_z     = torch.exp(log_sigma_z)
+
+        # KL(q||N(0,I))
+        kl = -0.5 * (1 + 2*log_sigma_z - mu_z**2 - sigma_z**2).sum(dim=-1).mean()
+
+        return mu_z, sigma_z, kl
 
 
 # =====================================================
@@ -384,7 +389,7 @@ class TCN_ENN(nn.Module):
     def forward(self, x, future_context, nZ=8):
         occ_logit_base, occ_base, mu_log_base, sigma_base, h_t = self.encoder(x)
         phi = h_t.detach()
-        z_mean, z_std = self.z_generator(phi, future_context)
+        z_mean, z_std, kl = self.z_generator(phi, future_context)
 
         preds = []
         for _ in range(nZ):
@@ -398,7 +403,7 @@ class TCN_ENN(nn.Module):
             sigma     = F.softplus(sigma_base + sig_e) + 1e-4
             preds.append((occ_logit, occ, mu_log, sigma))
 
-        return preds
+        return preds, kl
 
         return preds
 
@@ -414,7 +419,7 @@ class TCN_ENN(nn.Module):
         with torch.no_grad():
             occ_logit_base, occ_base, mu_log_base, sigma_base, h_t = self.encoder(x)
             phi = h_t.detach()
-            z_mean, z_std = self.z_generator(phi, future_context)
+            z_mean, z_std, _ = self.z_generator(phi, future_context)
 
             samples = []
             for _ in range(M):
@@ -422,9 +427,9 @@ class TCN_ENN(nn.Module):
                 z   = z_mean + z_std * eps
 
                 occ_e, mu_e, sig_e = self.epinet(phi, z)
-                occ    = torch.sigmoid(occ_logit_base + occ_e)
+                occ    = torch.sigmoid(occ_logit_base + occ_e).clamp(1e-6, 1-1e-6)
                 mu_log = mu_log_base + mu_e
-                sigma  = F.softplus(sigma_base + sig_e) + 1e-4
+                sigma  = F.softplus(sigma_base + sig_e).clamp(min=1e-4)
 
                 # Step 1: occurrence
                 active = torch.bernoulli(occ).bool()         # [B, H]
@@ -486,7 +491,7 @@ def pinball(y, pred, q):
 # =====================================================
 
 def train(model, tr_ld, va_ld, epochs=10, nZ=8, lr=1e-3,
-          lambda_q=0.05, beta_tail=0.5):
+          lambda_q=0.05, beta_tail=0.5, kl_weight=0.001):
     opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
     sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
 
@@ -499,7 +504,7 @@ def train(model, tr_ld, va_ld, epochs=10, nZ=8, lr=1e-3,
 
         for b in tr_ld:
             x, fc, y = b['x'], b['future_context'], b['y']
-            preds = model(x, fc, nZ=nZ)
+            preds, kl = model(x, fc, nZ=nZ)
 
             # Log-Normal Two-Head loss
             main_loss = sum(
@@ -515,7 +520,8 @@ def train(model, tr_ld, va_ld, epochs=10, nZ=8, lr=1e-3,
             p70_train = torch.maximum(exp_stack.quantile(0.7, dim=1), p50_train)
             q_loss    = pinball(y, p50_train, 0.5) + pinball(y, p70_train, 0.7)
 
-            loss = main_loss + lambda_q * q_loss
+            # KL: prevent z_std collapse, keep z variance alive
+            loss = main_loss + lambda_q * q_loss + kl_weight * kl
 
             opt.zero_grad()
             loss.backward()
@@ -763,11 +769,11 @@ def main(
         d_z=d_z, horizon=horizon, prior_scale=prior_scale)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Trainable params: {n_params:,}")
-    print(f"d_model={d_model} | d_z={d_z} | prior_scale={prior_scale} | lambda_q={lambda_q} | beta_tail={beta_tail}")
+    print(f"d_model={d_model} | d_z={d_z} | prior_scale={prior_scale} | lambda_q={lambda_q} | beta_tail={beta_tail} | kl_weight=0.001")
 
-    print("\nTraining (ZINB NLL + tail-weight + pinball aux)...")
+    print("\nTraining (LogNormal Two-Head + KL)...")
     train(model, tr_ld, va_ld, epochs=epochs, nZ=8, lr=1e-3,
-          lambda_q=lambda_q, beta_tail=beta_tail)
+          lambda_q=lambda_q, beta_tail=beta_tail, kl_weight=0.001)
 
     pl50, pl70 = evaluate(model, va_ld, M=100)
     hm50, hm70 = hist_mean_baseline(va_ld)
