@@ -457,7 +457,8 @@ def lognormal_loss(y, occ, mu_log, sigma, beta_tail=0.5):
 
     # Occurrence loss: BCE
     active   = (y > 0).float()
-    occ_loss = F.binary_cross_entropy(occ.clamp(eps, 1-eps), active)
+    occ_clamped = occ.clamp(1e-6, 1 - 1e-6)
+    occ_loss = F.binary_cross_entropy(occ_clamped, active)
 
     # Magnitude loss: Log-Normal NLL on nonzero only
     nz_mask  = (y > 0)
