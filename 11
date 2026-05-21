@@ -272,7 +272,8 @@ class SparsePeakAttention(nn.Module):
         scores = scores.masked_fill(sparse_mask[:, None, None, :], -1e4)
 
         # Peak bias: among valid historical weeks, high demand weeks receive higher attention.
-        # This targets magnitude / peak-demand memory.
+        # peak_score is sqrt(raw demand), which highlights peaks more than log demand
+        # while avoiding the instability of raw unbounded demand.
         peak_norm = peak_score / (peak_score.max(dim=1, keepdim=True)[0] + 1e-6)
         peak_bias = self.beta_peak * peak_norm
         scores = scores + peak_bias[:, None, None, :]
@@ -323,7 +324,10 @@ class TCNSparseAttnEncoder(nn.Module):
 
     def forward(self, x):
         b_t = x[:, :, 1]
-        peak_score = x[:, :, 0]
+        # Encoder input still uses log1p(demand), but peak attention should emphasize
+        # large historical demand more strongly than log-space. Convert back to raw
+        # demand and use sqrt scale as a stable peak-importance signal.
+        peak_score = torch.sqrt(torch.expm1(x[:, :, 0]).clamp(min=0) + 1e-6)
 
         h = self.input_proj(x).permute(0, 2, 1)
 
