@@ -282,11 +282,12 @@ class TCNSparseAttnEncoder(nn.Module):
         h   = self.sparse_attn(h.permute(0, 2, 1), b_t, peak_score)
         h_t = self.final_norm(h[:, -1, :])
 
-        occ    = torch.sigmoid(self.occurrence_head(h_t))           # [B, H] P(y>0)
-        mu_log = self.mu_log_head(h_t)                              # [B, H] log-scale mean
-        sigma  = F.softplus(self.sigma_head(h_t)) + 1e-4            # [B, H] log-scale std
+        occ_logit = self.occurrence_head(h_t)              # [B, H] raw logits
+        occ       = torch.sigmoid(occ_logit)               # [B, H] P(y>0)
+        mu_log    = self.mu_log_head(h_t)                  # [B, H] log-scale mean
+        sigma     = F.softplus(self.sigma_head(h_t)) + 1e-4 # [B, H] log-scale std
 
-        return occ, mu_log, sigma, h_t
+        return occ_logit, occ, mu_log, sigma, h_t
 
 
 # =====================================================
@@ -381,7 +382,7 @@ class TCN_ENN(nn.Module):
                                   prior_scale=prior_scale)
 
     def forward(self, x, future_context, nZ=8):
-        occ_base, mu_log_base, sigma_base, h_t = self.encoder(x)
+        occ_logit_base, occ_base, mu_log_base, sigma_base, h_t = self.encoder(x)
         phi = h_t.detach()
         z_mean, z_std = self.z_generator(phi, future_context)
 
@@ -391,10 +392,13 @@ class TCN_ENN(nn.Module):
             z   = z_mean + z_std * eps
 
             occ_e, mu_e, sig_e = self.epinet(phi, z)
-            occ    = torch.sigmoid(occ_base + occ_e)
-            mu_log = mu_log_base + mu_e
-            sigma  = F.softplus(sigma_base + sig_e) + 1e-4
-            preds.append((occ, mu_log, sigma))
+            occ_logit = occ_logit_base + occ_e
+            occ       = torch.sigmoid(occ_logit)
+            mu_log    = mu_log_base + mu_e
+            sigma     = F.softplus(sigma_base + sig_e) + 1e-4
+            preds.append((occ_logit, occ, mu_log, sigma))
+
+        return preds
 
         return preds
 
@@ -408,7 +412,7 @@ class TCN_ENN(nn.Module):
         """
         self.eval()
         with torch.no_grad():
-            occ_base, mu_log_base, sigma_base, h_t = self.encoder(x)
+            occ_logit_base, occ_base, mu_log_base, sigma_base, h_t = self.encoder(x)
             phi = h_t.detach()
             z_mean, z_std = self.z_generator(phi, future_context)
 
@@ -418,7 +422,7 @@ class TCN_ENN(nn.Module):
                 z   = z_mean + z_std * eps
 
                 occ_e, mu_e, sig_e = self.epinet(phi, z)
-                occ    = torch.sigmoid(occ_base + occ_e)
+                occ    = torch.sigmoid(occ_logit_base + occ_e)
                 mu_log = mu_log_base + mu_e
                 sigma  = F.softplus(sigma_base + sig_e) + 1e-4
 
@@ -445,20 +449,15 @@ class TCN_ENN(nn.Module):
 # 7. Loss & Metrics
 # =====================================================
 
-def lognormal_loss(y, occ, mu_log, sigma, beta_tail=0.5):
+def lognormal_loss(y, occ_logit, occ, mu_log, sigma, beta_tail=0.5):
     """
     Two-Head Log-Normal Loss:
-      1. BCE on occurrence: P(y>0)
-      2. Log-Normal NLL on magnitude: log(y) ~ N(mu_log, sigma^2)
-         Only computed on nonzero weeks.
-         Tail-weighted: high demand weeks get more weight.
+      1. BCEWithLogits on occurrence (numerically stable, no sigmoid needed)
+      2. Log-Normal NLL on magnitude (nonzero only, tail-weighted)
     """
-    eps = 1e-6
-
-    # Occurrence loss: BCE
+    # Occurrence loss: BCEWithLogits (stable, works on raw logits)
     active   = (y > 0).float()
-    occ_clamped = occ.clamp(1e-6, 1 - 1e-6)
-    occ_loss = F.binary_cross_entropy(occ_clamped, active)
+    occ_loss = F.binary_cross_entropy_with_logits(occ_logit, active)
 
     # Magnitude loss: Log-Normal NLL on nonzero only
     nz_mask  = (y > 0)
@@ -466,13 +465,11 @@ def lognormal_loss(y, occ, mu_log, sigma, beta_tail=0.5):
     if nz_mask.sum() > 0:
         y_nz      = y[nz_mask].clamp(min=1e-6)
         mu_log_nz = mu_log[nz_mask]
-        sigma_nz  = sigma[nz_mask]
+        sigma_nz  = sigma[nz_mask].clamp(min=1e-4)
 
-        # Log-Normal NLL: -log p(y) = log(sigma) + log(y) + (log(y)-mu)^2/(2*sigma^2)
         log_y  = torch.log(y_nz)
-        nll    = sigma_nz.log() + log_y + (log_y - mu_log_nz)**2 / (2 * sigma_nz**2 + eps)
+        nll    = sigma_nz.log() + log_y + (log_y - mu_log_nz)**2 / (2 * sigma_nz**2)
 
-        # Tail weight: higher demand gets more weight
         weight   = 1.0 + beta_tail * torch.log1p(y_nz)
         mag_loss = (nll * weight).sum() / weight.sum().clamp(min=1.0)
 
@@ -506,14 +503,14 @@ def train(model, tr_ld, va_ld, epochs=10, nZ=8, lr=1e-3,
 
             # Log-Normal Two-Head loss
             main_loss = sum(
-                lognormal_loss(y, occ, mu_log, sigma, beta_tail=beta_tail)
-                for occ, mu_log, sigma in preds
+                lognormal_loss(y, occ_logit, occ, mu_log, sigma, beta_tail=beta_tail)
+                for occ_logit, occ, mu_log, sigma in preds
             ) / nZ
 
             # Auxiliary pinball on expected demand = occ * exp(mu_log + sigma^2/2)
             exp_stack = torch.stack(
                 [occ * torch.exp(mu_log + sigma**2 / 2)
-                 for occ, mu_log, sigma in preds], dim=1)
+                 for occ_logit, occ, mu_log, sigma in preds], dim=1)
             p50_train = exp_stack.quantile(0.5, dim=1)
             p70_train = torch.maximum(exp_stack.quantile(0.7, dim=1), p50_train)
             q_loss    = pinball(y, p50_train, 0.5) + pinball(y, p70_train, 0.7)
@@ -653,7 +650,7 @@ def sigma_diagnosis(model, va_ld):
             fc = b['future_context']
             y  = b['y']
 
-            occ_base, mu_log_base, sigma_base, h_t = model.encoder(x)
+            occ_logit_base, occ_base, mu_log_base, sigma_base, h_t = model.encoder(x)
 
             all_y.append(y.numpy())
             all_mu_log.append(mu_log_base.numpy())
