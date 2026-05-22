@@ -1,27 +1,12 @@
 """
-TCN + SparsePeakAttn + ENN + Two-Head (Occurrence + Magnitude)
-Sparse Demand Forecasting
-
-Architecture:
-  Encoder: 8-dim features
-  SparsePeakAttention: sparse mask + peak bias
-  Two-Head output:
-    occurrence_head -> P(y>0): is this week active?
-    magnitude_head  -> E[y|y>0]: how much demand when active?
-    alpha_head      -> dispersion of magnitude
-  ContextZGenerator: z ~ q(z | phi, future_context)
-  Epinet: corrections for (occ, mag, alpha)
-
-Prediction:
-  P50/P70 via joint sampling:
-    z fixed across 20 weeks (joint prediction)
-    sample active/inactive from Bernoulli(P(y>0))
-    sample magnitude from NegBin(mu, alpha) when active
-    -> M trajectories -> quantile
-
-Loss:
-  BCE on occurrence + tail-weighted NegBin NLL on magnitude (nonzero only)
-  + auxiliary pinball calibration
+TCN + SparsePeakAttn + ENN + Two-Head v2
+Changes from v1 (enn_two_head_kl.py):
+  1. magnitude_head uses h_t.detach() -> occ and mag training fully decoupled
+  2. Three new magnitude features added to encoder input (input_dim 8->11):
+       hist_nonzero_mean : ASIN-level average demand magnitude
+       hist_nonzero_p75  : ASIN-level 75th percentile demand
+       recent_peak       : max demand in last 13 weeks (quarterly peak signal)
+  3. KL on z_generator retained (kl_weight=0.001)
 """
 
 import torch
@@ -91,7 +76,6 @@ def load_real_data(data_raw):
 
     df = df.sort_values(['ASIN', 'Week']).reset_index(drop=True)
 
-    # Holiday window feature
     if len(holiday_cols) > 0:
         holiday_window = np.zeros(len(df), dtype=np.float32)
         for c in holiday_cols:
@@ -121,7 +105,22 @@ def load_real_data(data_raw):
             if b_t[i] > 0: last = i
             d_t[i] = (i - last) / 52.0 if last >= 0 else 1.0
 
-        # 8-dim encoder features
+        # Magnitude features: ASIN-level statistics
+        nz_demand = demand[demand > 0]
+        hist_nz_mean = np.log1p(nz_demand.mean()) if len(nz_demand) > 0 else 0.0
+        hist_nz_p75  = np.log1p(np.percentile(nz_demand, 75)) if len(nz_demand) > 0 else 0.0
+
+        # Rolling recent peak (last 13 weeks at each step)
+        recent_peak = np.zeros(T)
+        for i in range(T):
+            window = demand[max(0, i-12):i+1]
+            recent_peak[i] = np.log1p(window.max())
+
+        # 11-dim encoder features
+        # [0-7]: original features
+        # [8]:   hist_nonzero_mean (ASIN magnitude baseline)
+        # [9]:   hist_nonzero_p75  (ASIN peak baseline)
+        # [10]:  recent_peak       (rolling quarterly peak)
         features = np.stack([
             v_t,
             b_t,
@@ -129,8 +128,11 @@ def load_real_data(data_raw):
             np.sin(2 * np.pi * t / 52),
             np.cos(2 * np.pi * t / 52),
             df.loc[group.index, 'promo_t'].values.astype(float),
-            np.sin(2 * np.pi * t / 13),   # quarterly
+            np.sin(2 * np.pi * t / 13),
             np.cos(2 * np.pi * t / 13),
+            np.full(T, hist_nz_mean),   # constant per ASIN
+            np.full(T, hist_nz_p75),    # constant per ASIN
+            recent_peak,                # rolling
         ], axis=1).astype(np.float32)
 
         future_context = group[context_cols].values.astype(np.float32)
@@ -143,7 +145,7 @@ def load_real_data(data_raw):
             'oos':            oos.astype(np.float32),
         }
 
-    print(f"History encoder dim: 8")
+    print(f"History encoder dim: 11")
     print(f"Conditional z context dim: {len(context_cols)}")
     return data, len(context_cols), context_cols
 
@@ -185,7 +187,7 @@ class DemandDataset(Dataset):
 
 
 # =====================================================
-# 3. Encoder  (TCN + SparsePeakAttention)
+# 3. Encoder
 # =====================================================
 
 class CausalConv1d(nn.Module):
@@ -199,24 +201,18 @@ class CausalConv1d(nn.Module):
 
 
 class SparsePeakAttention(nn.Module):
-    """
-    Sparse mask: ignore zero-demand positions.
-    Peak bias:   among valid positions, higher demand gets more attention.
-    peak_score uses sqrt(demand) for stable but strong peak emphasis.
-    """
     def __init__(self, d_model=32, n_heads=4, beta_peak=1.0):
         super().__init__()
-        self.d_model  = d_model
-        self.n_heads  = n_heads
-        self.d_head   = d_model // n_heads
+        self.d_model   = d_model
+        self.n_heads   = n_heads
+        self.d_head    = d_model // n_heads
         self.beta_peak = beta_peak
-
-        self.q_proj   = nn.Linear(d_model, d_model)
-        self.k_proj   = nn.Linear(d_model, d_model)
-        self.v_proj   = nn.Linear(d_model, d_model)
-        self.out_proj = nn.Linear(d_model, d_model)
-        self.dropout  = nn.Dropout(0.1)
-        self.norm     = nn.LayerNorm(d_model)
+        self.q_proj    = nn.Linear(d_model, d_model)
+        self.k_proj    = nn.Linear(d_model, d_model)
+        self.v_proj    = nn.Linear(d_model, d_model)
+        self.out_proj  = nn.Linear(d_model, d_model)
+        self.dropout   = nn.Dropout(0.1)
+        self.norm      = nn.LayerNorm(d_model)
 
     def forward(self, x, b_t, peak_score):
         B, T, D = x.shape
@@ -224,15 +220,11 @@ class SparsePeakAttention(nn.Module):
         k = self.k_proj(x).view(B, T, self.n_heads, self.d_head).transpose(1, 2)
         v = self.v_proj(x).view(B, T, self.n_heads, self.d_head).transpose(1, 2)
 
-        scores = torch.matmul(q, k.transpose(-2, -1)) / (self.d_head ** 0.5)
-
-        # Sparse mask
+        scores      = torch.matmul(q, k.transpose(-2, -1)) / (self.d_head ** 0.5)
         sparse_mask = (b_t == 0) & ~(b_t == 0).all(dim=1, keepdim=True)
-        scores = scores.masked_fill(sparse_mask[:, None, None, :], -1e4)
-
-        # Peak bias: sqrt scale, normalized per sequence
-        peak_norm = peak_score / (peak_score.max(dim=1, keepdim=True)[0] + 1e-6)
-        scores    = scores + self.beta_peak * peak_norm[:, None, None, :]
+        scores      = scores.masked_fill(sparse_mask[:, None, None, :], -1e4)
+        peak_norm   = peak_score / (peak_score.max(dim=1, keepdim=True)[0] + 1e-6)
+        scores      = scores + self.beta_peak * peak_norm[:, None, None, :]
 
         attn = torch.softmax(scores, dim=-1)
         attn = self.dropout(attn)
@@ -243,39 +235,33 @@ class SparsePeakAttention(nn.Module):
 
 class TCNSparseAttnEncoder(nn.Module):
     """
-    Two-Head output:
-      occurrence_head -> P(y>0): probability of non-zero demand
-      magnitude_head  -> E[y|y>0]: expected demand when active (log scale)
-      alpha_head      -> NegBin dispersion for magnitude
-
-    Two heads share h_t (same regime representation).
-    z is shared across both heads -> joint prediction maintained.
+    input_dim=11: 8 original + 3 magnitude features
+    occurrence_head: trained with live h_t -> encoder learns zero/active regime
+    magnitude_head:  trained with h_t.detach() -> fully decoupled from occ
+    alpha_head:      also detached
     """
-    def __init__(self, input_dim=8, d_model=32, horizon=20):
+    def __init__(self, input_dim=11, d_model=32, horizon=20):
         super().__init__()
         self.horizon    = horizon
         self.input_proj = nn.Linear(input_dim, d_model)
-
-        dilations  = [1, 2, 3, 4, 8, 26, 52]
-        self.convs = nn.ModuleList([CausalConv1d(d_model, d_model, 2, d) for d in dilations])
-        self.norms = nn.ModuleList([nn.LayerNorm(d_model) for _ in dilations])
-
-        self.sparse_attn = SparsePeakAttention(d_model, n_heads=4, beta_peak=1.0)
-        self.final_norm  = nn.LayerNorm(d_model)
+        dilations       = [1, 2, 3, 4, 8, 26, 52]
+        self.convs      = nn.ModuleList([CausalConv1d(d_model, d_model, 2, d) for d in dilations])
+        self.norms      = nn.ModuleList([nn.LayerNorm(d_model) for _ in dilations])
+        self.sparse_attn= SparsePeakAttention(d_model, n_heads=4, beta_peak=1.0)
+        self.final_norm = nn.LayerNorm(d_model)
 
         def head(out_dim):
             return nn.Sequential(nn.Linear(d_model, 64), nn.ReLU(), nn.Linear(64, out_dim))
 
-        # Two-Head
-        self.occurrence_head = head(horizon)  # P(y>0)
-        self.magnitude_head  = head(horizon)  # E[y|y>0], log scale
-        self.alpha_head      = head(horizon)  # NegBin dispersion
+        self.occurrence_head = head(horizon)  # live h_t -> encoder trained by occ_loss
+        self.magnitude_head  = head(horizon)  # detached h_t -> independent of encoder
+        self.alpha_head      = head(horizon)  # detached h_t -> independent of encoder
 
     def forward(self, x):
         b_t        = x[:, :, 1]
         peak_score = torch.sqrt(torch.expm1(x[:, :, 0]).clamp(min=0) + 1e-6)
+        h          = self.input_proj(x).permute(0, 2, 1)
 
-        h = self.input_proj(x).permute(0, 2, 1)
         for conv, norm in zip(self.convs, self.norms):
             h = conv(h) + h
             h = F.gelu(norm(h.permute(0, 2, 1))).permute(0, 2, 1)
@@ -283,22 +269,25 @@ class TCNSparseAttnEncoder(nn.Module):
         h   = self.sparse_attn(h.permute(0, 2, 1), b_t, peak_score)
         h_t = self.final_norm(h[:, -1, :])
 
-        occ   = torch.sigmoid(self.occurrence_head(h_t))  # [B, H] P(y>0)
-        mu    = F.softplus(self.magnitude_head(h_t))       # [B, H] E[y|y>0]
-        alpha = F.softplus(self.alpha_head(h_t)) + 1e-4   # [B, H]
+        # occurrence: live h_t, encoder trained by occ_loss
+        occ = torch.sigmoid(self.occurrence_head(h_t))
+
+        # magnitude: detached h_t, fully independent of encoder
+        h_mag = h_t.detach()
+        mu    = F.softplus(self.magnitude_head(h_mag))
+        alpha = F.softplus(self.alpha_head(h_mag)) + 1e-4
 
         return occ, mu, alpha, h_t
 
 
 # =====================================================
-# 4. ContextZGenerator  (Data-z)
+# 4. ContextZGenerator  (with KL)
 # =====================================================
 
 class ContextZGenerator(nn.Module):
     """
-    z ~ q(z | phi, future_context)
-    Generates z_mean and z_std from encoder state + future context.
-    Note: KL loss should be added in training if full VAE-style regularization needed.
+    z ~ q(z | phi, future_context) = N(mu_z, sigma_z^2)
+    KL prevents sigma_z collapse.
     """
     def __init__(self, d_phi=32, context_dim=2, d_z=16, horizon=20):
         super().__init__()
@@ -313,14 +302,15 @@ class ContextZGenerator(nn.Module):
         B   = phi.shape[0]
         ctx = future_context.reshape(B, -1)
         out = self.net(torch.cat([phi, ctx], dim=-1))
-        z_mean, z_logstd = out.chunk(2, dim=-1)
-        z_std = F.softplus(z_logstd) + 1e-4
-        return z_mean, z_std
+        mu_z, log_sigma_z = out.chunk(2, dim=-1)
+        log_sigma_z = log_sigma_z.clamp(-4, 2)
+        sigma_z     = torch.exp(log_sigma_z)
+        kl = -0.5 * (1 + 2*log_sigma_z - mu_z**2 - sigma_z**2).sum(dim=-1).mean()
+        return mu_z, sigma_z, kl
 
 
 # =====================================================
-# 5. Epinet  (ProjectedMLP, Osband et al. Eq.6)
-#    Output: corrections for (mu, alpha, pi) -> 3H
+# 5. Epinet
 # =====================================================
 
 class Epinet(nn.Module):
@@ -330,16 +320,12 @@ class Epinet(nn.Module):
         self.horizon     = horizon
         self.prior_scale = prior_scale
 
-        # 3H: occ_correction, mu_correction, alpha_correction
         self.learnable = nn.Sequential(
-            nn.Linear(d_z + d_phi, 64),
-            nn.ReLU(),
-            nn.Dropout(0.3),
+            nn.Linear(d_z + d_phi, 64), nn.ReLU(), nn.Dropout(0.3),
             nn.Linear(64, 3 * horizon * d_z),
         )
         self.prior = nn.Sequential(
-            nn.Linear(d_z + d_phi, 64),
-            nn.ReLU(),
+            nn.Linear(d_z + d_phi, 64), nn.ReLU(),
             nn.Linear(64, 3 * horizon * d_z),
         )
         for p in self.prior.parameters():
@@ -356,19 +342,11 @@ class Epinet(nn.Module):
 
 
 # =====================================================
-# 6. Full Model  (TCN_ENN with ZINB)
+# 6. Full Model
 # =====================================================
 
 class TCN_ENN(nn.Module):
-    """
-    Two-Head ENN:
-      occurrence: P(y>0) — is this week active?
-      magnitude:  E[y|y>0] — how much when active?
-
-    z shared across both heads and all 20 weeks -> Joint prediction.
-    Same regime z drives both occurrence and magnitude decisions.
-    """
-    def __init__(self, input_dim=8, context_dim=2, d_model=32,
+    def __init__(self, input_dim=11, context_dim=2, d_model=32,
                  d_z=16, horizon=20, prior_scale=0.3):
         super().__init__()
         self.d_z     = d_z
@@ -382,59 +360,46 @@ class TCN_ENN(nn.Module):
     def forward(self, x, future_context, nZ=8):
         occ_base, mu_base, alpha_base, h_t = self.encoder(x)
         phi = h_t.detach()
-        z_mean, z_std = self.z_generator(phi, future_context)
+        z_mean, z_std, kl = self.z_generator(phi, future_context)
 
         preds = []
         for _ in range(nZ):
-            eps = torch.randn_like(z_mean)
-            z   = z_mean + z_std * eps
-
+            eps   = torch.randn_like(z_mean)
+            z     = z_mean + z_std * eps
             occ_e, mu_e, al_e = self.epinet(phi, z)
-            occ   = torch.sigmoid(occ_base + occ_e)    # P(y>0)
-            mu    = F.softplus(mu_base + mu_e)          # E[y|y>0]
+            occ   = torch.sigmoid(occ_base + occ_e).clamp(1e-6, 1-1e-6)
+            mu    = F.softplus(mu_base + mu_e)
             alpha = F.softplus(alpha_base + al_e) + 1e-4
             preds.append((occ, mu, alpha))
 
-        return preds
+        return preds, kl
 
     def predict(self, x, future_context, M=50):
-        """
-        Two-stage joint sampling:
-          z fixed across 20 weeks (same regime)
-          Step 1: sample active/inactive from Bernoulli(occ)
-          Step 2: if active, sample from NegBin(mu, alpha)
-        -> M trajectories -> P50/P70
-        """
         self.eval()
         with torch.no_grad():
             occ_base, mu_base, alpha_base, h_t = self.encoder(x)
             phi = h_t.detach()
-            z_mean, z_std = self.z_generator(phi, future_context)
+            z_mean, z_std, _ = self.z_generator(phi, future_context)
 
             samples = []
             for _ in range(M):
-                eps = torch.randn_like(z_mean)
-                z   = z_mean + z_std * eps
-
+                eps   = torch.randn_like(z_mean)
+                z     = z_mean + z_std * eps
                 occ_e, mu_e, al_e = self.epinet(phi, z)
-                occ   = torch.sigmoid(occ_base + occ_e)
+                occ   = torch.sigmoid(occ_base + occ_e).clamp(1e-6, 1-1e-6)
                 mu    = F.softplus(mu_base + mu_e)
                 alpha = F.softplus(alpha_base + al_e) + 1e-4
 
-                # Step 1: occurrence
-                active = torch.bernoulli(occ).bool()      # [B, H]
-
-                # Step 2: magnitude (only when active)
-                nb = torch.distributions.NegativeBinomial(
+                active = torch.bernoulli(occ).bool()
+                nb     = torch.distributions.NegativeBinomial(
                     total_count=(1.0 / alpha).clamp(min=1e-4),
-                    probs=(mu * alpha / (1 + mu * alpha)).clamp(1e-6, 1 - 1e-6),
+                    probs=(mu * alpha / (1 + mu * alpha)).clamp(1e-6, 1-1e-6),
                 )
-                mag    = nb.sample().float()               # [B, H]
-                mag    = torch.clamp(mag, min=1)           # active weeks >= 1
+                mag    = nb.sample().float().clamp(min=1)
                 sample = torch.where(active, mag, torch.zeros_like(mag))
                 samples.append(sample)
 
-            samples = torch.stack(samples, dim=1)          # [B, M, H]
+            samples = torch.stack(samples, dim=1)
             p50 = samples.quantile(0.5, dim=1)
             p70 = samples.quantile(0.7, dim=1)
             p70 = torch.maximum(p70, p50)
@@ -446,32 +411,19 @@ class TCN_ENN(nn.Module):
 # =====================================================
 
 def two_head_loss(y, occ, mu, alpha, beta_tail=0.5):
-    """
-    Two-Head Loss:
-      1. BCE on occurrence: does this week have demand?
-      2. Tail-weighted NegBin NLL on magnitude: how much when active?
-         Only computed on nonzero weeks to avoid zero contamination.
-    """
-    eps = 1e-6
+    eps    = 1e-6
+    active = (y > 0).float()
+    occ_loss = F.binary_cross_entropy_with_logits(
+        torch.log(occ / (1 - occ + eps)), active)
 
-    # Occurrence loss: BCE
-    active   = (y > 0).float()
-    occ_loss = F.binary_cross_entropy(occ.clamp(eps, 1-eps), active)
-
-    # Magnitude loss: NegBin NLL on nonzero weeks only
-    nz_mask = (y > 0)
+    nz_mask  = (y > 0)
     mag_loss = torch.tensor(0.0)
     if nz_mask.sum() > 0:
-        y_nz     = y[nz_mask]
-        mu_nz    = mu[nz_mask]
-        alpha_nz = alpha[nz_mask]
-
+        y_nz, mu_nz, alpha_nz = y[nz_mask], mu[nz_mask], alpha[nz_mask]
         r   = (1.0 / alpha_nz).clamp(min=eps)
-        p   = (mu_nz * alpha_nz / (1 + mu_nz * alpha_nz)).clamp(eps, 1 - eps)
+        p   = (mu_nz * alpha_nz / (1 + mu_nz * alpha_nz)).clamp(eps, 1-eps)
         nll = -(torch.lgamma(y_nz + r) - torch.lgamma(r) - torch.lgamma(y_nz + 1)
-                + r * torch.log(1 - p) + y_nz * torch.log(p))
-
-        # Tail weight: higher demand gets more weight
+                + r * torch.log(1-p) + y_nz * torch.log(p))
         weight   = 1.0 + beta_tail * torch.log1p(y_nz)
         mag_loss = (nll * weight).sum() / weight.sum().clamp(min=1.0)
 
@@ -480,7 +432,7 @@ def two_head_loss(y, occ, mu, alpha, beta_tail=0.5):
 
 def pinball(y, pred, q):
     d = y - pred
-    return torch.mean(torch.max(q * d, (q - 1) * d))
+    return torch.mean(torch.max(q * d, (q-1) * d))
 
 
 # =====================================================
@@ -488,7 +440,7 @@ def pinball(y, pred, q):
 # =====================================================
 
 def train(model, tr_ld, va_ld, epochs=10, nZ=8, lr=1e-3,
-          lambda_q=0.05, beta_tail=0.5):
+          lambda_q=0.05, beta_tail=0.5, kl_weight=0.001):
     opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
     sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
 
@@ -501,21 +453,19 @@ def train(model, tr_ld, va_ld, epochs=10, nZ=8, lr=1e-3,
 
         for b in tr_ld:
             x, fc, y = b['x'], b['future_context'], b['y']
-            preds = model(x, fc, nZ=nZ)
+            preds, kl = model(x, fc, nZ=nZ)
 
-            # Two-head loss
             main_loss = sum(
                 two_head_loss(y, occ, mu, alpha, beta_tail=beta_tail)
                 for occ, mu, alpha in preds
             ) / nZ
 
-            # Auxiliary pinball on expected demand = occ * mu
             exp_stack = torch.stack([occ * mu for occ, mu, alpha in preds], dim=1)
             p50_train = exp_stack.quantile(0.5, dim=1)
             p70_train = torch.maximum(exp_stack.quantile(0.7, dim=1), p50_train)
             q_loss    = pinball(y, p50_train, 0.5) + pinball(y, p70_train, 0.7)
 
-            loss = main_loss + lambda_q * q_loss
+            loss = main_loss + lambda_q * q_loss + kl_weight * kl
 
             opt.zero_grad()
             loss.backward()
@@ -537,7 +487,7 @@ def train(model, tr_ld, va_ld, epochs=10, nZ=8, lr=1e-3,
             best_val = vl
             best_sd  = {k: v.clone() for k, v in model.state_dict().items()}
 
-        print(f"Epoch {epoch+1:3d} | train={tr_loss/max(1,len(tr_ld)):.4f} | val={vl:.4f} | beta_tail={beta_tail}")
+        print(f"Epoch {epoch+1:3d} | train={tr_loss/max(1,len(tr_ld)):.4f} | val={vl:.4f}")
 
     if best_sd is not None:
         model.load_state_dict(best_sd)
@@ -557,7 +507,6 @@ def evaluate(model, va_ld, M=100):
             all_y.append(b['y'].numpy())
             all_p50.append(p50.numpy())
             all_p70.append(p70.numpy())
-
     y   = np.concatenate(all_y)
     p50 = np.concatenate(all_p50)
     p70 = np.concatenate(all_p70)
@@ -583,11 +532,10 @@ def generate_forecast_df(model, va_ld, M=50):
     with torch.no_grad():
         for b in va_ld:
             x, fc, y, oos = b['x'], b['future_context'], b['y'], b['oos']
-            p50, p70 = model.predict(x, fc, M=M)
-            hist_mean = (x[:, :, 0].exp() - 1).mean(dim=1, keepdim=True).clamp(min=0)
+            p50, p70      = model.predict(x, fc, M=M)
+            hist_mean     = (x[:, :, 0].exp() - 1).mean(dim=1, keepdim=True).clamp(min=0)
             hm50 = hist_mean.expand_as(y)
             hm70 = hm50 * 1.25
-
             for i in range(y.shape[0]):
                 for h in range(y.shape[1]):
                     rows.append({
@@ -620,15 +568,15 @@ def generate_diagnostic_df(model, va_ld, M=100, threshold=0.5):
                 for h in range(b['y'].shape[1]):
                     y_val = b['y'][i, h].item()
                     rows.append({
-                        'asin':             b['asin'][i],
-                        'order_week':       pd.to_datetime(b['target_week'][h][i]),
-                        'horizon':          h + 1,
-                        'y':                y_val,
-                        'p50':              p50[i, h].item(),
-                        'p70':              p70[i, h].item(),
-                        'true_active':      int(y_val > 0),
-                        'pred_active_p50':  int(p50[i, h].item() > threshold),
-                        'pred_active_p70':  int(p70[i, h].item() > threshold),
+                        'asin':            b['asin'][i],
+                        'order_week':      pd.to_datetime(b['target_week'][h][i]),
+                        'horizon':         h + 1,
+                        'y':               y_val,
+                        'p50':             p50[i, h].item(),
+                        'p70':             p70[i, h].item(),
+                        'true_active':     int(y_val > 0),
+                        'pred_active_p50': int(p50[i, h].item() > threshold),
+                        'pred_active_p70': int(p70[i, h].item() > threshold),
                     })
     return pd.DataFrame(rows)
 
@@ -637,9 +585,8 @@ def underbias_diagnosis(diag_df, pred_col='p70', threshold=0.5):
     y    = diag_df['y'].values
     pred = diag_df[pred_col].values
 
-    true_active = y > 0
-    pred_active = pred > threshold
-
+    true_active  = y > 0
+    pred_active  = pred > threshold
     tp = np.sum(true_active & pred_active)
     fp = np.sum(~true_active & pred_active)
     fn = np.sum(true_active & ~pred_active)
@@ -649,22 +596,22 @@ def underbias_diagnosis(diag_df, pred_col='p70', threshold=0.5):
     precision = tp / max(1, tp + fp)
     f1        = 2 * precision * recall / max(1e-8, precision + recall)
 
-    total_under         = np.maximum(y - pred, 0).sum()
-    missed_active_mask  = true_active & ~pred_active
-    magnitude_under_mask= true_active & pred_active
-    missed_under        = np.maximum(y[missed_active_mask] - pred[missed_active_mask], 0).sum()
-    magnitude_under     = np.maximum(y[magnitude_under_mask] - pred[magnitude_under_mask], 0).sum()
+    total_under          = np.maximum(y - pred, 0).sum()
+    missed_active_mask   = true_active & ~pred_active
+    magnitude_under_mask = true_active & pred_active
+    missed_under         = np.maximum(y[missed_active_mask] - pred[missed_active_mask], 0).sum()
+    magnitude_under      = np.maximum(y[magnitude_under_mask] - pred[magnitude_under_mask], 0).sum()
 
     return pd.DataFrame([{
-        'pred_col':                pred_col,
+        'pred_col':              pred_col,
         'TP': int(tp), 'FP': int(fp), 'FN': int(fn), 'TN': int(tn),
-        'occurrence_recall':       recall,
-        'occurrence_precision':    precision,
-        'occurrence_f1':           f1,
-        'total_underbias':         total_under,
-        'underbias_rate':          total_under / max(1e-8, y.sum()),
-        'missed_active_share':     missed_under / max(1e-8, total_under),
-        'magnitude_under_share':   magnitude_under / max(1e-8, total_under),
+        'occurrence_recall':     recall,
+        'occurrence_precision':  precision,
+        'occurrence_f1':         f1,
+        'total_underbias':       total_under,
+        'underbias_rate':        total_under / max(1e-8, y.sum()),
+        'missed_active_share':   missed_under / max(1e-8, total_under),
+        'magnitude_under_share': magnitude_under / max(1e-8, total_under),
     }])
 
 
@@ -683,9 +630,10 @@ def main(
     batch_size=64,
     M_eval=50,
     lambda_q=0.05,
-    beta_tail=0.5
+    beta_tail=0.5,
+    kl_weight=0.001
 ):
-    print("TCN + SparsePeakAttn + ENN + Two-Head | Sparse Demand Forecasting")
+    print("TCN + SparsePeakAttn + ENN + Two-Head v2 | Sparse Demand Forecasting")
     print("=" * 60)
 
     data, context_dim, context_cols = load_real_data(data_raw1)
@@ -702,16 +650,16 @@ def main(
 
     print(f"Train samples: {len(tr_ld.dataset)} | Val samples: {len(va_ld.dataset)}")
 
-    model = TCN_ENN(
-        input_dim=8, context_dim=context_dim, d_model=d_model,
-        d_z=d_z, horizon=horizon, prior_scale=prior_scale)
+    model    = TCN_ENN(input_dim=11, context_dim=context_dim, d_model=d_model,
+                       d_z=d_z, horizon=horizon, prior_scale=prior_scale)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Trainable params: {n_params:,}")
-    print(f"d_model={d_model} | d_z={d_z} | prior_scale={prior_scale} | lambda_q={lambda_q} | beta_tail={beta_tail}")
+    print(f"d_model={d_model} | d_z={d_z} | prior_scale={prior_scale} | "
+          f"lambda_q={lambda_q} | beta_tail={beta_tail} | kl_weight={kl_weight}")
 
-    print("\nTraining (ZINB NLL + tail-weight + pinball aux)...")
+    print("\nTraining (Two-Head v2: detached mag + magnitude features + KL)...")
     train(model, tr_ld, va_ld, epochs=epochs, nZ=8, lr=1e-3,
-          lambda_q=lambda_q, beta_tail=beta_tail)
+          lambda_q=lambda_q, beta_tail=beta_tail, kl_weight=kl_weight)
 
     pl50, pl70 = evaluate(model, va_ld, M=100)
     hm50, hm70 = hist_mean_baseline(va_ld)
@@ -719,7 +667,7 @@ def main(
     print(f"\n{'Method':<20} {'Pinball-50':>12} {'Pinball-70':>12}")
     print("-" * 46)
     print(f"{'HistMean':<20} {hm50:>12.4f} {hm70:>12.4f}")
-    print(f"{'ENN (ZINB)':<20} {pl50:>12.4f} {pl70:>12.4f}")
+    print(f"{'ENN (Two-Head v2)':<20} {pl50:>12.4f} {pl70:>12.4f}")
     print(f"{'ENN vs HistMean':<20} {(hm50-pl50)/hm50*100:>+11.1f}% {(hm70-pl70)/hm70*100:>+11.1f}%")
 
     forecast_df = generate_forecast_df(model, va_ld, M=M_eval)
@@ -740,7 +688,7 @@ model, forecast_df, tr_ld, va_ld = main(
     data_small,
     prior_scale=0.3, epochs=10, history=52, horizon=20,
     d_model=32, d_z=16, batch_size=64, M_eval=50,
-    lambda_q=0.05, beta_tail=0.5
+    lambda_q=0.05, beta_tail=0.5, kl_weight=0.001
 )
 
 
