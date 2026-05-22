@@ -498,8 +498,9 @@ def mixed_loss(y, occ, gate, mu_nb, alpha, mu_log, sigma, beta_tail=0.5,
     nz_mask = (y > 0)
     if nz_mask.sum() > 0:
         gate_target = (y[nz_mask] > peak_threshold).float()
-        gate_loss   = F.binary_cross_entropy(
-            gate[nz_mask].clamp(eps, 1-eps), gate_target)
+        gate_logit  = torch.log(gate[nz_mask].clamp(1e-6, 1-1e-6) /
+                                (1 - gate[nz_mask].clamp(1e-6, 1-1e-6)))
+        gate_loss   = F.binary_cross_entropy_with_logits(gate_logit, gate_target)
         mag_loss = mag_loss + 0.1 * gate_loss
 
     return occ_loss + mag_loss
