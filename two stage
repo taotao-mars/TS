@@ -581,7 +581,25 @@ def generate_diagnostic_df(model, va_ld, M=100, threshold=0.5):
     return pd.DataFrame(rows)
 
 
-def underbias_diagnosis(diag_df, pred_col='p70', threshold=0.5):
+def magnitude_gap(diag_df):
+    """
+    On active weeks only: how much does prediction underestimate true demand?
+    """
+    df   = diag_df[diag_df['true_active'] == 1].copy()
+    y    = df['y'].values
+    p50  = df['p50'].values
+    p70  = df['p70'].values
+
+    avg_true    = y.mean()
+    avg_p50     = p50.mean()
+    avg_p70     = p70.mean()
+
+    print(f"\n[Magnitude Gap - Active weeks only]")
+    print(f"  True demand mean : {avg_true:.2f}")
+    print(f"  P50 pred mean    : {avg_p50:.2f}  ({avg_p50/avg_true*100:.1f}% of true)")
+    print(f"  P70 pred mean    : {avg_p70:.2f}  ({avg_p70/avg_true*100:.1f}% of true)")
+    print(f"  P50 gap          : {avg_true - avg_p50:.2f} units below true")
+    print(f"  P70 gap          : {avg_true - avg_p70:.2f} units below true")
     y    = diag_df['y'].values
     pred = diag_df[pred_col].values
 
@@ -727,3 +745,5 @@ print(underbias_diagnosis(diag_df, pred_col='p50', threshold=0.5).T)
 
 print("\nUnderbias Diagnosis - P70:")
 print(underbias_diagnosis(diag_df, pred_col='p70', threshold=0.5).T)
+
+magnitude_gap(diag_df)
