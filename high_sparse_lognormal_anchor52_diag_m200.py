@@ -2,13 +2,12 @@
 High-sparse experiment:
 TCN + SparsePeakAttention + ENN + Anchored LogNormal Magnitude
 
-变更 v2:
-- d_model: 32 → 24  (减少过拟合)
-- d_z: 16 → 8       (减少过拟合)
-- batch_size: 64 → 128  (每个 batch 更多 active weeks)
-- weight_decay: 1e-5 → 1e-4  (更强正则化)
-- occ_pos_weight: 4.0 → 2.5  (更接近理论值，稳定 occ 梯度)
-- 早停: patience=5  (防止过拟合继续)
+变更 v3:
+- occ_enn_scale: 0.15 → 0.60  (让 z 明显影响 occurrence regime)
+- loc_enn_scale: 0.50 → 0.70  (让 z 更明显影响 magnitude regime)
+- loc residual: ±0.30 → ±0.60  (anchor 偏低时允许模型修正)
+- magnitude encoder gradient: full detach → 70% detach + 30% trainable
+- 新增 check_z_effect 诊断，检查 z 是否真的影响 occ/mag
 """
 
 import torch
@@ -421,9 +420,9 @@ class TCNSparseAttnEncoder(nn.Module):
         h_occ = self.occ_proj(h_t)
         occ_logit_base = self.occurrence_head(h_occ)
 
-        # magnitude：detach h_t，切断 LogNormal 梯度对 encoder 的干扰
-        # z 通过 epinet 的 loc_e 仍然影响 magnitude，joint prediction 不受影响
-        h_t_mag = h_t.detach()
+        # magnitude：半 detach，而不是完全 detach
+        # 70% 稳定 encoder，30% 允许 magnitude loss 回流，帮助 encoder 学 magnitude-relevant regime
+        h_t_mag = 0.7 * h_t.detach() + 0.3 * h_t
         mag_inp = [h_t_mag, anchor_feats]
         if static_emb is not None:
             mag_inp.append(static_emb)
@@ -433,7 +432,8 @@ class TCNSparseAttnEncoder(nn.Module):
         h_scale = self.scale_proj(mag_inp)
 
         loc_resid_raw = self.loc_head(h_loc)
-        loc_base = loc_anchor + 0.30 * torch.tanh(loc_resid_raw)
+        # high sparse 下 anchor 经常偏低，±0.30 太保守；放大到 ±0.60
+        loc_base = loc_anchor + 0.60 * torch.tanh(loc_resid_raw)
         scale_raw = self.scale_head(h_scale)
         scale = 0.10 + 1.40 * torch.sigmoid(scale_raw)
 
@@ -510,8 +510,8 @@ class TCN_ENN_LogNormal(nn.Module):
         prior_scale=0.5,
         beta_peak=1.5,
         static_dim=0,
-        occ_enn_scale=0.15,
-        loc_enn_scale=0.50,
+        occ_enn_scale=0.60,
+        loc_enn_scale=0.70,
     ):
         super().__init__()
         self.d_z = d_z
@@ -1012,6 +1012,83 @@ def magnitude_gap(diag_df):
     return out
 
 
+def check_z_effect(model, va_ld, nZ=50, max_batches=5):
+    """
+    Diagnose whether the latent regime z actually changes occurrence and magnitude.
+
+    Key columns:
+    - occ_prob_z_std_mean: average std of occ_prob across z samples. Too small means z barely affects occurrence.
+    - loc_z_std_mean: average std of log-magnitude loc across z samples. Too small means z barely affects magnitude.
+    - sample_demand_z_std_mean: average std of expected demand proxy across z samples.
+    """
+    rows = []
+    model.eval()
+
+    with torch.no_grad():
+        for bi, b in enumerate(va_ld):
+            if bi >= max_batches:
+                break
+
+            x = b["x"]
+            fc = b["future_context"]
+            static = b.get("static", None)
+
+            occ_logit_base, loc_base, scale_base, phi = model._encode(x, fc, static)
+            z_mean, z_std, _ = model.z_generator(phi, fc)
+
+            occ_probs = []
+            locs = []
+            demand_proxy = []
+
+            for _ in range(nZ):
+                eps = torch.randn_like(z_mean)
+                z = z_mean + z_std * eps
+                occ_e, loc_e = model.epinet(phi, z)
+
+                occ_logit = occ_logit_base + model.occ_enn_scale * torch.tanh(occ_e)
+                occ_prob = torch.sigmoid(occ_logit).clamp(1e-6, 1 - 1e-6)
+                loc = loc_base + model.loc_enn_scale * torch.tanh(loc_e)
+                loc = torch.nan_to_num(loc, nan=0.0, posinf=6.0, neginf=-3.0).clamp(-3.0, 6.0)
+
+                # zero-inflated expected demand proxy under LogNormal(log1p(y))
+                mag_mean = torch.exp(loc + 0.5 * scale_base.pow(2)) - 1
+                mag_mean = mag_mean.clamp(min=0)
+                demand_proxy.append(occ_prob * mag_mean)
+                occ_probs.append(occ_prob)
+                locs.append(loc)
+
+            occ_probs = torch.stack(occ_probs, dim=0)
+            locs = torch.stack(locs, dim=0)
+            demand_proxy = torch.stack(demand_proxy, dim=0)
+
+            rows.append({
+                "batch": bi,
+                "occ_prob_base_mean": torch.sigmoid(occ_logit_base).mean().item(),
+                "occ_prob_z_std_mean": occ_probs.std(dim=0).mean().item(),
+                "occ_prob_z_range_mean": (occ_probs.max(dim=0).values - occ_probs.min(dim=0).values).mean().item(),
+                "loc_base_mean": loc_base.mean().item(),
+                "loc_z_std_mean": locs.std(dim=0).mean().item(),
+                "loc_z_range_mean": (locs.max(dim=0).values - locs.min(dim=0).values).mean().item(),
+                "sample_demand_z_std_mean": demand_proxy.std(dim=0).mean().item(),
+                "sample_demand_z_range_mean": (demand_proxy.max(dim=0).values - demand_proxy.min(dim=0).values).mean().item(),
+                "z_std_mean": z_std.mean().item(),
+            })
+
+    out = pd.DataFrame(rows)
+    print("\n[Z Effect Diagnostic]")
+    if len(out) == 0:
+        print("No validation batches available.")
+    else:
+        print(out.describe().T)
+        occ_std = out["occ_prob_z_std_mean"].mean()
+        loc_std = out["loc_z_std_mean"].mean()
+        if occ_std < 0.01:
+            print("  Warning: z has very weak effect on occurrence; consider larger occ_enn_scale.")
+        if loc_std < 0.05:
+            print("  Warning: z has weak effect on magnitude; consider larger loc_enn_scale or less detach.")
+    return out
+
+
 def check_anchor_quality(data_dict, history=52, horizon=20):
     rows = []
     for asin, d in data_dict.items():
@@ -1067,8 +1144,8 @@ def run_one_group(
     group_name,
     prior_scale=0.5,
     beta_peak=1.5,
-    occ_enn_scale=0.15,
-    loc_enn_scale=0.50,
+    occ_enn_scale=0.60,
+    loc_enn_scale=0.70,
     epochs=30,
     history=52,
     horizon=20,
@@ -1092,6 +1169,7 @@ def run_one_group(
     print(f"Zero rate: {(all_demand == 0).mean():.1%}")
     print(f"d_model={d_model} | d_z={d_z} | batch_size={batch_size}")
     print(f"occ_pos_weight={occ_pos_weight} | patience={patience} | weight_decay=1e-4")
+    print(f"occ_enn_scale={occ_enn_scale} | loc_enn_scale={loc_enn_scale} | loc_resid_scale=0.60")
 
     anchor_diag_df = check_anchor_quality(data, history=history, horizon=horizon)
 
@@ -1143,6 +1221,7 @@ def run_one_group(
     diag_p50 = underbias_diagnosis(diag_df, pred_col="p50", threshold=0.5)
     diag_p70 = underbias_diagnosis(diag_df, pred_col="p70", threshold=0.5)
     mag_gap_df = magnitude_gap(diag_df)
+    z_effect_df = check_z_effect(model, va_ld, nZ=50, max_batches=5)
 
     print("\nUnderbias Diagnosis - P50:")
     print(diag_p50.T)
@@ -1184,6 +1263,9 @@ def run_one_group(
         "pinball70":        eval_metrics["pinball70"],
         "p50_penalty_diff": p50_penalty_diff,
         "p70_penalty_diff": p70_penalty_diff,
+        "z_occ_prob_std":   z_effect_df["occ_prob_z_std_mean"].mean() if len(z_effect_df) else np.nan,
+        "z_loc_std":        z_effect_df["loc_z_std_mean"].mean() if len(z_effect_df) else np.nan,
+        "z_demand_std":     z_effect_df["sample_demand_z_std_mean"].mean() if len(z_effect_df) else np.nan,
     }
 
     return {
@@ -1195,6 +1277,7 @@ def run_one_group(
         "diag_p50":        diag_p50,
         "diag_p70":        diag_p70,
         "mag_gap":         mag_gap_df,
+        "z_effect_df":     z_effect_df,
         "anchor_diag_df":  anchor_diag_df,
         "p50_wape":        p50_wape,
         "p70_wape":        p70_wape,
@@ -1208,8 +1291,8 @@ def run_high_sparse_joint_regime_experiment(
     zero_thresholds=(0.4, 0.7),
     prior_scale=0.5,
     beta_peak=1.5,
-    occ_enn_scale=0.15,
-    loc_enn_scale=0.50,
+    occ_enn_scale=0.60,
+    loc_enn_scale=0.70,
     epochs=30,
     history=52,
     horizon=20,
@@ -1237,7 +1320,6 @@ def run_high_sparse_joint_regime_experiment(
     print(f"  weight_decay=1e-4 (was 1e-5)")
     print(f"  occ_pos_weight={occ_pos_weight} (was 4.0)")
     print(f"  patience={patience}")
-    print(f"  oversampling=OFF")
 
     result = run_one_group(
         data_high,
@@ -1278,8 +1360,8 @@ high_sparse_joint_result, high_sparse_joint_summary_df, asin_zero_stats = (
         zero_thresholds=(0.4, 0.7),
         prior_scale=0.5,
         beta_peak=1.5,
-        occ_enn_scale=0.15,
-        loc_enn_scale=0.50,
+        occ_enn_scale=0.60,
+        loc_enn_scale=0.70,
         epochs=30,
         history=52,
         horizon=20,
