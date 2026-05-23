@@ -1,0 +1,232 @@
+import torch
+import pandas as pd
+import numpy as np
+
+
+def predict_smooth_quantile(model, x, future_context, M=200, static=None):
+    """
+    Smooth forecast version:
+    不做 Bernoulli sampling，而是用 occ_prob * conditional magnitude quantile。
+    
+    用来检查：
+    当前 p50/p70 低，是不是因为 zero-inflated sampling quantile 把结果压低了。
+    """
+    model.eval()
+
+    with torch.no_grad():
+        occ_logit_base, loc_base, scale_base, phi = model._encode(
+            x, future_context, static
+        )
+
+        z_mean, z_std, _ = model.z_generator(phi, future_context)
+
+        p50_list = []
+        p70_list = []
+        occ_list = []
+        loc_list = []
+
+        for _ in range(M):
+            eps_z = torch.randn_like(z_mean)
+            z = z_mean + z_std * eps_z
+
+            _, occ_prob, loc, scale = model._apply_epinet(
+                occ_logit_base,
+                loc_base,
+                scale_base,
+                phi,
+                z
+            )
+
+            # conditional magnitude quantiles
+            # log1p(y) ~ Normal(loc, scale)
+            mag_p50 = torch.exp(loc) - 1.0
+
+            # z_0.70 for standard normal is about 0.5244
+            mag_p70 = torch.exp(loc + 0.5244 * scale) - 1.0
+
+            # smooth unconditional forecast
+            p50_z = occ_prob * mag_p50
+            p70_z = occ_prob * mag_p70
+
+            p50_list.append(p50_z)
+            p70_list.append(p70_z)
+            occ_list.append(occ_prob)
+            loc_list.append(loc)
+
+        p50 = torch.stack(p50_list, dim=0).mean(dim=0)
+        p70 = torch.stack(p70_list, dim=0).mean(dim=0)
+        p70 = torch.maximum(p70, p50)
+
+        occ_mean = torch.stack(occ_list, dim=0).mean(dim=0)
+        loc_mean = torch.stack(loc_list, dim=0).mean(dim=0)
+
+    return p50, p70, occ_mean, loc_mean
+
+
+def mag_anchor_output_diagnosis(result, M=200):
+    """
+    检查 anchor / loc_base / sampling prediction / smooth prediction。
+    """
+    model = result["model"]
+    va_ld = result["va_ld"]
+
+    rows = []
+
+    model.eval()
+
+    with torch.no_grad():
+        for b in va_ld:
+            x = b["x"]
+            fc = b["future_context"]
+            y = b["y"]
+            static = b.get("static", None)
+
+            # base encode
+            occ_logit_base, loc_base, scale_base, phi = model._encode(
+                x, fc, static
+            )
+
+            occ_base = torch.sigmoid(occ_logit_base)
+
+            # anchor from feature indices: [8, 9, 10]
+            anchor_feats = x[:, -1, [8, 9, 10]]
+            loc_anchor = (
+                0.40 * anchor_feats[:, 0]
+                + 0.40 * anchor_feats[:, 1]
+                + 0.20 * anchor_feats[:, 2]
+            ).unsqueeze(1).expand_as(y)
+
+            anchor_demand = torch.expm1(loc_anchor).clamp(min=0)
+            loc_base_demand = torch.expm1(loc_base).clamp(min=0)
+
+            # original zero-inflated sampling prediction
+            p50_sample, p70_sample = model.predict(
+                x, fc, M=M, static=static
+            )
+
+            # smooth prediction
+            p50_smooth, p70_smooth, occ_mean, loc_mean = predict_smooth_quantile(
+                model, x, fc, M=M, static=static
+            )
+
+            loc_z_demand = torch.expm1(loc_mean).clamp(min=0)
+
+            pos = y > 0
+
+            if pos.sum() > 0:
+                rows.append({
+                    "n_active": pos.sum().item(),
+
+                    "true_active_mean": y[pos].mean().item(),
+
+                    "anchor_active_mean": anchor_demand[pos].mean().item(),
+                    "loc_base_active_mean": loc_base_demand[pos].mean().item(),
+                    "loc_z_active_mean": loc_z_demand[pos].mean().item(),
+
+                    "sample_p50_active_mean": p50_sample[pos].mean().item(),
+                    "sample_p70_active_mean": p70_sample[pos].mean().item(),
+
+                    "smooth_p50_active_mean": p50_smooth[pos].mean().item(),
+                    "smooth_p70_active_mean": p70_smooth[pos].mean().item(),
+
+                    "occ_base_active_mean": occ_base[pos].mean().item(),
+                    "occ_z_active_mean": occ_mean[pos].mean().item(),
+
+                    "occ_z_active_p25": occ_mean[pos].quantile(0.25).item(),
+                    "occ_z_active_p50": occ_mean[pos].quantile(0.50).item(),
+                    "occ_z_active_p75": occ_mean[pos].quantile(0.75).item(),
+
+                    "scale_base_active_mean": scale_base[pos].mean().item(),
+                })
+
+    diag = pd.DataFrame(rows)
+
+    print("\n" + "=" * 80)
+    print("MAG / ANCHOR / OUTPUT DIAGNOSIS")
+    print("=" * 80)
+
+    if len(diag) == 0:
+        print("No active validation rows found.")
+        return diag
+
+    summary = diag.describe().T
+
+    cols_to_show = [
+        "true_active_mean",
+        "anchor_active_mean",
+        "loc_base_active_mean",
+        "loc_z_active_mean",
+        "sample_p50_active_mean",
+        "sample_p70_active_mean",
+        "smooth_p50_active_mean",
+        "smooth_p70_active_mean",
+        "occ_z_active_mean",
+        "occ_z_active_p25",
+        "occ_z_active_p50",
+        "occ_z_active_p75",
+        "scale_base_active_mean",
+    ]
+
+    print(summary.loc[cols_to_show])
+
+    print("\nKey ratios:")
+    print(
+        pd.DataFrame([{
+            "anchor / true": diag["anchor_active_mean"].mean() / diag["true_active_mean"].mean(),
+            "loc_base / true": diag["loc_base_active_mean"].mean() / diag["true_active_mean"].mean(),
+            "loc_z / true": diag["loc_z_active_mean"].mean() / diag["true_active_mean"].mean(),
+            "sample_p50 / true": diag["sample_p50_active_mean"].mean() / diag["true_active_mean"].mean(),
+            "sample_p70 / true": diag["sample_p70_active_mean"].mean() / diag["true_active_mean"].mean(),
+            "smooth_p50 / true": diag["smooth_p50_active_mean"].mean() / diag["true_active_mean"].mean(),
+            "smooth_p70 / true": diag["smooth_p70_active_mean"].mean() / diag["true_active_mean"].mean(),
+        }]).T.rename(columns={0: "ratio"})
+    )
+
+    return diag
+
+
+def generate_forecast_df_smooth(model, va_ld, M=200):
+    """
+    用 smooth quantile 重新生成 forecast_df，方便直接跑 WAPE。
+    不需要重新训练。
+    """
+    rows = []
+
+    model.eval()
+
+    with torch.no_grad():
+        for b in va_ld:
+            x = b["x"]
+            fc = b["future_context"]
+            y = b["y"]
+            oos = b["oos"]
+            static = b.get("static", None)
+
+            p50, p70, _, _ = predict_smooth_quantile(
+                model, x, fc, M=M, static=static
+            )
+
+            hist_mean = (
+                x[:, :, 0].exp() - 1
+            ).mean(dim=1, keepdim=True).clamp(min=0)
+
+            hm50 = hist_mean.expand_as(y)
+            hm70 = hm50 * 1.25
+
+            for i in range(y.shape[0]):
+                for h in range(y.shape[1]):
+                    rows.append({
+                        "asin": b["asin"][i],
+                        "order_week": pd.to_datetime(b["target_week"][h][i]),
+                        "fcst_week_index": h + 1,
+                        "fbi_demand": y[i, h].item(),
+                        "scot_oos": oos[i, h].item(),
+                        "oos": oos[i, h].item(),
+                        "oos_status": oos[i, h].item(),
+                        "p50_amxl": p50[i, h].item(),
+                        "p70_amxl": p70[i, h].item(),
+                        "p50_scot": hm50[i, h].item(),
+                        "p70_scot": hm70[i, h].item(),
+                    })
+
+    return pd.DataFrame(rows)
