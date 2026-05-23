@@ -24,6 +24,7 @@ Compared with the NB-only version:
 - Anchor-protected magnitude residual: allow upward loc correction more than downward correction.
 - Built-in diagnostics: anchor vs loc vs sampling vs smooth forecast.
 - Automatic output-rule comparison: original sampling vs smooth vs hybrid WAPE without retraining.
+- Validation calibration checks: scale/gate search for P50 and P70 without retraining.
 - Includes optional WAPE hook if calculate_wape_using_lp_oos2 and quick_error_check exist.
 """
 
@@ -2237,6 +2238,7 @@ def run_high_sparse_best_experiment(
     extreme_q=0.99,
     auto_output_rule_check=True,
     output_tau_grid=(0.50, 0.60, 0.70, 0.80),
+    auto_calibration_check=True,
 ):
     data_small = prepare_data_sample(
         data_raw1,
@@ -2282,6 +2284,7 @@ def run_high_sparse_best_experiment(
     print(f"  extreme_cap={extreme_cap}")
     print(f"  auto_output_rule_check={auto_output_rule_check}")
     print(f"  output_tau_grid={output_tau_grid}")
+    print(f"  auto_calibration_check={auto_calibration_check}")
 
     result = run_one_group(
         data_high,
@@ -2350,6 +2353,18 @@ def run_high_sparse_best_experiment(
             print("\nOutput-rule comparison failed.")
             print("Error:", repr(e))
             result["output_rule_outputs_error"] = repr(e)
+
+    if auto_calibration_check:
+        try:
+            calibration_outputs = run_auto_calibration_checks(
+                result,
+                M=M_eval
+            )
+            result["calibration_outputs"] = calibration_outputs
+        except Exception as e:
+            print("\nCalibration check failed.")
+            print("Error:", repr(e))
+            result["calibration_outputs_error"] = repr(e)
 
     return result, summary_df, asin_stats
 
@@ -2745,6 +2760,393 @@ def hybrid_active_magnitude_diagnosis(
 
     return diag
 
+
+def _forecast_basic_diagnostics(forecast_df, label="forecast", threshold=0.5):
+    """
+    Basic diagnostics for forecast outputs.
+    Helps separate:
+      1) occurrence error
+      2) active-week magnitude underprediction
+      3) zero-week overprediction
+    """
+    df = forecast_df.copy()
+
+    y = df["fbi_demand"].values
+    p50 = df["p50_amxl"].values
+    p70 = df["p70_amxl"].values
+
+    active = y > 0
+    zero = ~active
+
+    def safe_mean(arr):
+        return float(np.mean(arr)) if len(arr) > 0 else np.nan
+
+    out = {
+        "label": label,
+        "n_rows": len(df),
+        "n_asins": df["asin"].nunique(),
+        "true_mean": safe_mean(y),
+        "true_active_ratio": safe_mean(active),
+        "true_active_mean": safe_mean(y[active]),
+
+        "p50_mean": safe_mean(p50),
+        "p70_mean": safe_mean(p70),
+        "p50_active_ratio": safe_mean(p50 > threshold),
+        "p70_active_ratio": safe_mean(p70 > threshold),
+
+        "p50_active_mean_on_true_active": safe_mean(p50[active]),
+        "p70_active_mean_on_true_active": safe_mean(p70[active]),
+        "p50_zero_mean_on_true_zero": safe_mean(p50[zero]),
+        "p70_zero_mean_on_true_zero": safe_mean(p70[zero]),
+
+        "p50_active_over_true_ratio": (
+            safe_mean(p50[active]) / max(1e-8, safe_mean(y[active]))
+            if active.sum() > 0 else np.nan
+        ),
+        "p70_active_over_true_ratio": (
+            safe_mean(p70[active]) / max(1e-8, safe_mean(y[active]))
+            if active.sum() > 0 else np.nan
+        ),
+
+        "p50_coverage_all": safe_mean(y <= p50),
+        "p70_coverage_all": safe_mean(y <= p70),
+        "p50_coverage_active": safe_mean(y[active] <= p50[active]) if active.sum() > 0 else np.nan,
+        "p70_coverage_active": safe_mean(y[active] <= p70[active]) if active.sum() > 0 else np.nan,
+    }
+
+    return pd.DataFrame([out])
+
+
+def apply_forecast_calibration(
+    forecast_df,
+    p50_scale=1.0,
+    p70_scale=1.0,
+    p50_gate=None,
+    p70_gate=None,
+    occ_col="occ_prob_mean",
+):
+    """
+    Post-hoc forecast calibration.
+
+    p50_scale / p70_scale:
+        multiply forecasts to fix magnitude underprediction.
+
+    p50_gate / p70_gate:
+        if occ_col exists, set forecast to 0 when occ_prob < gate.
+        This controls false positive active forecasts on true-zero weeks.
+
+    This does NOT retrain the model.
+    """
+    df = forecast_df.copy()
+
+    df["p50_amxl"] = df["p50_amxl"] * p50_scale
+    df["p70_amxl"] = df["p70_amxl"] * p70_scale
+
+    if occ_col in df.columns:
+        if p50_gate is not None:
+            df.loc[df[occ_col] < p50_gate, "p50_amxl"] = 0.0
+        if p70_gate is not None:
+            df.loc[df[occ_col] < p70_gate, "p70_amxl"] = 0.0
+    else:
+        if p50_gate is not None or p70_gate is not None:
+            print(f"Warning: {occ_col} not found. Gate skipped.")
+
+    df["p70_amxl"] = np.maximum(df["p70_amxl"], df["p50_amxl"])
+
+    return df
+
+
+def _extract_penalty_values(out):
+    """
+    Extract scalar penalty values from quick_error_check output.
+    """
+    ans = {}
+
+    for key in ["p50_wape", "p70_wape"]:
+        if key in out:
+            obj = out[key]
+            try:
+                if hasattr(obj, "to_dict"):
+                    d = obj.to_dict()
+                    for k, v in d.items():
+                        if "amxl_penalty" in str(k):
+                            ans[f"{key}_amxl_penalty"] = float(v)
+                        if "amxl_underbias" in str(k):
+                            ans[f"{key}_amxl_underbias"] = float(v)
+                        if "amxl_overbias" in str(k):
+                            ans[f"{key}_amxl_overbias"] = float(v)
+            except Exception:
+                pass
+
+    if "p50_penalty_diff" in out:
+        ans["p50_penalty_diff"] = out["p50_penalty_diff"]
+    if "p70_penalty_diff" in out:
+        ans["p70_penalty_diff"] = out["p70_penalty_diff"]
+
+    return ans
+
+
+def run_calibration_grid_on_forecast(
+    forecast_df,
+    label="forecast",
+    p50_scales=(1.00, 1.10, 1.20, 1.30, 1.40),
+    p70_scales=(1.00, 1.05, 1.10, 1.15, 1.20),
+    p50_gates=(None,),
+    p70_gates=(None,),
+    occ_col="occ_prob_mean",
+    max_print=20,
+):
+    """
+    Run a calibration grid on an existing forecast_df.
+
+    Recommended usage:
+      1) Try scale-only for P50 first.
+      2) Try gate + scale for P70 if active_ratio is too high.
+    """
+    rows = []
+    outputs = {}
+
+    print("\n" + "=" * 80)
+    print(f"CALIBRATION GRID: {label}")
+    print("=" * 80)
+
+    base_diag = _forecast_basic_diagnostics(forecast_df, label=f"{label}_base")
+    print("\nBase diagnostics:")
+    print(base_diag.T)
+
+    for p50_scale in p50_scales:
+        for p70_scale in p70_scales:
+            for p50_gate in p50_gates:
+                for p70_gate in p70_gates:
+                    calibrated_df = apply_forecast_calibration(
+                        forecast_df,
+                        p50_scale=p50_scale,
+                        p70_scale=p70_scale,
+                        p50_gate=p50_gate,
+                        p70_gate=p70_gate,
+                        occ_col=occ_col,
+                    )
+
+                    case_label = (
+                        f"{label}|p50s={p50_scale:.2f}|p70s={p70_scale:.2f}|"
+                        f"p50g={p50_gate}|p70g={p70_gate}"
+                    )
+
+                    diag = _forecast_basic_diagnostics(
+                        calibrated_df,
+                        label=case_label
+                    ).iloc[0].to_dict()
+
+                    out = _run_wape_for_forecast_df(
+                        calibrated_df,
+                        label=case_label
+                    )
+
+                    penalty_vals = _extract_penalty_values(out)
+
+                    row = {
+                        "label": case_label,
+                        "p50_scale": p50_scale,
+                        "p70_scale": p70_scale,
+                        "p50_gate": p50_gate,
+                        "p70_gate": p70_gate,
+                    }
+                    row.update(diag)
+                    row.update(penalty_vals)
+
+                    rows.append(row)
+                    outputs[case_label] = out
+
+    summary = pd.DataFrame(rows)
+
+    print("\n" + "=" * 80)
+    print(f"CALIBRATION SUMMARY: {label}")
+    print("=" * 80)
+
+    if "p50_penalty_diff" in summary.columns:
+        print("\nTop P50 by penalty diff, more negative is better:")
+        print(
+            summary.sort_values("p50_penalty_diff")
+            .head(max_print)[
+                [
+                    "label",
+                    "p50_scale",
+                    "p50_gate",
+                    "p50_mean",
+                    "p50_active_ratio",
+                    "p50_active_over_true_ratio",
+                    "p50_zero_mean_on_true_zero",
+                    "p50_penalty_diff",
+                ]
+            ]
+        )
+
+    if "p70_penalty_diff" in summary.columns:
+        print("\nTop P70 by penalty diff, more negative is better:")
+        print(
+            summary.sort_values("p70_penalty_diff")
+            .head(max_print)[
+                [
+                    "label",
+                    "p70_scale",
+                    "p70_gate",
+                    "p70_mean",
+                    "p70_active_ratio",
+                    "p70_active_over_true_ratio",
+                    "p70_zero_mean_on_true_zero",
+                    "p70_penalty_diff",
+                ]
+            ]
+        )
+
+    return {
+        "summary": summary,
+        "outputs": outputs,
+        "base_diag": base_diag,
+    }
+
+
+def run_p50_calibration_check(
+    result,
+    source="original",
+    M=200,
+    p50_scales=(1.00, 1.10, 1.20, 1.30, 1.40, 1.50),
+    p50_gates=(None, 0.30, 0.40, 0.50),
+):
+    """
+    Focused P50 calibration.
+
+    source:
+      - "original": use result["forecast_df"], sampling output.
+      - "smooth": regenerate smooth output.
+      - "hybrid_0.8": generate hybrid with tau=0.8.
+    """
+    model = result["model"]
+    va_ld = result["va_ld"]
+
+    if source == "original":
+        forecast_df = result["forecast_df"].copy()
+    elif source == "smooth":
+        forecast_df = generate_forecast_df_smooth(
+            model,
+            va_ld,
+            M=M
+        )
+    elif source.startswith("hybrid"):
+        try:
+            tau = float(source.split("_")[1])
+        except Exception:
+            tau = 0.80
+
+        forecast_df = generate_forecast_df_hybrid(
+            model,
+            va_ld,
+            M=M,
+            tau50=tau,
+            tau70=tau,
+        )
+    else:
+        raise ValueError("source must be original, smooth, or hybrid_<tau>")
+
+    return run_calibration_grid_on_forecast(
+        forecast_df,
+        label=f"P50_calibration_{source}",
+        p50_scales=p50_scales,
+        p70_scales=(1.0,),
+        p50_gates=p50_gates,
+        p70_gates=(None,),
+        occ_col="occ_prob_mean",
+        max_print=20,
+    )
+
+
+def run_p70_gate_scale_calibration_check(
+    result,
+    source="hybrid_0.8",
+    M=200,
+    p70_scales=(0.90, 1.00, 1.10, 1.20, 1.30),
+    p70_gates=(None, 0.30, 0.40, 0.50, 0.60),
+):
+    """
+    Focused P70 calibration.
+
+    This tests whether P70 WAPE is high because:
+      - P70 magnitude is too low, needing scale up
+      - false positives are too high, needing occurrence gate
+    """
+    model = result["model"]
+    va_ld = result["va_ld"]
+
+    if source == "original":
+        forecast_df = result["forecast_df"].copy()
+    elif source == "smooth":
+        forecast_df = generate_forecast_df_smooth(
+            model,
+            va_ld,
+            M=M
+        )
+    elif source.startswith("hybrid"):
+        try:
+            tau = float(source.split("_")[1])
+        except Exception:
+            tau = 0.80
+
+        forecast_df = generate_forecast_df_hybrid(
+            model,
+            va_ld,
+            M=M,
+            tau50=tau,
+            tau70=tau,
+        )
+    else:
+        raise ValueError("source must be original, smooth, or hybrid_<tau>")
+
+    return run_calibration_grid_on_forecast(
+        forecast_df,
+        label=f"P70_gate_scale_calibration_{source}",
+        p50_scales=(1.0,),
+        p70_scales=p70_scales,
+        p50_gates=(None,),
+        p70_gates=p70_gates,
+        occ_col="occ_prob_mean",
+        max_print=20,
+    )
+
+
+def run_auto_calibration_checks(result, M=200):
+    """
+    Run focused calibration checks automatically.
+    This is intentionally smaller than a huge grid.
+
+    It prints:
+      1) P50 scale/gate calibration on original output
+      2) P70 gate/scale calibration on hybrid tau=0.8 output
+    """
+    print("\n" + "=" * 80)
+    print("AUTO CALIBRATION CHECKS")
+    print("=" * 80)
+
+    p50_calib = run_p50_calibration_check(
+        result,
+        source="original",
+        M=M,
+        p50_scales=(1.00, 1.10, 1.20, 1.30, 1.40, 1.50),
+        p50_gates=(None, 0.30, 0.40, 0.50),
+    )
+
+    p70_calib = run_p70_gate_scale_calibration_check(
+        result,
+        source="hybrid_0.8",
+        M=M,
+        p70_scales=(0.90, 1.00, 1.10, 1.20, 1.30),
+        p70_gates=(None, 0.30, 0.40, 0.50, 0.60),
+    )
+
+    return {
+        "p50_calibration": p50_calib,
+        "p70_calibration": p70_calib,
+    }
+
 # =====================================================
 # 9. Execute
 # =====================================================
@@ -2773,5 +3175,6 @@ def hybrid_active_magnitude_diagnosis(
 #         extreme_q=0.99,
 #         auto_output_rule_check=True,
 #         output_tau_grid=(0.50, 0.60, 0.70, 0.80),
+#         auto_calibration_check=True,
 #     )
 # )
