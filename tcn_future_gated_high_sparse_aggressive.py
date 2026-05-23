@@ -1,5 +1,5 @@
 """
-High-sparse aggressive experiment for:
+High-sparse positive-magnitude experiment for:
 TCN + Future-Gated SparsePeakAttn + ENN + Two-Head v3
 
 What this script does:
@@ -14,7 +14,8 @@ What this script does:
       prior_scale higher
       lambda_q slightly higher
       kl_weight slightly higher
-6. Optionally apply a light aggressive inference correction after prediction.
+6. Add positive-only magnitude losses during training to reduce active-week underbias.
+   No inference-time correction is used.
 
 Assumptions:
 - data_raw1 already exists in your notebook/session.
@@ -572,7 +573,52 @@ def pinball(y, pred, q):
     return torch.mean(torch.max(q * d, (q - 1) * d))
 
 
-def train(model, tr_ld, va_ld, epochs=10, nZ=8, lr=1e-3, lambda_q=0.05, beta_tail=0.5, kl_weight=0.001):
+def positive_magnitude_losses(y, mu, alpha=None):
+    """
+    Positive-only magnitude objectives.
+
+    These losses are computed only on active weeks y > 0.
+    They directly train the magnitude branch, instead of relying only on
+    the negative-binomial likelihood.
+
+    log_mag_loss: symmetric log-scale magnitude fit.
+    under_mag_loss: asymmetric penalty when predicted magnitude is below true magnitude.
+    """
+    pos_mask = y > 0
+
+    if pos_mask.sum() == 0:
+        zero = torch.tensor(0.0, device=y.device)
+        return zero, zero
+
+    y_pos = y[pos_mask]
+    mu_pos = mu[pos_mask].clamp(min=1e-6)
+
+    log_y = torch.log1p(y_pos)
+    log_mu = torch.log1p(mu_pos)
+
+    log_mag_loss = F.mse_loss(log_mu, log_y)
+
+    # Underforecast-only penalty on active weeks.
+    # This specifically targets rare active weeks whose magnitudes are too low.
+    under_gap = F.relu(log_y - log_mu)
+    under_mag_loss = torch.mean(under_gap ** 2)
+
+    return log_mag_loss, under_mag_loss
+
+
+def train(
+    model,
+    tr_ld,
+    va_ld,
+    epochs=10,
+    nZ=8,
+    lr=1e-3,
+    lambda_q=0.05,
+    beta_tail=0.5,
+    kl_weight=0.001,
+    lambda_logmag=0.10,
+    lambda_under_mag=0.20
+):
     opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
     sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
 
@@ -584,6 +630,8 @@ def train(model, tr_ld, va_ld, epochs=10, nZ=8, lr=1e-3, lambda_q=0.05, beta_tai
         tr_loss = 0.0
         last_occ_loss = 0.0
         last_mag_loss = 0.0
+        last_logmag_loss = 0.0
+        last_under_mag_loss = 0.0
         last_kl = 0.0
 
         for b in tr_ld:
@@ -593,23 +641,36 @@ def train(model, tr_ld, va_ld, epochs=10, nZ=8, lr=1e-3, lambda_q=0.05, beta_tai
 
             preds, kl = model(x, fc, nZ=nZ)
             losses, occ_losses, mag_losses = [], [], []
+            logmag_losses, under_mag_losses = [], []
 
             for occ_logit, occ_prob, mu, alpha in preds:
                 loss_i, occ_i, mag_i = two_head_loss(y, occ_logit, mu, alpha, beta_tail=beta_tail)
+                logmag_i, undermag_i = positive_magnitude_losses(y, mu, alpha)
+
                 losses.append(loss_i)
                 occ_losses.append(occ_i)
                 mag_losses.append(mag_i)
+                logmag_losses.append(logmag_i)
+                under_mag_losses.append(undermag_i)
 
             main_loss = sum(losses) / nZ
             occ_loss = sum(occ_losses) / nZ
             mag_loss = sum(mag_losses) / nZ
+            logmag_loss = sum(logmag_losses) / nZ
+            under_mag_loss = sum(under_mag_losses) / nZ
 
             exp_stack = torch.stack([occ_prob * mu for occ_logit, occ_prob, mu, alpha in preds], dim=1)
             p50_train = exp_stack.quantile(0.5, dim=1)
             p70_train = torch.maximum(exp_stack.quantile(0.7, dim=1), p50_train)
             q_loss = pinball(y, p50_train, 0.5) + pinball(y, p70_train, 0.7)
 
-            loss = main_loss + lambda_q * q_loss + kl_weight * kl
+            loss = (
+                main_loss
+                + lambda_q * q_loss
+                + lambda_logmag * logmag_loss
+                + lambda_under_mag * under_mag_loss
+                + kl_weight * kl
+            )
 
             opt.zero_grad()
             loss.backward()
@@ -619,6 +680,8 @@ def train(model, tr_ld, va_ld, epochs=10, nZ=8, lr=1e-3, lambda_q=0.05, beta_tai
             tr_loss += loss.item()
             last_occ_loss = occ_loss.item()
             last_mag_loss = mag_loss.item()
+            last_logmag_loss = logmag_loss.item()
+            last_under_mag_loss = under_mag_loss.item()
             last_kl = kl.item()
 
         sch.step()
@@ -641,6 +704,8 @@ def train(model, tr_ld, va_ld, epochs=10, nZ=8, lr=1e-3, lambda_q=0.05, beta_tai
             f"val={vl:.4f} | "
             f"occ={last_occ_loss:.4f} | "
             f"mag={last_mag_loss:.4f} | "
+            f"logmag={last_logmag_loss:.4f} | "
+            f"undermag={last_under_mag_loss:.4f} | "
             f"kl={last_kl:.4f}"
         )
 
@@ -815,7 +880,9 @@ def run_one_group(
     M_eval=50,
     lambda_q=0.05,
     beta_tail=0.5,
-    kl_weight=0.001
+    kl_weight=0.001,
+    lambda_logmag=0.10,
+    lambda_under_mag=0.20
 ):
     print("\n" + "#" * 70)
     print(f"Running group: {group_name}")
@@ -857,7 +924,9 @@ def run_one_group(
         lr=1e-3,
         lambda_q=lambda_q,
         beta_tail=beta_tail,
-        kl_weight=kl_weight
+        kl_weight=kl_weight,
+        lambda_logmag=lambda_logmag,
+        lambda_under_mag=lambda_under_mag
     )
 
     pl50, pl70 = evaluate(model, va_ld, M=100)
@@ -949,7 +1018,7 @@ def run_one_group(
 # 7. Run high_sparse only
 # =====================================================
 
-def run_high_sparse_aggressive_experiment(
+def run_high_sparse_posmag_experiment(
     data_raw1,
     n_asins=5000,
     zero_thresholds=(0.4, 0.7),
@@ -964,7 +1033,9 @@ def run_high_sparse_aggressive_experiment(
     M_eval=80,
     lambda_q=0.10,
     beta_tail=1.0,
-    kl_weight=0.003
+    kl_weight=0.003,
+    lambda_logmag=0.10,
+    lambda_under_mag=0.20
 ):
     data_small = prepare_data_sample(data_raw1, n_asins=n_asins)
     data_grouped, asin_stats = add_zero_rate_group(data_small, zero_thresholds=zero_thresholds)
@@ -980,10 +1051,11 @@ def run_high_sparse_aggressive_experiment(
     print("Aggressive training settings:")
     print(f"  beta_tail={beta_tail}, beta_peak={beta_peak}, prior_scale={prior_scale}")
     print(f"  lambda_q={lambda_q}, kl_weight={kl_weight}, M_eval={M_eval}")
+    print(f"  lambda_logmag={lambda_logmag}, lambda_under_mag={lambda_under_mag}")
 
     result = run_one_group(
         data_high,
-        group_name='high_sparse_aggressive',
+        group_name='high_sparse_posmag',
         prior_scale=prior_scale,
         beta_peak=beta_peak,
         epochs=epochs,
@@ -995,13 +1067,15 @@ def run_high_sparse_aggressive_experiment(
         M_eval=M_eval,
         lambda_q=lambda_q,
         beta_tail=beta_tail,
-        kl_weight=kl_weight
+        kl_weight=kl_weight,
+        lambda_logmag=lambda_logmag,
+        lambda_under_mag=lambda_under_mag
     )
 
     summary_df = pd.DataFrame([result['summary']])
 
     print("\n" + "=" * 80)
-    print("HIGH-SPARSE AGGRESSIVE SUMMARY")
+    print("HIGH-SPARSE POSITIVE-MAGNITUDE SUMMARY")
     print("=" * 80)
     print(summary_df)
 
@@ -1012,7 +1086,7 @@ def run_high_sparse_aggressive_experiment(
 # 8. Execute
 # =====================================================
 
-high_sparse_result, high_sparse_summary_df, asin_zero_stats = run_high_sparse_aggressive_experiment(
+high_sparse_result, high_sparse_summary_df, asin_zero_stats = run_high_sparse_posmag_experiment(
     data_raw1,
     n_asins=5000,
     zero_thresholds=(0.4, 0.7),
@@ -1027,5 +1101,7 @@ high_sparse_result, high_sparse_summary_df, asin_zero_stats = run_high_sparse_ag
     M_eval=80,
     lambda_q=0.10,
     beta_tail=1.0,
-    kl_weight=0.003
+    kl_weight=0.003,
+    lambda_logmag=0.10,
+    lambda_under_mag=0.20
 )
