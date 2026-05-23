@@ -20,6 +20,8 @@ Compared with the NB-only version:
 - Includes z-effect diagnostics.
 - No early stopping: training always runs the requested number of epochs.
 - Optional p99 extreme-ASIN filter: remove ASINs whose max demand exceeds positive-demand p99.
+- Direct future-context effects: holiday / in-stock / price directly shift occurrence and magnitude.
+- Built-in diagnostics: anchor vs loc vs sampling vs smooth forecast.
 - Includes optional WAPE hook if calculate_wape_using_lp_oos2 and quick_error_check exist.
 """
 
@@ -749,6 +751,8 @@ class TCN_ENN_LogNormal(nn.Module):
         loc_shift_tanh=True,
         mag_grad_mix=0.30,
         loc_resid_scale=0.60,
+        occ_ctx_scale=0.50,
+        loc_ctx_scale=0.30,
     ):
         super().__init__()
 
@@ -760,6 +764,8 @@ class TCN_ENN_LogNormal(nn.Module):
         self.loc_enn_scale = loc_enn_scale
         self.occ_shift_clip = occ_shift_clip
         self.loc_shift_tanh = loc_shift_tanh
+        self.occ_ctx_scale = occ_ctx_scale
+        self.loc_ctx_scale = loc_ctx_scale
 
         self.encoder = TCNSparseAttnEncoder(
             input_dim=input_dim,
@@ -805,6 +811,21 @@ class TCN_ENN_LogNormal(nn.Module):
             nn.Sigmoid()
         )
 
+        # Direct future-context effects.
+        # The same future context still affects z indirectly through z_generator,
+        # but now it can also directly shift horizon-specific occurrence and magnitude.
+        self.context_occ_head = nn.Sequential(
+            nn.Linear(context_dim, 32),
+            nn.ReLU(),
+            nn.Linear(32, 1)
+        )
+
+        self.context_loc_head = nn.Sequential(
+            nn.Linear(context_dim, 32),
+            nn.ReLU(),
+            nn.Linear(32, 1)
+        )
+
     def _encode(self, x, future_context, static=None):
         B = x.shape[0]
 
@@ -822,6 +843,32 @@ class TCN_ENN_LogNormal(nn.Module):
             peak_gate=peak_gate,
             static_emb=static_emb
         )
+
+        # Direct horizon-specific future context effect.
+        # This lets holiday / in_stock / price directly affect each future horizon,
+        # while the same context is still used indirectly through z_generator.
+        _, H, C = future_context.shape
+        ctx_flat = future_context.reshape(B * H, C)
+
+        occ_ctx_shift = self.context_occ_head(ctx_flat).view(B, H)
+        loc_ctx_shift = self.context_loc_head(ctx_flat).view(B, H)
+
+        occ_logit_base = (
+            occ_logit_base
+            + self.occ_ctx_scale * torch.tanh(occ_ctx_shift)
+        )
+
+        loc_base = (
+            loc_base
+            + self.loc_ctx_scale * torch.tanh(loc_ctx_shift)
+        )
+
+        loc_base = torch.nan_to_num(
+            loc_base,
+            nan=0.0,
+            posinf=6.0,
+            neginf=-3.0
+        ).clamp(-3.0, 6.0)
 
         if static_emb is not None:
             phi = torch.cat([h_t, static_emb], dim=-1)
@@ -1551,6 +1598,301 @@ def check_z_effect(model, va_ld, nZ=50, max_batches=5):
     return z_df
 
 
+
+def predict_smooth_quantile(model, x, future_context, M=200, static=None):
+    """
+    Smooth forecast version:
+    Instead of Bernoulli sampling, use occ_prob * conditional magnitude quantiles.
+
+    This is for diagnosis / alternative business forecast output.
+    It checks whether zero-inflated sampling quantiles are making p50/p70 too conservative.
+    """
+    model.eval()
+
+    with torch.no_grad():
+        occ_logit_base, loc_base, scale_base, phi = model._encode(
+            x, future_context, static
+        )
+
+        z_mean, z_std, _ = model.z_generator(phi, future_context)
+
+        p50_list = []
+        p70_list = []
+        occ_list = []
+        loc_list = []
+        scale_list = []
+
+        for _ in range(M):
+            eps_z = torch.randn_like(z_mean)
+            z = z_mean + z_std * eps_z
+
+            _, occ_prob, loc, scale = model._apply_epinet(
+                occ_logit_base, loc_base, scale_base, phi, z
+            )
+
+            mag_p50 = torch.exp(loc) - 1.0
+            mag_p70 = torch.exp(loc + 0.5244 * scale) - 1.0
+
+            p50_list.append(occ_prob * mag_p50)
+            p70_list.append(occ_prob * mag_p70)
+            occ_list.append(occ_prob)
+            loc_list.append(loc)
+            scale_list.append(scale)
+
+        p50 = torch.stack(p50_list, dim=0).mean(dim=0)
+        p70 = torch.stack(p70_list, dim=0).mean(dim=0)
+        p70 = torch.maximum(p70, p50)
+
+        occ_mean = torch.stack(occ_list, dim=0).mean(dim=0)
+        loc_mean = torch.stack(loc_list, dim=0).mean(dim=0)
+        scale_mean = torch.stack(scale_list, dim=0).mean(dim=0)
+
+    return p50, p70, occ_mean, loc_mean, scale_mean
+
+
+def mag_anchor_output_diagnosis(result, M=200):
+    """
+    Diagnosis for three possible bottlenecks:
+      1) anchor itself is too low
+      2) loc_base / z-adjusted loc is too low
+      3) zero-inflated sampling quantile suppresses p50/p70
+    """
+    model = result["model"]
+    va_ld = result["va_ld"]
+
+    rows = []
+    model.eval()
+
+    with torch.no_grad():
+        for b in va_ld:
+            x = b["x"]
+            fc = b["future_context"]
+            y = b["y"]
+            static = b.get("static", None)
+
+            occ_logit_base, loc_base, scale_base, phi = model._encode(x, fc, static)
+            occ_base = torch.sigmoid(occ_logit_base)
+
+            anchor_feats = x[:, -1, [8, 9, 10]]
+            loc_anchor = (
+                0.40 * anchor_feats[:, 0]
+                + 0.40 * anchor_feats[:, 1]
+                + 0.20 * anchor_feats[:, 2]
+            ).unsqueeze(1).expand_as(y)
+
+            anchor_demand = torch.expm1(loc_anchor).clamp(min=0)
+            loc_base_demand = torch.expm1(loc_base).clamp(min=0)
+
+            p50_sample, p70_sample = model.predict(x, fc, M=M, static=static)
+
+            p50_smooth, p70_smooth, occ_mean, loc_mean, scale_mean = predict_smooth_quantile(
+                model, x, fc, M=M, static=static
+            )
+
+            loc_z_demand = torch.expm1(loc_mean).clamp(min=0)
+            cond_p50_mag = torch.expm1(loc_mean).clamp(min=0)
+            cond_p70_mag = torch.exp(loc_mean + 0.5244 * scale_mean).sub(1.0).clamp(min=0)
+
+            pos = y > 0
+
+            if pos.sum() > 0:
+                rows.append({
+                    "n_active": pos.sum().item(),
+                    "true_active_mean": y[pos].mean().item(),
+                    "anchor_active_mean": anchor_demand[pos].mean().item(),
+                    "loc_base_active_mean": loc_base_demand[pos].mean().item(),
+                    "loc_z_active_mean": loc_z_demand[pos].mean().item(),
+                    "conditional_mag_p50_active_mean": cond_p50_mag[pos].mean().item(),
+                    "conditional_mag_p70_active_mean": cond_p70_mag[pos].mean().item(),
+                    "sample_p50_active_mean": p50_sample[pos].mean().item(),
+                    "sample_p70_active_mean": p70_sample[pos].mean().item(),
+                    "smooth_p50_active_mean": p50_smooth[pos].mean().item(),
+                    "smooth_p70_active_mean": p70_smooth[pos].mean().item(),
+                    "occ_base_active_mean": occ_base[pos].mean().item(),
+                    "occ_z_active_mean": occ_mean[pos].mean().item(),
+                    "occ_z_active_p25": occ_mean[pos].quantile(0.25).item(),
+                    "occ_z_active_p50": occ_mean[pos].quantile(0.50).item(),
+                    "occ_z_active_p75": occ_mean[pos].quantile(0.75).item(),
+                    "scale_base_active_mean": scale_base[pos].mean().item(),
+                    "scale_z_active_mean": scale_mean[pos].mean().item(),
+                })
+
+    diag = pd.DataFrame(rows)
+
+    print("\n" + "=" * 80)
+    print("MAG / ANCHOR / OUTPUT DIAGNOSIS")
+    print("=" * 80)
+
+    if len(diag) == 0:
+        print("No active validation rows found.")
+        return diag
+
+    summary = diag.describe().T
+
+    cols_to_show = [
+        "true_active_mean",
+        "anchor_active_mean",
+        "loc_base_active_mean",
+        "loc_z_active_mean",
+        "conditional_mag_p50_active_mean",
+        "conditional_mag_p70_active_mean",
+        "sample_p50_active_mean",
+        "sample_p70_active_mean",
+        "smooth_p50_active_mean",
+        "smooth_p70_active_mean",
+        "occ_z_active_mean",
+        "occ_z_active_p25",
+        "occ_z_active_p50",
+        "occ_z_active_p75",
+        "scale_z_active_mean",
+    ]
+
+    print(summary.loc[cols_to_show])
+
+    ratio_df = pd.DataFrame([{
+        "anchor / true": diag["anchor_active_mean"].mean() / diag["true_active_mean"].mean(),
+        "loc_base / true": diag["loc_base_active_mean"].mean() / diag["true_active_mean"].mean(),
+        "loc_z / true": diag["loc_z_active_mean"].mean() / diag["true_active_mean"].mean(),
+        "cond_p50_mag / true": diag["conditional_mag_p50_active_mean"].mean() / diag["true_active_mean"].mean(),
+        "cond_p70_mag / true": diag["conditional_mag_p70_active_mean"].mean() / diag["true_active_mean"].mean(),
+        "sample_p50 / true": diag["sample_p50_active_mean"].mean() / diag["true_active_mean"].mean(),
+        "sample_p70 / true": diag["sample_p70_active_mean"].mean() / diag["true_active_mean"].mean(),
+        "smooth_p50 / true": diag["smooth_p50_active_mean"].mean() / diag["true_active_mean"].mean(),
+        "smooth_p70 / true": diag["smooth_p70_active_mean"].mean() / diag["true_active_mean"].mean(),
+    }]).T.rename(columns={0: "ratio"})
+
+    print("\nKey ratios:")
+    print(ratio_df)
+
+    print("\nInterpretation guide:")
+    print("1) If anchor/true is low: historical anchor is too conservative.")
+    print("2) If loc_z/true is low: magnitude model is still conservative.")
+    print("3) If loc_z is okay but sample_p70 is low: zero-inflated sampling quantile suppresses output.")
+    print("4) If smooth_p70 improves WAPE a lot: output rule, not model learning, is the bottleneck.")
+
+    return diag
+
+
+def generate_forecast_df_smooth(model, va_ld, M=200):
+    """
+    Generate forecast_df with smooth quantile output.
+    No retraining needed.
+    """
+    rows = []
+    model.eval()
+
+    with torch.no_grad():
+        for b in va_ld:
+            x = b["x"]
+            fc = b["future_context"]
+            y = b["y"]
+            oos = b["oos"]
+            static = b.get("static", None)
+
+            p50, p70, _, _, _ = predict_smooth_quantile(model, x, fc, M=M, static=static)
+
+            hist_mean = (
+                x[:, :, 0].exp() - 1
+            ).mean(dim=1, keepdim=True).clamp(min=0)
+
+            hm50 = hist_mean.expand_as(y)
+            hm70 = hm50 * 1.25
+
+            for i in range(y.shape[0]):
+                for h in range(y.shape[1]):
+                    rows.append({
+                        "asin": b["asin"][i],
+                        "order_week": pd.to_datetime(b["target_week"][h][i]),
+                        "fcst_week_index": h + 1,
+                        "fbi_demand": y[i, h].item(),
+                        "scot_oos": oos[i, h].item(),
+                        "oos": oos[i, h].item(),
+                        "oos_status": oos[i, h].item(),
+                        "p50_amxl": p50[i, h].item(),
+                        "p70_amxl": p70[i, h].item(),
+                        "p50_scot": hm50[i, h].item(),
+                        "p70_scot": hm70[i, h].item(),
+                    })
+
+    return pd.DataFrame(rows)
+
+
+def run_smooth_wape_check(result, M=200):
+    """
+    Generate smooth forecast and run WAPE if your notebook has:
+      calculate_wape_using_lp_oos2
+      quick_error_check
+    """
+    model = result["model"]
+    va_ld = result["va_ld"]
+
+    forecast_df_smooth = generate_forecast_df_smooth(model, va_ld, M=M)
+
+    print("\n" + "=" * 80)
+    print("SMOOTH FORECAST WAPE CHECK")
+    print("=" * 80)
+    print("Smooth forecast rows:", len(forecast_df_smooth))
+    print("Smooth forecast ASINs:", forecast_df_smooth["asin"].nunique())
+    print("Smooth forecast zero rate:", (forecast_df_smooth["fbi_demand"] == 0).mean())
+
+    outputs = {"forecast_df_smooth": forecast_df_smooth}
+
+    if (
+        "calculate_wape_using_lp_oos2" in globals()
+        and "quick_error_check" in globals()
+    ):
+        quantiles = [0.5, 0.7]
+
+        wape_df_smooth = calculate_wape_using_lp_oos2(
+            forecast_df_smooth,
+            quantiles,
+            remove_oos_dp=True,
+            source="lp"
+        )
+
+        cols_p50 = [
+            "p50_amxl_penalty",
+            "p50_scot_penalty",
+            "p50_amxl_overbias",
+            "p50_scot_overbias",
+            "p50_amxl_underbias",
+            "p50_scot_underbias",
+            "fbi_demand",
+        ]
+
+        cols_p70 = [
+            "p70_amxl_penalty",
+            "p70_scot_penalty",
+            "p70_amxl_overbias",
+            "p70_scot_overbias",
+            "p70_amxl_underbias",
+            "p70_scot_underbias",
+            "fbi_demand",
+        ]
+
+        p50_wape_smooth, p50_penalty_diff_smooth = quick_error_check(wape_df_smooth, cols_p50)
+        p70_wape_smooth, p70_penalty_diff_smooth = quick_error_check(wape_df_smooth, cols_p70)
+
+        print("\nSmooth P50 WAPE / Penalty Summary:")
+        print(p50_wape_smooth)
+        print("Smooth P50 penalty diff:", p50_penalty_diff_smooth)
+
+        print("\nSmooth P70 WAPE / Penalty Summary:")
+        print(p70_wape_smooth)
+        print("Smooth P70 penalty diff:", p70_penalty_diff_smooth)
+
+        outputs.update({
+            "wape_df_smooth": wape_df_smooth,
+            "p50_wape_smooth": p50_wape_smooth,
+            "p70_wape_smooth": p70_wape_smooth,
+            "p50_penalty_diff_smooth": p50_penalty_diff_smooth,
+            "p70_penalty_diff_smooth": p70_penalty_diff_smooth,
+        })
+    else:
+        print("WAPE skipped: calculate_wape_using_lp_oos2 or quick_error_check not found.")
+
+    return outputs
+
 # =====================================================
 # 8. Main run functions
 # =====================================================
@@ -1638,6 +1980,8 @@ def run_one_group(
         occ_shift_clip=2.0,
         mag_grad_mix=0.30,
         loc_resid_scale=0.60,
+        occ_ctx_scale=0.50,
+        loc_ctx_scale=0.30,
     )
 
     print(
@@ -1701,6 +2045,14 @@ def run_one_group(
     )
 
     mag_gap_df = magnitude_gap(diag_df)
+
+    mag_output_diag = mag_anchor_output_diagnosis(
+        {
+            "model": model,
+            "va_ld": va_ld
+        },
+        M=M_eval
+    )
 
     print("\nUnderbias Diagnosis - P50:")
     print(diag_p50.T)
@@ -1801,6 +2153,7 @@ def run_one_group(
         "diag_p50": diag_p50,
         "diag_p70": diag_p70,
         "mag_gap": mag_gap_df,
+        "mag_output_diag": mag_output_diag,
         "anchor_diag_df": anchor_diag_df,
         "z_effect_df": z_effect_df,
         "p50_wape": p50_wape,
