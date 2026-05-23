@@ -415,10 +415,15 @@ class TCNSparseAttnEncoder(nn.Module):
         h = self.sparse_attn(h.permute(0, 2, 1), b_t, peak_score, peak_gate=peak_gate)
         h_t = self.final_norm(h[:, -1, :])
 
+        # occurrence：完整梯度回流到 encoder
+        # encoder 专注学习 occurrence 的时序表示
         h_occ = self.occ_proj(h_t)
         occ_logit_base = self.occurrence_head(h_occ)
 
-        mag_inp = [h_t, anchor_feats]
+        # magnitude：detach h_t，切断 LogNormal 梯度对 encoder 的干扰
+        # z 通过 epinet 的 loc_e 仍然影响 magnitude，joint prediction 不受影响
+        h_t_mag = h_t.detach()
+        mag_inp = [h_t_mag, anchor_feats]
         if static_emb is not None:
             mag_inp.append(static_emb)
         mag_inp = torch.cat(mag_inp, dim=-1)
@@ -618,7 +623,7 @@ class TCN_ENN_LogNormal(nn.Module):
 # 4. Loss / Train / Eval
 # =====================================================
 
-def lognormal_enn_loss(y, occ_logit, loc, scale, occ_pos_weight=2.5):
+def lognormal_enn_loss(y, occ_logit, loc, scale, occ_pos_weight=1.5):
     active = (y > 0).float()
     pos_weight = torch.tensor(occ_pos_weight, device=y.device, dtype=y.dtype)
     occ_loss = F.binary_cross_entropy_with_logits(occ_logit, active, pos_weight=pos_weight)
@@ -651,7 +656,7 @@ def train(
     nZ=8,
     lr=5e-4,
     kl_weight=0.003,
-    occ_pos_weight=2.5,    # 4.0 → 2.5：更接近理论值，稳定梯度
+    occ_pos_weight=1.5,    # 4.0 → 2.5：更接近理论值，稳定梯度
     M_val=100,
     patience=5,            # 早停
 ):
@@ -964,7 +969,7 @@ def run_one_group(
     batch_size=128,    # 64 → 128
     M_eval=200,
     kl_weight=0.003,
-    occ_pos_weight=2.5,  # 4.0 → 2.5
+    occ_pos_weight=1.5,  # 4.0 → 2.5
     patience=5,
 ):
     print("\n" + "#" * 70)
@@ -1105,7 +1110,7 @@ def run_high_sparse_joint_regime_experiment(
     batch_size=128,
     M_eval=200,
     kl_weight=0.003,
-    occ_pos_weight=2.5,
+    occ_pos_weight=1.5,
     patience=5,
 ):
     data_small = prepare_data_sample(data_raw1, n_asins=n_asins)
@@ -1175,7 +1180,7 @@ high_sparse_joint_result, high_sparse_joint_summary_df, asin_zero_stats = (
         batch_size=128,
         M_eval=200,
         kl_weight=0.003,
-        occ_pos_weight=2.5,
+        occ_pos_weight=1.5,
         patience=5,
     )
 )
