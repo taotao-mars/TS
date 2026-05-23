@@ -11,7 +11,7 @@ Main changes vs previous version:
       active ~ Bernoulli(occ_prob)
       magnitude ~ LogNormal(loc, scale) - 1
 5. ENN only perturbs LogNormal loc with small scale; scale is treated as aleatoric noise.
-6. Stage-1 stable training: P70/P80 under-loss defaults to 0 and can be turned on later.
+6. Stage-1 stable training: P70 under-loss defaults to 0 and can be turned on later.
 
 Assumptions:
 - data_raw1 already exists in notebook/session.
@@ -667,13 +667,9 @@ class TCN_ENN_LogNormal(nn.Module):
             samples = torch.stack(samples, dim=1)
             p50 = samples.quantile(0.5, dim=1)
             p70 = samples.quantile(0.7, dim=1)
-            p80 = samples.quantile(0.8, dim=1)
-            p90 = samples.quantile(0.9, dim=1)
             p70 = torch.maximum(p70, p50)
-            p80 = torch.maximum(p80, p70)
-            p90 = torch.maximum(p90, p80)
 
-        return p50, p70, p80, p90
+        return p50, p70
 
 
 # =====================================================
@@ -691,7 +687,6 @@ def lognormal_two_head_loss(
     loc,
     scale,
     lambda_p70_under=0.0,
-    lambda_p80_under=0.0,
 ):
     """
     Distribution loss:
@@ -706,7 +701,7 @@ def lognormal_two_head_loss(
     if pos_mask.sum() == 0:
         zero = torch.tensor(0.0, device=y.device)
         total = occ_loss
-        return total, occ_loss, zero, zero, zero
+        return total, occ_loss, zero, zero
 
     log_y = torch.log1p(y[pos_mask])
     # Safety: keep distribution parameters finite and bounded.
@@ -724,19 +719,14 @@ def lognormal_two_head_loss(
     rel_under70 = F.relu(y[pos_mask] - p70_mag[pos_mask]) / (y[pos_mask] + 1e-6)
     p70_under_loss = torch.mean(rel_under70 ** 2)
 
-    z80 = 0.8416
-    p80_mag = torch.exp((loc + scale * z80).clamp(min=-3.0, max=8.0)) - 1.0
-    rel_under80 = F.relu(y[pos_mask] - p80_mag[pos_mask]) / (y[pos_mask] + 1e-6)
-    p80_under_loss = torch.mean(rel_under80 ** 2)
 
     total = (
         occ_loss
         + mag_nll
         + lambda_p70_under * p70_under_loss
-        + lambda_p80_under * p80_under_loss
     )
 
-    return total, occ_loss, mag_nll, p70_under_loss, p80_under_loss
+    return total, occ_loss, mag_nll, p70_under_loss
 
 
 def train(
@@ -749,7 +739,6 @@ def train(
     lambda_q=0.10,
     kl_weight=0.003,
     lambda_p70_under=0.0,
-    lambda_p80_under=0.0,
 ):
     opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
     sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
@@ -763,7 +752,6 @@ def train(
         last_occ = 0.0
         last_mag_nll = 0.0
         last_p70_under = 0.0
-        last_p80_under = 0.0
         last_kl = 0.0
 
         for b in tr_ld:
@@ -778,23 +766,20 @@ def train(
             occ_losses = []
             mag_losses = []
             p70_under_losses = []
-            p80_under_losses = []
             exp_samples = []
 
             for occ_logit, occ_prob, loc, scale in preds:
-                loss_i, occ_i, mag_i, p70u_i, p80u_i = lognormal_two_head_loss(
+                loss_i, occ_i, mag_i, p70u_i = lognormal_two_head_loss(
                     y,
                     occ_logit,
                     loc,
                     scale,
                     lambda_p70_under=lambda_p70_under,
-                    lambda_p80_under=lambda_p80_under,
                 )
                 losses.append(loss_i)
                 occ_losses.append(occ_i)
                 mag_losses.append(mag_i)
                 p70_under_losses.append(p70u_i)
-                p80_under_losses.append(p80u_i)
 
                 # Expected active magnitude under LogNormal on original scale.
                 # E[exp(N(loc, scale^2)) - 1] = exp(loc + 0.5 scale^2) - 1.
@@ -806,7 +791,6 @@ def train(
             occ_loss = sum(occ_losses) / nZ
             mag_nll = sum(mag_losses) / nZ
             p70_under_loss = sum(p70_under_losses) / nZ
-            p80_under_loss = sum(p80_under_losses) / nZ
 
             exp_stack = torch.stack(exp_samples, dim=1)
             p50_train = exp_stack.quantile(0.5, dim=1)
@@ -824,7 +808,6 @@ def train(
             last_occ = occ_loss.item()
             last_mag_nll = mag_nll.item()
             last_p70_under = p70_under_loss.item()
-            last_p80_under = p80_under_loss.item()
             last_kl = kl.item()
 
         sch.step()
@@ -833,7 +816,7 @@ def train(
         vl = 0.0
         with torch.no_grad():
             for b in va_ld:
-                p50, p70, p80, p90 = model.predict(
+                p50, p70 = model.predict(
                     b['x'], b['future_context'], M=60, static=b.get('static', None)
                 )
                 vl += (pinball(b['y'], p50, 0.5) + pinball(b['y'], p70, 0.7)).item()
@@ -850,7 +833,6 @@ def train(
             f"occ={last_occ:.4f} | "
             f"mag_nll={last_mag_nll:.4f} | "
             f"p70_under={last_p70_under:.4f} | "
-            f"p80_under={last_p80_under:.4f} | "
             f"kl={last_kl:.4f}"
         )
 
@@ -860,42 +842,35 @@ def train(
 
 
 def evaluate(model, va_ld, M=100):
-    all_y, all_p50, all_p70, all_p80, all_p90 = [], [], [], [], []
+    all_y, all_p50, all_p70 = [], [], []
     model.eval()
     with torch.no_grad():
         for b in va_ld:
-            p50, p70, p80, p90 = model.predict(
+            p50, p70 = model.predict(
                 b['x'], b['future_context'], M=M, static=b.get('static', None)
             )
             all_y.append(b['y'].numpy())
             all_p50.append(p50.numpy())
             all_p70.append(p70.numpy())
-            all_p80.append(p80.numpy())
-            all_p90.append(p90.numpy())
 
     y = np.concatenate(all_y)
     p50 = np.concatenate(all_p50)
     p70 = np.concatenate(all_p70)
-    p80 = np.concatenate(all_p80)
-    p90 = np.concatenate(all_p90)
     yt = torch.tensor(y)
 
     return {
         'pinball50': pinball(yt, torch.tensor(p50), 0.5).item(),
         'pinball70': pinball(yt, torch.tensor(p70), 0.7).item(),
-        'pinball80': pinball(yt, torch.tensor(p80), 0.8).item(),
-        'pinball90': pinball(yt, torch.tensor(p90), 0.9).item(),
     }
 
-
-def generate_forecast_df(model, va_ld, M=100, chosen_high_quantile='p70'):
+def generate_forecast_df(model, va_ld, M=100):
     rows = []
     model.eval()
     with torch.no_grad():
         for b in va_ld:
             x, fc, y, oos = b['x'], b['future_context'], b['y'], b['oos']
             static = b.get('static', None)
-            p50, p70, p80, p90 = model.predict(x, fc, M=M, static=static)
+            p50, p70 = model.predict(x, fc, M=M, static=static)
 
             hist_mean = (x[:, :, 0].exp() - 1).mean(dim=1, keepdim=True).clamp(min=0)
             hm50 = hist_mean.expand_as(y)
@@ -913,24 +888,11 @@ def generate_forecast_df(model, va_ld, M=100, chosen_high_quantile='p70'):
                         'oos_status': oos[i, h].item(),
                         'p50_amxl': p50[i, h].item(),
                         'p70_amxl': p70[i, h].item(),
-                        'p80_amxl': p80[i, h].item(),
-                        'p90_amxl': p90[i, h].item(),
                         'p50_scot': hm50[i, h].item(),
                         'p70_scot': hm70[i, h].item(),
                     })
 
-    df = pd.DataFrame(rows)
-
-    # Optional: if you want business p70 to use a more aggressive quantile for high-sparse.
-    # Leave default as true p70. To test aggressive setting, set chosen_high_quantile='p80'.
-    if chosen_high_quantile == 'p80':
-        df['p70_amxl_eval'] = df['p80_amxl']
-    elif chosen_high_quantile == 'p90':
-        df['p70_amxl_eval'] = df['p90_amxl']
-    else:
-        df['p70_amxl_eval'] = df['p70_amxl']
-
-    return df
+    return pd.DataFrame(rows)
 
 
 # =====================================================
@@ -942,7 +904,7 @@ def generate_diagnostic_df(model, va_ld, M=100, threshold=0.5):
     model.eval()
     with torch.no_grad():
         for b in va_ld:
-            p50, p70, p80, p90 = model.predict(
+            p50, p70 = model.predict(
                 b['x'], b['future_context'], M=M, static=b.get('static', None)
             )
             for i in range(b['y'].shape[0]):
@@ -950,8 +912,6 @@ def generate_diagnostic_df(model, va_ld, M=100, threshold=0.5):
                     y_val = b['y'][i, h].item()
                     p50_val = p50[i, h].item()
                     p70_val = p70[i, h].item()
-                    p80_val = p80[i, h].item()
-                    p90_val = p90[i, h].item()
                     rows.append({
                         'asin': b['asin'][i],
                         'order_week': pd.to_datetime(b['target_week'][h][i]),
@@ -959,16 +919,11 @@ def generate_diagnostic_df(model, va_ld, M=100, threshold=0.5):
                         'y': y_val,
                         'p50': p50_val,
                         'p70': p70_val,
-                        'p80': p80_val,
-                        'p90': p90_val,
                         'true_active': int(y_val > 0),
                         'pred_active_p50': int(p50_val > threshold),
                         'pred_active_p70': int(p70_val > threshold),
-                        'pred_active_p80': int(p80_val > threshold),
-                        'pred_active_p90': int(p90_val > threshold),
                     })
     return pd.DataFrame(rows)
-
 
 def underbias_diagnosis(diag_df, pred_col='p70', threshold=0.5):
     y = diag_df['y'].values
@@ -1026,23 +981,15 @@ def magnitude_gap(diag_df):
     y = df['y'].values
     p50 = df['p50'].values
     p70 = df['p70'].values
-    p80 = df['p80'].values
-    p90 = df['p90'].values
 
     out = pd.DataFrame([{
         'true_active_mean': y.mean(),
         'p50_active_mean': p50.mean(),
         'p70_active_mean': p70.mean(),
-        'p80_active_mean': p80.mean(),
-        'p90_active_mean': p90.mean(),
         'p50_pct_of_true': p50.mean() / max(y.mean(), 1e-8),
         'p70_pct_of_true': p70.mean() / max(y.mean(), 1e-8),
-        'p80_pct_of_true': p80.mean() / max(y.mean(), 1e-8),
-        'p90_pct_of_true': p90.mean() / max(y.mean(), 1e-8),
         'p50_gap': y.mean() - p50.mean(),
         'p70_gap': y.mean() - p70.mean(),
-        'p80_gap': y.mean() - p80.mean(),
-        'p90_gap': y.mean() - p90.mean(),
     }])
 
     print("\n[Magnitude Gap - Active weeks only]")
@@ -1069,8 +1016,6 @@ def run_one_group(
     lambda_q=0.10,
     kl_weight=0.003,
     lambda_p70_under=0.0,
-    lambda_p80_under=0.0,
-    chosen_high_quantile='p70',
 ):
     print("\n" + "#" * 70)
     print(f"Running group: {group_name}")
@@ -1116,7 +1061,6 @@ def run_one_group(
         lambda_q=lambda_q,
         kl_weight=kl_weight,
         lambda_p70_under=lambda_p70_under,
-        lambda_p80_under=lambda_p80_under,
     )
 
     eval_metrics = evaluate(model, va_ld, M=M_eval)
@@ -1127,41 +1071,24 @@ def run_one_group(
         model,
         va_ld,
         M=M_eval,
-        chosen_high_quantile=chosen_high_quantile,
     )
     forecast_df['zero_group_run'] = group_name
 
     diag_df = generate_diagnostic_df(model, va_ld, M=M_eval, threshold=0.5)
     diag_p50 = underbias_diagnosis(diag_df, pred_col='p50', threshold=0.5)
     diag_p70 = underbias_diagnosis(diag_df, pred_col='p70', threshold=0.5)
-    diag_p80 = underbias_diagnosis(diag_df, pred_col='p80', threshold=0.5)
-    diag_p90 = underbias_diagnosis(diag_df, pred_col='p90', threshold=0.5)
     mag_gap = magnitude_gap(diag_df)
 
     print("\nUnderbias Diagnosis - P50:")
     print(diag_p50.T)
     print("\nUnderbias Diagnosis - P70:")
     print(diag_p70.T)
-    print("\nUnderbias Diagnosis - P80:")
-    print(diag_p80.T)
-    print("\nUnderbias Diagnosis - P90:")
-    print(diag_p90.T)
 
     # Business WAPE using your official functions.
     quantiles = [0.5, 0.7]
 
-    # If you want to evaluate p80/p90 as the business high quantile,
-    # overwrite p70_amxl before calling official WAPE.
-    wape_input = forecast_df.copy()
-    if chosen_high_quantile == 'p80':
-        wape_input['p70_amxl'] = wape_input['p80_amxl']
-        print("\nBusiness eval: using p80_amxl as p70_amxl")
-    elif chosen_high_quantile == 'p90':
-        wape_input['p70_amxl'] = wape_input['p90_amxl']
-        print("\nBusiness eval: using p90_amxl as p70_amxl")
-
     wape_df = calculate_wape_using_lp_oos2(
-        wape_input,
+        forecast_df,
         quantiles,
         remove_oos_dp=True,
         source='lp'
@@ -1206,15 +1133,10 @@ def run_one_group(
         'forecast_true_active_ratio': (forecast_df['fbi_demand'] > 0).mean(),
         'forecast_p50_active_ratio': (forecast_df['p50_amxl'] > 0).mean(),
         'forecast_p70_active_ratio': (forecast_df['p70_amxl'] > 0).mean(),
-        'forecast_p80_active_ratio': (forecast_df['p80_amxl'] > 0).mean(),
-        'forecast_p90_active_ratio': (forecast_df['p90_amxl'] > 0).mean(),
         'pinball50': eval_metrics['pinball50'],
         'pinball70': eval_metrics['pinball70'],
-        'pinball80': eval_metrics['pinball80'],
-        'pinball90': eval_metrics['pinball90'],
         'p50_penalty_diff': p50_penalty_diff,
         'p70_penalty_diff': p70_penalty_diff,
-        'chosen_high_quantile': chosen_high_quantile,
     }
 
     return {
@@ -1225,8 +1147,6 @@ def run_one_group(
         'diag_df': diag_df,
         'diag_p50': diag_p50,
         'diag_p70': diag_p70,
-        'diag_p80': diag_p80,
-        'diag_p90': diag_p90,
         'mag_gap': mag_gap,
         'p50_wape': p50_wape,
         'p70_wape': p70_wape,
@@ -1254,8 +1174,6 @@ def run_high_sparse_lognormal_experiment(
     lambda_q=0.10,
     kl_weight=0.003,
     lambda_p70_under=0.0,
-    lambda_p80_under=0.0,
-    chosen_high_quantile='p70',
 ):
     data_small = prepare_data_sample(data_raw1, n_asins=n_asins)
     data_grouped, asin_stats = add_zero_rate_group(data_small, zero_thresholds=zero_thresholds)
@@ -1271,8 +1189,7 @@ def run_high_sparse_lognormal_experiment(
     print("Training settings:")
     print(f"  beta_peak={beta_peak}, prior_scale={prior_scale}")
     print(f"  lambda_q={lambda_q}, kl_weight={kl_weight}, M_eval={M_eval}")
-    print(f"  lambda_p70_under={lambda_p70_under}, lambda_p80_under={lambda_p80_under}")
-    print(f"  chosen_high_quantile={chosen_high_quantile}")
+    print(f"  lambda_p70_under={lambda_p70_under}")
     print("  oversampling=OFF, ENN loc-only")
     print("  magnitude=LogNormal distribution, ENN loc-only")
 
@@ -1291,8 +1208,6 @@ def run_high_sparse_lognormal_experiment(
         lambda_q=lambda_q,
         kl_weight=kl_weight,
         lambda_p70_under=lambda_p70_under,
-        lambda_p80_under=lambda_p80_under,
-        chosen_high_quantile=chosen_high_quantile,
     )
 
     summary_df = pd.DataFrame([result['summary']])
@@ -1325,6 +1240,4 @@ high_sparse_lognormal_result, high_sparse_lognormal_summary_df, asin_zero_stats 
     lambda_q=0.10,
     kl_weight=0.003,
     lambda_p70_under=0.0,
-    lambda_p80_under=0.0,
-    chosen_high_quantile='p70',  # try 'p80' if your goal is lower underbias
 )
