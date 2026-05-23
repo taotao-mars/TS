@@ -1,0 +1,38 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from scipy import stats
+
+active_y = pd.to_numeric(data_high["fbi_demand"], errors="coerce").fillna(0)
+active_y = active_y[active_y > 0]
+
+log_y = np.log1p(active_y)
+
+print("Positive demand summary:")
+print(active_y.describe(percentiles=[0.5, 0.7, 0.8, 0.9, 0.95, 0.99]))
+
+print("\nLog positive demand summary:")
+print(pd.Series(log_y).describe(percentiles=[0.5, 0.7, 0.8, 0.9, 0.95, 0.99]))
+
+print("\nSkewness:")
+print("raw skew:", stats.skew(active_y))
+print("log skew:", stats.skew(log_y))
+
+print("\nKurtosis:")
+print("raw kurtosis:", stats.kurtosis(active_y))
+print("log kurtosis:", stats.kurtosis(log_y))
+
+plt.figure()
+plt.hist(active_y, bins=50)
+plt.title("Positive Demand Distribution")
+plt.show()
+
+plt.figure()
+plt.hist(log_y, bins=50)
+plt.title("log1p Positive Demand Distribution")
+plt.show()
+
+plt.figure()
+stats.probplot(log_y, dist="norm", plot=plt)
+plt.title("QQ Plot: log1p Positive Demand vs Normal")
+plt.show()
