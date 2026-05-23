@@ -23,7 +23,7 @@ Compared with the NB-only version:
 - No direct future-context head: future context only affects occ/mag indirectly through z.
 - Anchor-protected magnitude residual: allow upward loc correction more than downward correction.
 - Built-in diagnostics: anchor vs loc vs sampling vs smooth forecast.
-- Output-rule comparison: original sampling vs smooth vs hybrid WAPE without retraining.
+- Automatic output-rule comparison: original sampling vs smooth vs hybrid WAPE without retraining.
 - Includes optional WAPE hook if calculate_wape_using_lp_oos2 and quick_error_check exist.
 """
 
@@ -2235,6 +2235,8 @@ def run_high_sparse_best_experiment(
     occ_div_weight=0.01,
     remove_extreme_asins=True,
     extreme_q=0.99,
+    auto_output_rule_check=True,
+    output_tau_grid=(0.50, 0.60, 0.70, 0.80),
 ):
     data_small = prepare_data_sample(
         data_raw1,
@@ -2278,6 +2280,8 @@ def run_high_sparse_best_experiment(
     print(f"  remove_extreme_asins={remove_extreme_asins}")
     print(f"  extreme_q={extreme_q}")
     print(f"  extreme_cap={extreme_cap}")
+    print(f"  auto_output_rule_check={auto_output_rule_check}")
+    print(f"  output_tau_grid={output_tau_grid}")
 
     result = run_one_group(
         data_high,
@@ -2318,6 +2322,34 @@ def run_high_sparse_best_experiment(
     print("HIGH-SPARSE BEST SUMMARY")
     print("=" * 80)
     print(summary_df)
+
+    # -------------------------------------------------
+    # Automatically run output-rule comparison after training.
+    # This compares:
+    #   A. original zero-inflated sampling
+    #   B. smooth occ_prob × conditional magnitude
+    #   C. hybrid min(1, occ_prob / tau) × conditional magnitude
+    # -------------------------------------------------
+    if auto_output_rule_check:
+        try:
+            output_rule_outputs = run_output_rule_comparison(
+                result,
+                M=M_eval,
+                tau_grid=output_tau_grid
+            )
+            result["output_rule_outputs"] = output_rule_outputs
+
+            if "hybrid_summary" in output_rule_outputs:
+                result["hybrid_summary"] = output_rule_outputs["hybrid_summary"]
+
+                print("\n" + "=" * 80)
+                print("AUTO OUTPUT-RULE COMPARISON SUMMARY")
+                print("=" * 80)
+                print(output_rule_outputs["hybrid_summary"])
+        except Exception as e:
+            print("\nOutput-rule comparison failed.")
+            print("Error:", repr(e))
+            result["output_rule_outputs_error"] = repr(e)
 
     return result, summary_df, asin_stats
 
@@ -2739,5 +2771,7 @@ def hybrid_active_magnitude_diagnosis(
 #         occ_div_weight=0.01,
 #         remove_extreme_asins=True,
 #         extreme_q=0.99,
+#         auto_output_rule_check=True,
+#         output_tau_grid=(0.50, 0.60, 0.70, 0.80),
 #     )
 # )
