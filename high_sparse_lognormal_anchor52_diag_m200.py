@@ -676,11 +676,26 @@ def train(
         total_loss = 0.0
         last_occ = last_mag = last_kl = 0.0
 
-        for b in tr_ld:
+        # ── 诊断（只在第一个 epoch 的前3个 batch 打印）──
+        _diag_batches = 3 if epoch == 0 else 0
+
+        for _bi, b in enumerate(tr_ld):
             x = b["x"]
             fc = b["future_context"]
             y = b["y"]
             static = b.get("static", None)
+
+            if _bi < _diag_batches:
+                active_cnt = (y > 0).sum().item()
+                total_cnt  = y.numel()
+                print(
+                    f"  [diag batch {_bi}] "
+                    f"active={active_cnt}/{total_cnt} "
+                    f"({100*active_cnt/total_cnt:.1f}%) "
+                    f"y_max={y.max():.1f} y_mean={y[y>0].mean():.2f}"
+                    if active_cnt > 0 else
+                    f"  [diag batch {_bi}] active=0/{total_cnt} ← 全零batch!"
+                )
 
             preds, kl = model(x, fc, nZ=nZ, static=static)
             losses, occ_losses, mag_losses = [], [], []
@@ -698,6 +713,26 @@ def train(
             mag_loss  = sum(mag_losses) / nZ
             loss = main_loss + kl_weight * kl
 
+            # ── 诊断：loc 和真实 log1p(y) 的差距（只在 epoch 0 前3个 batch）
+            if _bi < _diag_batches:
+                with torch.no_grad():
+                    pos_mask = y > 0
+                    if pos_mask.sum() > 0:
+                        avg_loc = sum(
+                            loc[pos_mask] for _, _, loc, _ in preds
+                        ) / nZ
+                        avg_scale = sum(
+                            scale[pos_mask] for _, _, _, scale in preds
+                        ) / nZ
+                        log_y = torch.log1p(y[pos_mask])
+                        loc_err = (avg_loc - log_y).abs().mean()
+                        print(
+                            f"    loc_err={loc_err:.3f} "
+                            f"loc_mean={avg_loc.mean():.3f} "
+                            f"log_y_mean={log_y.mean():.3f} "
+                            f"scale_mean={avg_scale.mean():.3f}"
+                        )
+
             opt.zero_grad()
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -709,6 +744,17 @@ def train(
             last_kl  = kl.item()
 
         sch.step()
+
+        # ── 诊断：检查各分支参数梯度（只在前3个 epoch）
+        if epoch < 3:
+            occ_grad  = model.encoder.occurrence_head[-1].weight.grad
+            loc_grad  = model.encoder.loc_head[-1].weight.grad
+            enc_grad  = model.encoder.input_proj.weight.grad
+            print(
+                f"  [grad] occ_head={occ_grad.abs().mean():.4f} "
+                f"loc_head={loc_grad.abs().mean() if loc_grad is not None else 'None'} "
+                f"encoder={enc_grad.abs().mean():.4f}"
+            )
 
         # validation
         model.eval()
