@@ -141,8 +141,22 @@ def load_real_data(data_raw):
     holiday_cols = [c for c in data_raw.columns if c.startswith('holiday_indicator_')]
     context_cols = ['our_price', 'in_stock_dph'] + holiday_cols
 
+    # 静态 ASIN 特征：描述商品本身属性，不随时间变化
+    # 让模型跨 ASIN 学到同类商品的需求模式
+    STATIC_COLS = [
+        'pkg_weight',
+        'pkg_height',
+        'pkg_length',
+        'pkg_width',
+        'gl_product_group',
+        'category_code',
+        'brand_class',
+    ]
+    static_cols_available = [c for c in STATIC_COLS if c in data_raw.columns]
+
     base_cols = ['asin', 'order_week', 'fbi_demand', 'scot_oos']
-    keep_cols = [c for c in base_cols + context_cols if c in data_raw.columns]
+    keep_cols = [c for c in base_cols + context_cols + static_cols_available
+                 if c in data_raw.columns]
 
     df = data_raw[keep_cols].copy()
     df = df.rename(columns={
@@ -189,6 +203,21 @@ def load_real_data(data_raw):
 
     df['t'] = ((df['Week'] - df['Week'].min()).dt.days // 7).astype(int)
 
+    # 处理静态特征：类别特征 label encode，数值特征 log 归一化
+    static_df = df.groupby('ASIN')[static_cols_available].first().reset_index()
+    for c in static_cols_available:
+        if static_df[c].dtype == object or str(static_df[c].dtype) == 'category':
+            # 类别特征：label encode
+            static_df[c] = pd.Categorical(static_df[c]).codes.astype(float)
+            static_df[c] = (static_df[c] - static_df[c].mean()) / (static_df[c].std() + 1e-8)
+        else:
+            # 数值特征：log 归一化
+            static_df[c] = pd.to_numeric(static_df[c], errors='coerce').fillna(0).clip(lower=0)
+            static_df[c] = np.log1p(static_df[c])
+            static_df[c] = (static_df[c] - static_df[c].mean()) / (static_df[c].std() + 1e-8)
+    static_lookup = static_df.set_index('ASIN')[static_cols_available].to_dict('index')
+    n_static = len(static_cols_available)
+
     data = {}
     for asin, group in df.groupby('ASIN'):
         group = group.reset_index(drop=True)
@@ -229,19 +258,30 @@ def load_real_data(data_raw):
 
         future_context = group[context_cols].values.astype(np.float32)
 
+        # 静态特征：每个 ASIN 一个向量
+        if asin in static_lookup and n_static > 0:
+            static_vec = np.array(
+                [static_lookup[asin].get(c, 0.0) for c in static_cols_available],
+                dtype=np.float32
+            )
+        else:
+            static_vec = np.zeros(max(n_static, 1), dtype=np.float32)
+
         data[asin] = {
             'features': features,
             'future_context': future_context,
             'demand': demand.astype(np.float32),
             'week': weeks,
             'oos': oos.astype(np.float32),
+            'static': static_vec,
         }
 
-    print("History encoder dim: 11")
+    print(f"History encoder dim: 11")
+    print(f"Static feature dim: {n_static} {static_cols_available}")
     print(f"Conditional z context dim: {len(context_cols)}")
     print("Conditional z context columns:", context_cols)
 
-    return data, len(context_cols), context_cols
+    return data, len(context_cols), context_cols, n_static
 
 
 # =====================================================
@@ -270,7 +310,6 @@ class DemandDataset(Dataset):
             for start in starts:
                 target_weeks = weeks[start+history:start+history+horizon]
                 y_window = demand[start+history:start+history+horizon]
-                # 标记该样本的 horizon 窗口里是否有活跃周
                 has_active = int((y_window > 0).any())
 
                 self.samples.append({
@@ -284,6 +323,7 @@ class DemandDataset(Dataset):
                     'target_week': [str(w)[:10] for w in target_weeks],
                     'oos': torch.tensor(oos[start+history:start+history+horizon], dtype=torch.float32),
                     'has_active': has_active,
+                    'static': torch.tensor(d['static'], dtype=torch.float32),
                 })
 
     def __len__(self):
@@ -379,16 +419,18 @@ class SparsePeakAttention(nn.Module):
 class TCNSparseAttnEncoder(nn.Module):
     """
     历史序列编码器。
-    核心改动：hist_nonzero_mean / hist_nonzero_p75 / recent_peak
-    这三个历史锚点直接跳过 TCN，shortcut 连接到 magnitude head，
-    让模型有一个强的先验起点，不需要从原始序列重新学量级信息。
+    职责分工：
+    - 动态特征（历史序列）→ TCN → h_t → occurrence_head（occurrence 基础预测）
+    - 动态锚点（hist_mean/p75/peak）shortcut → mag_proj（magnitude 动态先验）
+    - 静态特征（ASIN属性）由 TCN_ENN 传入，直接拼接到 mag_proj（magnitude 静态先验）
     """
-    # feature 索引（对应 load_real_data 里 features 的列顺序）
     ANCHOR_IDXS = [8, 9, 10]  # hist_nonzero_mean, hist_nonzero_p75, recent_peak
 
-    def __init__(self, input_dim=11, d_model=32, horizon=20, beta_peak=1.5):
+    def __init__(self, input_dim=11, d_model=32, horizon=20,
+                 beta_peak=1.5, static_dim=0):
         super().__init__()
         self.horizon = horizon
+        self.static_dim = static_dim
         self.input_proj = nn.Linear(input_dim, d_model)
 
         dilations = [1, 2, 3, 4, 8, 26, 52]
@@ -399,29 +441,43 @@ class TCNSparseAttnEncoder(nn.Module):
         self.final_norm = nn.LayerNorm(d_model)
 
         n_anchors = len(self.ANCHOR_IDXS)
+        # static_emb 维度：TCN_ENN 的 static_encoder 输出 16 维
+        d_static_emb = 16 if static_dim > 0 else 0
 
-        self.occ_proj = nn.Sequential(nn.Linear(d_model, d_model), nn.ReLU(), nn.LayerNorm(d_model))
-        # magnitude proj 接收 h_t + 历史锚点
+        self.occ_proj = nn.Sequential(
+            nn.Linear(d_model, d_model), nn.ReLU(), nn.LayerNorm(d_model)
+        )
+        # magnitude proj：h_t + 动态锚点 + 静态特征嵌入
         self.mag_proj = nn.Sequential(
-            nn.Linear(d_model + n_anchors, d_model), nn.ReLU(), nn.LayerNorm(d_model)
+            nn.Linear(d_model + n_anchors + d_static_emb, d_model),
+            nn.ReLU(),
+            nn.LayerNorm(d_model)
         )
+        # alpha proj：同样接收静态信息，让 NB 的离散度也感知 ASIN 类型
         self.alpha_proj = nn.Sequential(
-            nn.Linear(d_model + n_anchors, d_model), nn.ReLU(), nn.LayerNorm(d_model)
+            nn.Linear(d_model + n_anchors + d_static_emb, d_model),
+            nn.ReLU(),
+            nn.LayerNorm(d_model)
         )
 
-        self.occurrence_head = nn.Sequential(nn.Linear(d_model, 64), nn.ReLU(), nn.Linear(64, horizon))
-        self.magnitude_head = nn.Sequential(nn.Linear(d_model, 64), nn.ReLU(), nn.Linear(64, horizon))
-        self.alpha_head = nn.Sequential(nn.Linear(d_model, 64), nn.ReLU(), nn.Linear(64, horizon))
+        self.occurrence_head = nn.Sequential(
+            nn.Linear(d_model, 64), nn.ReLU(), nn.Linear(64, horizon)
+        )
+        self.magnitude_head = nn.Sequential(
+            nn.Linear(d_model, 64), nn.ReLU(), nn.Linear(64, horizon)
+        )
+        self.alpha_head = nn.Sequential(
+            nn.Linear(d_model, 64), nn.ReLU(), nn.Linear(64, horizon)
+        )
 
-    def forward(self, x, peak_gate=None):
+    def forward(self, x, peak_gate=None, static_emb=None):
         b_t = x[:, :, 1]
         peak_score = torch.sqrt(torch.expm1(x[:, :, 0]).clamp(min=0) + 1e-6)
 
-        # 提取历史锚点（用最后一个时间步，已经是 rolling 值，无泄漏）
+        # 动态锚点：rolling 值，最后一个时间步，无数据泄漏
         anchor = x[:, -1, self.ANCHOR_IDXS]  # [B, 3]
 
         h = self.input_proj(x).permute(0, 2, 1)
-
         for conv, norm in zip(self.convs, self.norms):
             h = conv(h) + h
             h = h.permute(0, 2, 1)
@@ -432,13 +488,17 @@ class TCNSparseAttnEncoder(nn.Module):
         h = self.sparse_attn(h.permute(0, 2, 1), b_t, peak_score, peak_gate=peak_gate)
         h_t = self.final_norm(h[:, -1, :])
 
+        # occurrence：只用动态历史信息
         h_occ = self.occ_proj(h_t)
-
-        # magnitude 和 alpha 直接拼接历史锚点，提供强先验
-        h_mag = self.mag_proj(torch.cat([h_t, anchor], dim=-1))
-        h_alpha = self.alpha_proj(torch.cat([h_t, anchor], dim=-1))
-
         occ_logit = self.occurrence_head(h_occ)
+
+        # magnitude：动态历史 + 动态锚点 + 静态 ASIN 属性
+        mag_inp = [h_t, anchor]
+        if static_emb is not None:
+            mag_inp.append(static_emb)
+        h_mag = self.mag_proj(torch.cat(mag_inp, dim=-1))
+        h_alpha = self.alpha_proj(torch.cat(mag_inp, dim=-1))
+
         mu = F.softplus(self.magnitude_head(h_mag))
         alpha = F.softplus(self.alpha_head(h_alpha)) + 1e-4
 
@@ -506,14 +566,40 @@ class Epinet(nn.Module):
 
 
 class TCN_ENN(nn.Module):
-    def __init__(self, input_dim=11, context_dim=2, d_model=32, d_z=16, horizon=20, prior_scale=0.3, beta_peak=1.5):
+    def __init__(self, input_dim=11, context_dim=2, d_model=32, d_z=16,
+                 horizon=20, prior_scale=0.3, beta_peak=1.5, static_dim=0):
         super().__init__()
         self.d_z = d_z
         self.horizon = horizon
+        self.static_dim = static_dim
 
-        self.encoder = TCNSparseAttnEncoder(input_dim=input_dim, d_model=d_model, horizon=horizon, beta_peak=beta_peak)
-        self.z_generator = ContextZGenerator(d_phi=d_model, context_dim=context_dim, d_z=d_z, horizon=horizon)
-        self.epinet = Epinet(d_phi=d_model, d_z=d_z, horizon=horizon, prior_scale=prior_scale)
+        self.encoder = TCNSparseAttnEncoder(
+            input_dim=input_dim, d_model=d_model,
+            horizon=horizon, beta_peak=beta_peak,
+            static_dim=static_dim,
+        )
+
+        # 静态特征编码器：把 ASIN 属性压缩成一个条件向量
+        if static_dim > 0:
+            self.static_encoder = nn.Sequential(
+                nn.Linear(static_dim, 32),
+                nn.ReLU(),
+                nn.LayerNorm(32),
+                nn.Linear(32, 16),
+                nn.ReLU(),
+            )
+            d_cond = d_model + 16  # h_t + static_emb
+        else:
+            self.static_encoder = None
+            d_cond = d_model
+
+        # z_generator 和 epinet 输入维度加上静态条件
+        self.z_generator = ContextZGenerator(
+            d_phi=d_cond, context_dim=context_dim, d_z=d_z, horizon=horizon
+        )
+        self.epinet = Epinet(
+            d_phi=d_cond, d_z=d_z, horizon=horizon, prior_scale=prior_scale
+        )
 
         self.future_peak_gate = nn.Sequential(
             nn.Linear(horizon * context_dim, 64),
@@ -522,19 +608,42 @@ class TCN_ENN(nn.Module):
             nn.Sigmoid()
         )
 
-    def forward(self, x, future_context, nZ=8):
+    def _encode(self, x, future_context, static=None):
         B = x.shape[0]
         peak_gate = self.future_peak_gate(future_context.reshape(B, -1))
-        occ_logit_base, mu_base, alpha_base, h_t = self.encoder(x, peak_gate=peak_gate)
 
-        phi = h_t.detach()
-        z_mean, z_std, kl = self.z_generator(phi, future_context)
+        # 先生成 static_emb，同时传给 encoder（影响 magnitude）和 phi（影响 z/epinet）
+        if self.static_encoder is not None and static is not None:
+            static_emb = self.static_encoder(static)   # [B, 16]
+        else:
+            static_emb = None
+
+        # encoder：动态历史 + 静态属性 → occ/mu/alpha 基础预测
+        occ_logit_base, mu_base, alpha_base, h_t = self.encoder(
+            x, peak_gate=peak_gate, static_emb=static_emb
+        )
+
+        # phi：h_t + 静态属性 → z 的条件向量
+        if static_emb is not None:
+            phi = torch.cat([h_t, static_emb], dim=-1)  # [B, d_model+16]
+        else:
+            phi = h_t
+
+        return occ_logit_base, mu_base, alpha_base, h_t, phi
+
+    def forward(self, x, future_context, nZ=8, static=None):
+        occ_logit_base, mu_base, alpha_base, h_t, phi = self._encode(
+            x, future_context, static
+        )
+
+        phi_det = phi.detach()
+        z_mean, z_std, kl = self.z_generator(phi_det, future_context)
 
         preds = []
         for _ in range(nZ):
             eps = torch.randn_like(z_mean)
             z = z_mean + z_std * eps
-            occ_e, mu_e, al_e = self.epinet(phi, z)
+            occ_e, mu_e, al_e = self.epinet(phi_det, z)
 
             occ_logit = occ_logit_base + occ_e
             occ_prob = torch.sigmoid(occ_logit).clamp(1e-6, 1 - 1e-6)
@@ -544,13 +653,12 @@ class TCN_ENN(nn.Module):
 
         return preds, kl
 
-    def predict(self, x, future_context, M=50):
+    def predict(self, x, future_context, M=50, static=None):
         self.eval()
         with torch.no_grad():
-            B = x.shape[0]
-            peak_gate = self.future_peak_gate(future_context.reshape(B, -1))
-            occ_logit_base, mu_base, alpha_base, h_t = self.encoder(x, peak_gate=peak_gate)
-            phi = h_t.detach()
+            occ_logit_base, mu_base, alpha_base, h_t, phi = self._encode(
+                x, future_context, static
+            )
             z_mean, z_std, _ = self.z_generator(phi, future_context)
 
             samples = []
@@ -569,7 +677,7 @@ class TCN_ENN(nn.Module):
                     total_count=(1.0 / alpha).clamp(min=1e-4),
                     probs=(mu * alpha / (1 + mu * alpha)).clamp(1e-6, 1 - 1e-6),
                 )
-                mag = nb.sample().float().clamp(min=1)
+                mag = nb.sample().float().clamp(min=0)
                 sample = torch.where(active, mag, torch.zeros_like(mag))
                 samples.append(sample)
 
@@ -684,8 +792,9 @@ def train(
             x = b['x']
             fc = b['future_context']
             y = b['y']
+            static = b.get('static', None)
 
-            preds, kl = model(x, fc, nZ=nZ)
+            preds, kl = model(x, fc, nZ=nZ, static=static)
             losses, occ_losses, mag_losses = [], [], []
             logmag_losses, under_mag_losses = [], []
 
@@ -736,7 +845,8 @@ def train(
         vl = 0.0
         with torch.no_grad():
             for b in va_ld:
-                p50, p70 = model.predict(b['x'], b['future_context'], M=30)
+                p50, p70 = model.predict(b['x'], b['future_context'], M=30,
+                                         static=b.get('static', None))
                 vl += (pinball(b['y'], p50, 0.5) + pinball(b['y'], p70, 0.7)).item()
         vl /= max(1, len(va_ld))
 
@@ -765,7 +875,8 @@ def evaluate(model, va_ld, M=100):
     model.eval()
     with torch.no_grad():
         for b in va_ld:
-            p50, p70 = model.predict(b['x'], b['future_context'], M=M)
+            p50, p70 = model.predict(b['x'], b['future_context'], M=M,
+                                     static=b.get('static', None))
             all_y.append(b['y'].numpy())
             all_p50.append(p50.numpy())
             all_p70.append(p70.numpy())
@@ -783,7 +894,8 @@ def generate_forecast_df(model, va_ld, M=50):
     with torch.no_grad():
         for b in va_ld:
             x, fc, y, oos = b['x'], b['future_context'], b['y'], b['oos']
-            p50, p70 = model.predict(x, fc, M=M)
+            static = b.get('static', None)
+            p50, p70 = model.predict(x, fc, M=M, static=static)
 
             hist_mean = (x[:, :, 0].exp() - 1).mean(dim=1, keepdim=True).clamp(min=0)
             hm50 = hist_mean.expand_as(y)
@@ -816,7 +928,8 @@ def generate_diagnostic_df(model, va_ld, M=100, threshold=0.5):
     model.eval()
     with torch.no_grad():
         for b in va_ld:
-            p50, p70 = model.predict(b['x'], b['future_context'], M=M)
+            p50, p70 = model.predict(b['x'], b['future_context'], M=M,
+                                     static=b.get('static', None))
             for i in range(b['y'].shape[0]):
                 for h in range(b['y'].shape[1]):
                     y_val = b['y'][i, h].item()
@@ -934,7 +1047,7 @@ def run_one_group(
     print(f"Running group: {group_name}")
     print("#" * 70)
 
-    data, context_dim, context_cols = load_real_data(data_group)
+    data, context_dim, context_cols, n_static = load_real_data(data_group)
 
     all_demand = np.concatenate([d['demand'] for d in data.values()])
     print(f"ASINs: {len(data)}")
@@ -958,7 +1071,8 @@ def run_one_group(
         d_z=d_z,
         horizon=horizon,
         prior_scale=prior_scale,
-        beta_peak=beta_peak
+        beta_peak=beta_peak,
+        static_dim=n_static,
     )
 
     print(f"Trainable params: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
