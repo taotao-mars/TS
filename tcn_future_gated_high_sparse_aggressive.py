@@ -10,7 +10,8 @@ Main changes vs previous version:
 4. Predict final P50/P70 from zero-inflated mixture samples:
       active ~ Bernoulli(occ_prob)
       magnitude ~ LogNormal(loc, scale) - 1
-5. Add active P70 underbias calibration loss.
+5. ENN only perturbs LogNormal loc with small scale; scale is treated as aleatoric noise.
+6. Stage-1 stable training: P70/P80 under-loss defaults to 0 and can be turned on later.
 
 Assumptions:
 - data_raw1 already exists in notebook/session.
@@ -499,7 +500,12 @@ class Epinet(nn.Module):
     Outputs epistemic residuals for:
     1. occurrence logit
     2. lognormal loc
-    3. lognormal scale raw residual
+    3. unused scale residual kept only for backward-compatible output shape
+
+    Important design choice:
+    - ENN is used mainly for epistemic uncertainty in the magnitude level (loc).
+    - LogNormal scale is treated as aleatoric noise and is not perturbed by z.
+    - This avoids mixing epistemic uncertainty with heavy-tail observation noise.
     """
     def __init__(self, d_phi=32, d_z=16, horizon=20, prior_scale=0.3):
         super().__init__()
@@ -615,9 +621,14 @@ class TCN_ENN_LogNormal(nn.Module):
             occ_logit = occ_logit_base + occ_e
             occ_prob = torch.sigmoid(occ_logit).clamp(1e-6, 1 - 1e-6)
 
-            loc = loc_base + loc_e
-            scale = F.softplus(scale_base + scale_e) + 1e-3
-            scale = scale.clamp(min=0.05, max=2.5)
+            # ENN loc-only perturbation:
+            # z changes plausible active-magnitude levels, but not aleatoric scale.
+            loc = loc_base + 0.10 * loc_e
+            loc = torch.nan_to_num(loc, nan=0.0, posinf=6.0, neginf=-3.0).clamp(-3.0, 6.0)
+
+            # scale_base already comes from the base encoder and is bounded.
+            # Do NOT let epinet perturb scale; otherwise LogNormal samples can explode.
+            scale = torch.nan_to_num(scale_base, nan=0.5, posinf=1.2, neginf=0.10).clamp(0.10, 1.20)
 
             preds.append((occ_logit, occ_prob, loc, scale))
 
@@ -640,13 +651,15 @@ class TCN_ENN_LogNormal(nn.Module):
                 occ_logit = occ_logit_base + occ_e
                 occ_prob = torch.sigmoid(occ_logit).clamp(1e-6, 1 - 1e-6)
 
-                loc = loc_base + loc_e
-                scale = F.softplus(scale_base + scale_e) + 1e-3
-                scale = scale.clamp(min=0.05, max=2.5)
+                # ENN loc-only perturbation for epistemic uncertainty.
+                loc = loc_base + 0.10 * loc_e
+                loc = torch.nan_to_num(loc, nan=0.0, posinf=6.0, neginf=-3.0).clamp(-3.0, 6.0)
+                scale = torch.nan_to_num(scale_base, nan=0.5, posinf=1.2, neginf=0.10).clamp(0.10, 1.20)
 
                 active = torch.bernoulli(occ_prob).bool()
                 eps_mag = torch.randn_like(loc)
-                mag = torch.exp(loc + scale * eps_mag) - 1.0
+                log_mag = (loc + scale * eps_mag).clamp(min=-3.0, max=8.0)
+                mag = torch.exp(log_mag) - 1.0
                 mag = mag.clamp(min=0)
                 sample = torch.where(active, mag, torch.zeros_like(mag))
                 samples.append(sample)
@@ -677,7 +690,7 @@ def lognormal_two_head_loss(
     occ_logit,
     loc,
     scale,
-    lambda_p70_under=0.5,
+    lambda_p70_under=0.0,
     lambda_p80_under=0.0,
 ):
     """
@@ -696,19 +709,23 @@ def lognormal_two_head_loss(
         return total, occ_loss, zero, zero, zero
 
     log_y = torch.log1p(y[pos_mask])
+    # Safety: keep distribution parameters finite and bounded.
+    loc = torch.nan_to_num(loc, nan=0.0, posinf=6.0, neginf=-3.0).clamp(-3.0, 6.0)
+    scale = torch.nan_to_num(scale, nan=0.5, posinf=1.2, neginf=0.10).clamp(0.10, 1.20)
+
     loc_pos = loc[pos_mask]
-    scale_pos = scale[pos_mask].clamp(min=0.05, max=2.5)
+    scale_pos = scale[pos_mask]
 
     dist = torch.distributions.Normal(loc_pos, scale_pos)
     mag_nll = -dist.log_prob(log_y).mean()
 
     z70 = 0.5244
-    p70_mag = torch.exp(loc + scale * z70) - 1.0
+    p70_mag = torch.exp((loc + scale * z70).clamp(min=-3.0, max=8.0)) - 1.0
     rel_under70 = F.relu(y[pos_mask] - p70_mag[pos_mask]) / (y[pos_mask] + 1e-6)
     p70_under_loss = torch.mean(rel_under70 ** 2)
 
     z80 = 0.8416
-    p80_mag = torch.exp(loc + scale * z80) - 1.0
+    p80_mag = torch.exp((loc + scale * z80).clamp(min=-3.0, max=8.0)) - 1.0
     rel_under80 = F.relu(y[pos_mask] - p80_mag[pos_mask]) / (y[pos_mask] + 1e-6)
     p80_under_loss = torch.mean(rel_under80 ** 2)
 
@@ -728,10 +745,10 @@ def train(
     va_ld,
     epochs=20,
     nZ=8,
-    lr=1e-3,
+    lr=5e-4,
     lambda_q=0.10,
     kl_weight=0.003,
-    lambda_p70_under=0.5,
+    lambda_p70_under=0.0,
     lambda_p80_under=0.0,
 ):
     opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
@@ -781,7 +798,7 @@ def train(
 
                 # Expected active magnitude under LogNormal on original scale.
                 # E[exp(N(loc, scale^2)) - 1] = exp(loc + 0.5 scale^2) - 1.
-                mag_mean = torch.exp(loc + 0.5 * scale ** 2) - 1.0
+                mag_mean = torch.exp((loc + 0.5 * scale ** 2).clamp(min=-3.0, max=8.0)) - 1.0
                 mag_mean = mag_mean.clamp(min=0)
                 exp_samples.append(occ_prob * mag_mean)
 
@@ -1051,7 +1068,7 @@ def run_one_group(
     M_eval=100,
     lambda_q=0.10,
     kl_weight=0.003,
-    lambda_p70_under=0.5,
+    lambda_p70_under=0.0,
     lambda_p80_under=0.0,
     chosen_high_quantile='p70',
 ):
@@ -1095,7 +1112,7 @@ def run_one_group(
         va_ld,
         epochs=epochs,
         nZ=8,
-        lr=1e-3,
+        lr=5e-4,
         lambda_q=lambda_q,
         kl_weight=kl_weight,
         lambda_p70_under=lambda_p70_under,
@@ -1236,7 +1253,7 @@ def run_high_sparse_lognormal_experiment(
     M_eval=100,
     lambda_q=0.10,
     kl_weight=0.003,
-    lambda_p70_under=0.5,
+    lambda_p70_under=0.0,
     lambda_p80_under=0.0,
     chosen_high_quantile='p70',
 ):
@@ -1256,8 +1273,8 @@ def run_high_sparse_lognormal_experiment(
     print(f"  lambda_q={lambda_q}, kl_weight={kl_weight}, M_eval={M_eval}")
     print(f"  lambda_p70_under={lambda_p70_under}, lambda_p80_under={lambda_p80_under}")
     print(f"  chosen_high_quantile={chosen_high_quantile}")
-    print("  oversampling=OFF")
-    print("  magnitude=LogNormal distribution")
+    print("  oversampling=OFF, ENN loc-only")
+    print("  magnitude=LogNormal distribution, ENN loc-only")
 
     result = run_one_group(
         data_high,
@@ -1307,7 +1324,7 @@ high_sparse_lognormal_result, high_sparse_lognormal_summary_df, asin_zero_stats 
     M_eval=100,
     lambda_q=0.10,
     kl_weight=0.003,
-    lambda_p70_under=0.5,
+    lambda_p70_under=0.0,
     lambda_p80_under=0.0,
     chosen_high_quantile='p70',  # try 'p80' if your goal is lower underbias
 )
