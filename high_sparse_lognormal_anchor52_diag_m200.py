@@ -389,8 +389,9 @@ class TCNSparseAttnEncoder(nn.Module):
             nn.Linear(d_model, 64), nn.ReLU(), nn.Linear(64, horizon)
         )
 
-        # 零初始化：训练开始时 loc ≈ anchor
-        nn.init.zeros_(self.loc_head[-1].weight)
+        # 小随机初始化：训练开始时 loc ≈ anchor（tanh(小值)≈0）
+        # 不能用全零初始化 weight，否则梯度消失，loc_head 永远不更新
+        nn.init.normal_(self.loc_head[-1].weight, std=0.01)
         nn.init.zeros_(self.loc_head[-1].bias)
 
     def forward(self, x, peak_gate=None, static_emb=None):
@@ -745,16 +746,36 @@ def train(
 
         sch.step()
 
-        # ── 诊断：检查各分支参数梯度（只在前3个 epoch）
-        if epoch < 3:
-            occ_grad  = model.encoder.occurrence_head[-1].weight.grad
-            loc_grad  = model.encoder.loc_head[-1].weight.grad
-            enc_grad  = model.encoder.input_proj.weight.grad
+        # ── 诊断：梯度 + 参数值 + mag_nll 详情（前5个 epoch）
+        if epoch < 5:
+            occ_grad = model.encoder.occurrence_head[-1].weight.grad
+            loc_grad = model.encoder.loc_head[-1].weight.grad
+            enc_grad = model.encoder.input_proj.weight.grad
+            loc_w    = model.encoder.loc_head[-1].weight
+
+            # mag_nll 详情：只在有 active weeks 的 batch 里计算
+            mag_nll_vals = [m.item() for m in mag_losses if m.item() > 0]
+
             print(
-                f"  [grad] occ_head={occ_grad.abs().mean():.4f} "
-                f"loc_head={loc_grad.abs().mean() if loc_grad is not None else 'None'} "
-                f"encoder={enc_grad.abs().mean():.4f}"
+                f"  [grad] "
+                f"occ={occ_grad.abs().mean():.4f} "
+                f"loc={loc_grad.abs().mean():.4f if loc_grad is not None else 'None'} "
+                f"enc={enc_grad.abs().mean():.4f}"
             )
+            print(
+                f"  [loc_head_w] "
+                f"mean={loc_w.abs().mean():.5f} "
+                f"max={loc_w.abs().max():.5f} "
+                f"(should grow from 0.01)"
+            )
+            if mag_nll_vals:
+                print(
+                    f"  [mag_nll detail] "
+                    f"nonzero_count={len(mag_nll_vals)}/{len(mag_losses)} "
+                    f"mean={sum(mag_nll_vals)/len(mag_nll_vals):.4f}"
+                )
+            else:
+                print(f"  [mag_nll detail] all zero this epoch ← 还是有问题"  )
 
         # validation
         model.eval()
@@ -770,6 +791,33 @@ def train(
                 ).item()
 
         val_loss /= max(1, len(va_ld))
+
+        # ── epoch 级 magnitude 诊断：每个 epoch 都打印
+        model.eval()
+        with torch.no_grad():
+            loc_errs, log_y_means, loc_means = [], [], []
+            for b in va_ld:
+                x_v = b["x"]
+                fc_v = b["future_context"]
+                y_v = b["y"]
+                st_v = b.get("static", None)
+
+                occ_lb, loc_b, scale_b, phi_v = model._encode(x_v, fc_v, st_v)
+                pos = y_v > 0
+                if pos.sum() > 0:
+                    log_y = torch.log1p(y_v[pos])
+                    loc_p = loc_b[pos]
+                    loc_errs.append((loc_p - log_y).abs().mean().item())
+                    log_y_means.append(log_y.mean().item())
+                    loc_means.append(loc_p.mean().item())
+
+            if loc_errs:
+                print(
+                    f"  [mag_diag] "
+                    f"loc_err={sum(loc_errs)/len(loc_errs):.3f} "
+                    f"loc_mean={sum(loc_means)/len(loc_means):.3f} "
+                    f"log_y_mean={sum(log_y_means)/len(log_y_means):.3f}"
+                )
 
         improved = val_loss < best_val
         if improved:
