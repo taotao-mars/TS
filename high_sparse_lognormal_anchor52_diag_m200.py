@@ -20,7 +20,8 @@ Compared with the NB-only version:
 - Includes z-effect diagnostics.
 - No early stopping: training always runs the requested number of epochs.
 - Optional p99 extreme-ASIN filter: remove ASINs whose max demand exceeds positive-demand p99.
-- Direct future-context effects: holiday / in-stock / price directly shift occurrence and magnitude.
+- No direct future-context head: future context only affects occ/mag indirectly through z.
+- Anchor-protected magnitude residual: allow upward loc correction more than downward correction.
 - Built-in diagnostics: anchor vs loc vs sampling vs smooth forecast.
 - Includes optional WAPE hook if calculate_wape_using_lp_oos2 and quick_error_check exist.
 """
@@ -520,7 +521,9 @@ class TCNSparseAttnEncoder(nn.Module):
         beta_peak=1.5,
         static_dim=0,
         mag_grad_mix=0.30,
-        loc_resid_scale=0.60
+        loc_resid_scale=0.60,
+        loc_up_scale=0.70,
+        loc_down_scale=0.20
     ):
         super().__init__()
 
@@ -528,6 +531,8 @@ class TCNSparseAttnEncoder(nn.Module):
         self.static_dim = static_dim
         self.mag_grad_mix = mag_grad_mix
         self.loc_resid_scale = loc_resid_scale
+        self.loc_up_scale = loc_up_scale
+        self.loc_down_scale = loc_down_scale
 
         self.input_proj = nn.Linear(input_dim, d_model)
 
@@ -640,7 +645,19 @@ class TCNSparseAttnEncoder(nn.Module):
         h_scale = self.scale_proj(mag_inp)
 
         loc_resid_raw = self.loc_head(h_loc)
-        loc_base = loc_anchor + self.loc_resid_scale * torch.tanh(loc_resid_raw)
+
+        # Anchor-protected residual:
+        # The historical anchor is a useful positive-demand scale.
+        # We allow the model to correct upward more than downward, so loc_head
+        # cannot aggressively suppress the anchor and make magnitude too conservative.
+        loc_resid_unit = torch.tanh(loc_resid_raw)
+        loc_resid = torch.where(
+            loc_resid_unit >= 0,
+            self.loc_up_scale * loc_resid_unit,     # upward correction
+            self.loc_down_scale * loc_resid_unit    # limited downward correction
+        )
+
+        loc_base = loc_anchor + loc_resid
 
         scale_raw = self.scale_head(h_scale)
         scale = 0.10 + 1.40 * torch.sigmoid(scale_raw)
@@ -751,8 +768,8 @@ class TCN_ENN_LogNormal(nn.Module):
         loc_shift_tanh=True,
         mag_grad_mix=0.30,
         loc_resid_scale=0.60,
-        occ_ctx_scale=0.50,
-        loc_ctx_scale=0.30,
+        loc_up_scale=0.70,
+        loc_down_scale=0.20,
     ):
         super().__init__()
 
@@ -764,8 +781,6 @@ class TCN_ENN_LogNormal(nn.Module):
         self.loc_enn_scale = loc_enn_scale
         self.occ_shift_clip = occ_shift_clip
         self.loc_shift_tanh = loc_shift_tanh
-        self.occ_ctx_scale = occ_ctx_scale
-        self.loc_ctx_scale = loc_ctx_scale
 
         self.encoder = TCNSparseAttnEncoder(
             input_dim=input_dim,
@@ -774,7 +789,9 @@ class TCN_ENN_LogNormal(nn.Module):
             beta_peak=beta_peak,
             static_dim=static_dim,
             mag_grad_mix=mag_grad_mix,
-            loc_resid_scale=loc_resid_scale
+            loc_resid_scale=loc_resid_scale,
+            loc_up_scale=loc_up_scale,
+            loc_down_scale=loc_down_scale
         )
 
         if static_dim > 0:
@@ -811,21 +828,6 @@ class TCN_ENN_LogNormal(nn.Module):
             nn.Sigmoid()
         )
 
-        # Direct future-context effects.
-        # The same future context still affects z indirectly through z_generator,
-        # but now it can also directly shift horizon-specific occurrence and magnitude.
-        self.context_occ_head = nn.Sequential(
-            nn.Linear(context_dim, 32),
-            nn.ReLU(),
-            nn.Linear(32, 1)
-        )
-
-        self.context_loc_head = nn.Sequential(
-            nn.Linear(context_dim, 32),
-            nn.ReLU(),
-            nn.Linear(32, 1)
-        )
-
     def _encode(self, x, future_context, static=None):
         B = x.shape[0]
 
@@ -843,32 +845,6 @@ class TCN_ENN_LogNormal(nn.Module):
             peak_gate=peak_gate,
             static_emb=static_emb
         )
-
-        # Direct horizon-specific future context effect.
-        # This lets holiday / in_stock / price directly affect each future horizon,
-        # while the same context is still used indirectly through z_generator.
-        _, H, C = future_context.shape
-        ctx_flat = future_context.reshape(B * H, C)
-
-        occ_ctx_shift = self.context_occ_head(ctx_flat).view(B, H)
-        loc_ctx_shift = self.context_loc_head(ctx_flat).view(B, H)
-
-        occ_logit_base = (
-            occ_logit_base
-            + self.occ_ctx_scale * torch.tanh(occ_ctx_shift)
-        )
-
-        loc_base = (
-            loc_base
-            + self.loc_ctx_scale * torch.tanh(loc_ctx_shift)
-        )
-
-        loc_base = torch.nan_to_num(
-            loc_base,
-            nan=0.0,
-            posinf=6.0,
-            neginf=-3.0
-        ).clamp(-3.0, 6.0)
 
         if static_emb is not None:
             phi = torch.cat([h_t, static_emb], dim=-1)
@@ -1630,9 +1606,12 @@ def predict_smooth_quantile(model, x, future_context, M=200, static=None):
                 occ_logit_base, loc_base, scale_base, phi, z
             )
 
+            # Conditional magnitude quantiles:
+            # log1p(y) | active ~ Normal(loc, scale)
             mag_p50 = torch.exp(loc) - 1.0
             mag_p70 = torch.exp(loc + 0.5244 * scale) - 1.0
 
+            # Smooth unconditional demand forecast.
             p50_list.append(occ_prob * mag_p50)
             p70_list.append(occ_prob * mag_p70)
             occ_list.append(occ_prob)
@@ -1699,20 +1678,26 @@ def mag_anchor_output_diagnosis(result, M=200):
                 rows.append({
                     "n_active": pos.sum().item(),
                     "true_active_mean": y[pos].mean().item(),
+
                     "anchor_active_mean": anchor_demand[pos].mean().item(),
                     "loc_base_active_mean": loc_base_demand[pos].mean().item(),
                     "loc_z_active_mean": loc_z_demand[pos].mean().item(),
+
                     "conditional_mag_p50_active_mean": cond_p50_mag[pos].mean().item(),
                     "conditional_mag_p70_active_mean": cond_p70_mag[pos].mean().item(),
+
                     "sample_p50_active_mean": p50_sample[pos].mean().item(),
                     "sample_p70_active_mean": p70_sample[pos].mean().item(),
+
                     "smooth_p50_active_mean": p50_smooth[pos].mean().item(),
                     "smooth_p70_active_mean": p70_smooth[pos].mean().item(),
+
                     "occ_base_active_mean": occ_base[pos].mean().item(),
                     "occ_z_active_mean": occ_mean[pos].mean().item(),
                     "occ_z_active_p25": occ_mean[pos].quantile(0.25).item(),
                     "occ_z_active_p50": occ_mean[pos].quantile(0.50).item(),
                     "occ_z_active_p75": occ_mean[pos].quantile(0.75).item(),
+
                     "scale_base_active_mean": scale_base[pos].mean().item(),
                     "scale_z_active_mean": scale_mean[pos].mean().item(),
                 })
@@ -1789,7 +1774,9 @@ def generate_forecast_df_smooth(model, va_ld, M=200):
             oos = b["oos"]
             static = b.get("static", None)
 
-            p50, p70, _, _, _ = predict_smooth_quantile(model, x, fc, M=M, static=static)
+            p50, p70, _, _, _ = predict_smooth_quantile(
+                model, x, fc, M=M, static=static
+            )
 
             hist_mean = (
                 x[:, :, 0].exp() - 1
@@ -1980,8 +1967,8 @@ def run_one_group(
         occ_shift_clip=2.0,
         mag_grad_mix=0.30,
         loc_resid_scale=0.60,
-        occ_ctx_scale=0.50,
-        loc_ctx_scale=0.30,
+        loc_up_scale=0.70,
+        loc_down_scale=0.20,
     )
 
     print(
