@@ -3,36 +3,137 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from scipy import stats
 
-active_y = pd.to_numeric(data_high["fbi_demand"], errors="coerce").fillna(0)
-active_y = active_y[active_y > 0]
+# =====================================================
+# 1. Create high_sparse dataset
+# =====================================================
 
-log_y = np.log1p(active_y)
+def create_high_sparse_data(
+    data_raw1,
+    n_asins=5000,
+    zero_thresholds=(0.4, 0.7),
+    seed=42
+):
+    np.random.seed(seed)
 
-print("Positive demand summary:")
-print(active_y.describe(percentiles=[0.5, 0.7, 0.8, 0.9, 0.95, 0.99]))
+    df = data_raw1.copy()
+    df["order_week"] = pd.to_datetime(df["order_week"])
+    df["fbi_demand"] = pd.to_numeric(df["fbi_demand"], errors="coerce").fillna(0).clip(lower=0)
 
-print("\nLog positive demand summary:")
-print(pd.Series(log_y).describe(percentiles=[0.5, 0.7, 0.8, 0.9, 0.95, 0.99]))
+    sample_asins = np.random.choice(
+        df["asin"].unique(),
+        size=min(n_asins, df["asin"].nunique()),
+        replace=False
+    )
 
-print("\nSkewness:")
-print("raw skew:", stats.skew(active_y))
-print("log skew:", stats.skew(log_y))
+    data_small = df[df["asin"].isin(sample_asins)].copy()
 
-print("\nKurtosis:")
-print("raw kurtosis:", stats.kurtosis(active_y))
-print("log kurtosis:", stats.kurtosis(log_y))
+    asin_stats = (
+        data_small.groupby("asin")
+        .agg(
+            zero_rate=("fbi_demand", lambda x: (x == 0).mean()),
+            total_demand=("fbi_demand", "sum"),
+            n_weeks=("fbi_demand", "count"),
+            active_weeks=("fbi_demand", lambda x: (x > 0).sum())
+        )
+        .reset_index()
+    )
 
-plt.figure()
-plt.hist(active_y, bins=50)
-plt.title("Positive Demand Distribution")
-plt.show()
+    low, high = zero_thresholds
 
-plt.figure()
-plt.hist(log_y, bins=50)
-plt.title("log1p Positive Demand Distribution")
-plt.show()
+    def assign_group(z):
+        if z < low:
+            return "low_sparse"
+        elif z < high:
+            return "mid_sparse"
+        else:
+            return "high_sparse"
 
-plt.figure()
-stats.probplot(log_y, dist="norm", plot=plt)
-plt.title("QQ Plot: log1p Positive Demand vs Normal")
-plt.show()
+    asin_stats["zero_group"] = asin_stats["zero_rate"].apply(assign_group)
+
+    data_grouped = data_small.merge(
+        asin_stats[["asin", "zero_rate", "zero_group"]],
+        on="asin",
+        how="left"
+    )
+
+    data_high = data_grouped[data_grouped["zero_group"] == "high_sparse"].copy()
+
+    print("Sample ASINs:", data_small["asin"].nunique())
+    print("Sample rows:", len(data_small))
+
+    print("\nASIN counts by group:")
+    print(asin_stats.groupby("zero_group")["asin"].nunique())
+
+    print("\nHigh sparse ASINs:", data_high["asin"].nunique())
+    print("High sparse rows:", len(data_high))
+    print("High sparse zero rate:", (data_high["fbi_demand"] == 0).mean())
+
+    return data_high, data_grouped, asin_stats
+
+
+# =====================================================
+# 2. Check positive-demand distribution
+# =====================================================
+
+def check_positive_demand_distribution(data_high, y_col="fbi_demand"):
+    active_y = pd.to_numeric(data_high[y_col], errors="coerce").fillna(0)
+    active_y = active_y[active_y > 0]
+
+    log_y = np.log1p(active_y)
+
+    print("\n==============================")
+    print("HIGH SPARSE POSITIVE DEMAND")
+    print("==============================")
+
+    print("\nPositive demand summary:")
+    print(active_y.describe(
+        percentiles=[0.5, 0.7, 0.8, 0.9, 0.95, 0.99]
+    ))
+
+    print("\nLog1p positive demand summary:")
+    print(pd.Series(log_y).describe(
+        percentiles=[0.5, 0.7, 0.8, 0.9, 0.95, 0.99]
+    ))
+
+    print("\nSkewness:")
+    print("raw skew:", stats.skew(active_y))
+    print("log skew:", stats.skew(log_y))
+
+    print("\nKurtosis:")
+    print("raw kurtosis:", stats.kurtosis(active_y))
+    print("log kurtosis:", stats.kurtosis(log_y))
+
+    plt.figure(figsize=(6, 4))
+    plt.hist(active_y, bins=50)
+    plt.title("Positive Demand Distribution")
+    plt.xlabel("Demand")
+    plt.ylabel("Count")
+    plt.show()
+
+    plt.figure(figsize=(6, 4))
+    plt.hist(log_y, bins=50)
+    plt.title("log1p Positive Demand Distribution")
+    plt.xlabel("log1p(Demand)")
+    plt.ylabel("Count")
+    plt.show()
+
+    plt.figure(figsize=(6, 6))
+    stats.probplot(log_y, dist="norm", plot=plt)
+    plt.title("QQ Plot: log1p Positive Demand vs Normal")
+    plt.show()
+
+    return active_y, log_y
+
+
+# =====================================================
+# 3. Run
+# =====================================================
+
+data_high, data_grouped, asin_stats = create_high_sparse_data(
+    data_raw1,
+    n_asins=5000,
+    zero_thresholds=(0.4, 0.7),
+    seed=42
+)
+
+active_y, log_y = check_positive_demand_distribution(data_high)
