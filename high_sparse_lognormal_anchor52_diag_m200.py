@@ -436,6 +436,12 @@ class TCNSparseAttnEncoder(nn.Module):
             nn.Linear(d_model, 64), nn.ReLU(), nn.Linear(64, horizon)
         )
 
+        # Important: start from the historical anchor.
+        # With zero initialization, loc_resid_raw = 0 at initialization,
+        # so loc ~= loc_anchor before training instead of a random shifted value.
+        nn.init.zeros_(self.loc_head[-1].weight)
+        nn.init.zeros_(self.loc_head[-1].bias)
+
     def forward(self, x, peak_gate=None, static_emb=None):
         b_t = x[:, :, 1]
         peak_score = torch.sqrt(torch.expm1(x[:, :, 0]).clamp(min=0) + 1e-6)
@@ -476,7 +482,7 @@ class TCNSparseAttnEncoder(nn.Module):
         loc_anchor = torch.nan_to_num(loc_anchor, nan=0.0, posinf=6.0, neginf=0.0).clamp(0.0, 6.0)
 
         loc_resid_raw = self.loc_head(h_mag)
-        loc_resid = 0.75 * torch.tanh(loc_resid_raw)
+        loc_resid = 0.30 * torch.tanh(loc_resid_raw)
         loc = loc_anchor + loc_resid
 
         # Bounded LogNormal scale for numerical stability.
@@ -563,7 +569,7 @@ class Epinet(nn.Module):
 class TCN_ENN_LogNormal(nn.Module):
     def __init__(self, input_dim=11, context_dim=2, d_model=32, d_z=16,
                  horizon=20, prior_scale=0.3, beta_peak=1.5, static_dim=0,
-                 loc_enn_scale=0.30):
+                 loc_enn_scale=0.50):
         super().__init__()
         self.d_z = d_z
         self.horizon = horizon
@@ -646,7 +652,7 @@ class TCN_ENN_LogNormal(nn.Module):
 
             # ENN loc-only perturbation:
             # z changes plausible active-magnitude levels, but not aleatoric scale.
-            loc = loc_base + self.loc_enn_scale * loc_e
+            loc = loc_base + self.loc_enn_scale * torch.tanh(loc_e)
             loc = torch.nan_to_num(loc, nan=0.0, posinf=6.0, neginf=-3.0).clamp(-3.0, 6.0)
 
             # scale_base already comes from the base encoder and is bounded.
@@ -677,7 +683,7 @@ class TCN_ENN_LogNormal(nn.Module):
                 occ_prob = torch.sigmoid(occ_logit).clamp(1e-6, 1 - 1e-6)
 
                 # ENN loc-only perturbation for epistemic uncertainty.
-                loc = loc_base + self.loc_enn_scale * loc_e
+                loc = loc_base + self.loc_enn_scale * torch.tanh(loc_e)
                 loc = torch.nan_to_num(loc, nan=0.0, posinf=6.0, neginf=-3.0).clamp(-3.0, 6.0)
                 scale = torch.nan_to_num(scale_base, nan=0.8, posinf=1.5, neginf=0.10).clamp(0.10, 1.50)
 
@@ -1105,7 +1111,7 @@ def run_one_group(
     group_name,
     prior_scale=0.5,
     beta_peak=1.5,
-    loc_enn_scale=0.30,
+    loc_enn_scale=0.50,
     epochs=20,
     history=52,
     horizon=20,
@@ -1268,7 +1274,7 @@ def run_high_sparse_lognormal_experiment(
     zero_thresholds=(0.4, 0.7),
     prior_scale=0.5,
     beta_peak=1.5,
-    loc_enn_scale=0.30,
+    loc_enn_scale=0.50,
     epochs=20,
     history=52,
     horizon=20,
@@ -1297,11 +1303,11 @@ def run_high_sparse_lognormal_experiment(
     print(f"  lambda_p70_under={lambda_p70_under}")
     print(f"  loc_enn_scale={loc_enn_scale}")
     print("  oversampling=OFF, occurrence base-only, ENN loc-only")
-    print("  magnitude=anchored LogNormal distribution, ENN loc-only")
+    print("  magnitude=anchored LogNormal, bounded residual, bounded ENN loc-only")
 
     result = run_one_group(
         data_high,
-        group_name='high_sparse_lognormal_anchor_no_os',
+        group_name='high_sparse_lognormal_anchor_stable_no_os',
         prior_scale=prior_scale,
         beta_peak=beta_peak,
         loc_enn_scale=loc_enn_scale,
@@ -1337,7 +1343,7 @@ high_sparse_lognormal_result, high_sparse_lognormal_summary_df, asin_zero_stats 
     zero_thresholds=(0.4, 0.7),
     prior_scale=0.5,
     beta_peak=1.5,
-    loc_enn_scale=0.30,
+    loc_enn_scale=0.50,
     epochs=20,
     history=52,
     horizon=20,
