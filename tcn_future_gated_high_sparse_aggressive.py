@@ -352,6 +352,10 @@ class SparsePeakAttention(nn.Module):
 
 
 class TCNSparseAttnEncoder(nn.Module):
+    """
+    历史序列编码器，只负责 magnitude 和 alpha（量级分支）。
+    occurrence 预测已移至 TCN_ENN 层，由 future_context 直接驱动。
+    """
     def __init__(self, input_dim=11, d_model=32, horizon=20, beta_peak=1.5):
         super().__init__()
         self.horizon = horizon
@@ -364,11 +368,10 @@ class TCNSparseAttnEncoder(nn.Module):
         self.sparse_attn = SparsePeakAttention(d_model, n_heads=4, beta_peak=beta_peak)
         self.final_norm = nn.LayerNorm(d_model)
 
-        self.occ_proj = nn.Sequential(nn.Linear(d_model, d_model), nn.ReLU(), nn.LayerNorm(d_model))
+        # occurrence_head 已移除，历史序列不再直接预测 occurrence
         self.mag_proj = nn.Sequential(nn.Linear(d_model, d_model), nn.ReLU(), nn.LayerNorm(d_model))
         self.alpha_proj = nn.Sequential(nn.Linear(d_model, d_model), nn.ReLU(), nn.LayerNorm(d_model))
 
-        self.occurrence_head = nn.Sequential(nn.Linear(d_model, 64), nn.ReLU(), nn.Linear(64, horizon))
         self.magnitude_head = nn.Sequential(nn.Linear(d_model, 64), nn.ReLU(), nn.Linear(64, horizon))
         self.alpha_head = nn.Sequential(nn.Linear(d_model, 64), nn.ReLU(), nn.Linear(64, horizon))
 
@@ -388,15 +391,59 @@ class TCNSparseAttnEncoder(nn.Module):
         h = self.sparse_attn(h.permute(0, 2, 1), b_t, peak_score, peak_gate=peak_gate)
         h_t = self.final_norm(h[:, -1, :])
 
-        h_occ = self.occ_proj(h_t)
         h_mag = self.mag_proj(h_t)
         h_alpha = self.alpha_proj(h_t)
 
-        occ_logit = self.occurrence_head(h_occ)
         mu = F.softplus(self.magnitude_head(h_mag))
         alpha = F.softplus(self.alpha_head(h_alpha)) + 1e-4
 
-        return occ_logit, mu, alpha, h_t
+        return mu, alpha, h_t
+
+
+class FutureOccurrencePredictor(nn.Module):
+    """
+    occurrence 预测器，直接由 future_context 和历史摘要 h_t 共同驱动。
+    future_context 是主要信号（权重更高），h_t 作为辅助条件。
+
+    对于 high_sparse ASIN，触发需求的是外部事件（价格、促销、库存），
+    而不是历史序列本身，因此 occurrence 应主要由 future_context 决定。
+    """
+    def __init__(self, context_dim=2, d_model=32, horizon=20):
+        super().__init__()
+        self.horizon = horizon
+        ctx_flat = horizon * context_dim
+
+        # future_context 分支：主要信号
+        self.ctx_branch = nn.Sequential(
+            nn.Linear(ctx_flat, 64),
+            nn.ReLU(),
+            nn.LayerNorm(64),
+            nn.Linear(64, 64),
+            nn.ReLU(),
+        )
+
+        # h_t 分支：辅助信号（历史稀疏程度、recent peak 等）
+        self.hist_branch = nn.Sequential(
+            nn.Linear(d_model, 32),
+            nn.ReLU(),
+        )
+
+        # 融合后输出 horizon 个 occurrence logit
+        self.fusion = nn.Sequential(
+            nn.Linear(64 + 32, 64),
+            nn.ReLU(),
+            nn.Linear(64, horizon),
+        )
+
+    def forward(self, future_context, h_t):
+        B = h_t.shape[0]
+        ctx = future_context.reshape(B, -1)
+
+        h_ctx = self.ctx_branch(ctx)       # [B, 64]
+        h_hist = self.hist_branch(h_t)     # [B, 32]
+
+        occ_logit = self.fusion(torch.cat([h_ctx, h_hist], dim=-1))  # [B, horizon]
+        return occ_logit
 
 
 class ContextZGenerator(nn.Module):
@@ -465,7 +512,12 @@ class TCN_ENN(nn.Module):
         self.d_z = d_z
         self.horizon = horizon
 
+        # 历史序列编码器：只负责 magnitude 和 alpha
         self.encoder = TCNSparseAttnEncoder(input_dim=input_dim, d_model=d_model, horizon=horizon, beta_peak=beta_peak)
+
+        # occurrence 预测器：由 future_context 主导，h_t 辅助
+        self.occ_predictor = FutureOccurrencePredictor(context_dim=context_dim, d_model=d_model, horizon=horizon)
+
         self.z_generator = ContextZGenerator(d_phi=d_model, context_dim=context_dim, d_z=d_z, horizon=horizon)
         self.epinet = Epinet(d_phi=d_model, d_z=d_z, horizon=horizon, prior_scale=prior_scale)
 
@@ -479,7 +531,12 @@ class TCN_ENN(nn.Module):
     def forward(self, x, future_context, nZ=8):
         B = x.shape[0]
         peak_gate = self.future_peak_gate(future_context.reshape(B, -1))
-        occ_logit_base, mu_base, alpha_base, h_t = self.encoder(x, peak_gate=peak_gate)
+
+        # encoder 只输出 magnitude 和 alpha
+        mu_base, alpha_base, h_t = self.encoder(x, peak_gate=peak_gate)
+
+        # occurrence 由 future_context 主导预测
+        occ_logit_base = self.occ_predictor(future_context, h_t)
 
         phi = h_t.detach()
         z_mean, z_std, kl = self.z_generator(phi, future_context)
@@ -503,7 +560,10 @@ class TCN_ENN(nn.Module):
         with torch.no_grad():
             B = x.shape[0]
             peak_gate = self.future_peak_gate(future_context.reshape(B, -1))
-            occ_logit_base, mu_base, alpha_base, h_t = self.encoder(x, peak_gate=peak_gate)
+
+            mu_base, alpha_base, h_t = self.encoder(x, peak_gate=peak_gate)
+            occ_logit_base = self.occ_predictor(future_context, h_t)
+
             phi = h_t.detach()
             z_mean, z_std, _ = self.z_generator(phi, future_context)
 
@@ -523,7 +583,7 @@ class TCN_ENN(nn.Module):
                     total_count=(1.0 / alpha).clamp(min=1e-4),
                     probs=(mu * alpha / (1 + mu * alpha)).clamp(1e-6, 1 - 1e-6),
                 )
-                mag = nb.sample().float().clamp(min=1)
+                mag = nb.sample().float().clamp(min=0)
                 sample = torch.where(active, mag, torch.zeros_like(mag))
                 samples.append(sample)
 
