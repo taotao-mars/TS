@@ -10,8 +10,8 @@ Main changes vs previous version:
 4. Predict final P50/P70 from zero-inflated mixture samples:
       active ~ Bernoulli(occ_prob)
       magnitude ~ LogNormal(loc, scale) - 1
-5. ENN only perturbs LogNormal loc with small scale; scale is treated as aleatoric noise.
-6. Stage-1 stable training: P70 under-loss defaults to 0 and can be turned on later.
+5. ENN perturbs only LogNormal loc with moderate scale (default 0.3); scale is treated as aleatoric noise.
+6. Stage-1 stable training: use clean distribution loss first; P70 under-loss defaults to 0 and can be turned on later.
 
 Assumptions:
 - data_raw1 already exists in notebook/session.
@@ -463,8 +463,12 @@ class TCNSparseAttnEncoder(nn.Module):
         h_scale = self.scale_proj(mag_inp)
 
         loc = self.loc_head(h_mag)
-        scale = F.softplus(self.scale_head(h_scale)) + 1e-3
-        scale = scale.clamp(min=0.05, max=2.5)
+
+        # Bounded LogNormal scale for numerical stability.
+        # Data check shows log1p(Y|Y>0) is approximately normal but still heavy-tailed.
+        # Keep scale learnable, but constrain it to a reasonable aleatoric range.
+        raw_scale = self.scale_head(h_scale)
+        scale = 0.10 + 1.40 * torch.sigmoid(raw_scale)  # [0.10, 1.50]
 
         return occ_logit, loc, scale, h_t
 
@@ -543,11 +547,13 @@ class Epinet(nn.Module):
 
 class TCN_ENN_LogNormal(nn.Module):
     def __init__(self, input_dim=11, context_dim=2, d_model=32, d_z=16,
-                 horizon=20, prior_scale=0.3, beta_peak=1.5, static_dim=0):
+                 horizon=20, prior_scale=0.3, beta_peak=1.5, static_dim=0,
+                 loc_enn_scale=0.30):
         super().__init__()
         self.d_z = d_z
         self.horizon = horizon
         self.static_dim = static_dim
+        self.loc_enn_scale = loc_enn_scale
 
         self.encoder = TCNSparseAttnEncoder(
             input_dim=input_dim,
@@ -623,12 +629,12 @@ class TCN_ENN_LogNormal(nn.Module):
 
             # ENN loc-only perturbation:
             # z changes plausible active-magnitude levels, but not aleatoric scale.
-            loc = loc_base + 0.10 * loc_e
+            loc = loc_base + self.loc_enn_scale * loc_e
             loc = torch.nan_to_num(loc, nan=0.0, posinf=6.0, neginf=-3.0).clamp(-3.0, 6.0)
 
             # scale_base already comes from the base encoder and is bounded.
             # Do NOT let epinet perturb scale; otherwise LogNormal samples can explode.
-            scale = torch.nan_to_num(scale_base, nan=0.5, posinf=1.2, neginf=0.10).clamp(0.10, 1.20)
+            scale = torch.nan_to_num(scale_base, nan=0.8, posinf=1.5, neginf=0.10).clamp(0.10, 1.50)
 
             preds.append((occ_logit, occ_prob, loc, scale))
 
@@ -652,9 +658,9 @@ class TCN_ENN_LogNormal(nn.Module):
                 occ_prob = torch.sigmoid(occ_logit).clamp(1e-6, 1 - 1e-6)
 
                 # ENN loc-only perturbation for epistemic uncertainty.
-                loc = loc_base + 0.10 * loc_e
+                loc = loc_base + self.loc_enn_scale * loc_e
                 loc = torch.nan_to_num(loc, nan=0.0, posinf=6.0, neginf=-3.0).clamp(-3.0, 6.0)
-                scale = torch.nan_to_num(scale_base, nan=0.5, posinf=1.2, neginf=0.10).clamp(0.10, 1.20)
+                scale = torch.nan_to_num(scale_base, nan=0.8, posinf=1.5, neginf=0.10).clamp(0.10, 1.50)
 
                 active = torch.bernoulli(occ_prob).bool()
                 eps_mag = torch.randn_like(loc)
@@ -706,7 +712,7 @@ def lognormal_two_head_loss(
     log_y = torch.log1p(y[pos_mask])
     # Safety: keep distribution parameters finite and bounded.
     loc = torch.nan_to_num(loc, nan=0.0, posinf=6.0, neginf=-3.0).clamp(-3.0, 6.0)
-    scale = torch.nan_to_num(scale, nan=0.5, posinf=1.2, neginf=0.10).clamp(0.10, 1.20)
+    scale = torch.nan_to_num(scale, nan=0.8, posinf=1.5, neginf=0.10).clamp(0.10, 1.50)
 
     loc_pos = loc[pos_mask]
     scale_pos = scale[pos_mask]
@@ -736,7 +742,7 @@ def train(
     epochs=20,
     nZ=8,
     lr=5e-4,
-    lambda_q=0.10,
+    lambda_q=0.0,
     kl_weight=0.003,
     lambda_p70_under=0.0,
 ):
@@ -1006,6 +1012,7 @@ def run_one_group(
     group_name,
     prior_scale=0.5,
     beta_peak=1.5,
+    loc_enn_scale=0.30,
     epochs=20,
     history=52,
     horizon=20,
@@ -1013,7 +1020,7 @@ def run_one_group(
     d_z=16,
     batch_size=64,
     M_eval=100,
-    lambda_q=0.10,
+    lambda_q=0.0,
     kl_weight=0.003,
     lambda_p70_under=0.0,
 ):
@@ -1047,6 +1054,7 @@ def run_one_group(
         prior_scale=prior_scale,
         beta_peak=beta_peak,
         static_dim=n_static,
+        loc_enn_scale=loc_enn_scale,
     )
 
     print(f"Trainable params: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
@@ -1164,6 +1172,7 @@ def run_high_sparse_lognormal_experiment(
     zero_thresholds=(0.4, 0.7),
     prior_scale=0.5,
     beta_peak=1.5,
+    loc_enn_scale=0.30,
     epochs=20,
     history=52,
     horizon=20,
@@ -1171,7 +1180,7 @@ def run_high_sparse_lognormal_experiment(
     d_z=16,
     batch_size=64,
     M_eval=100,
-    lambda_q=0.10,
+    lambda_q=0.0,
     kl_weight=0.003,
     lambda_p70_under=0.0,
 ):
@@ -1190,6 +1199,7 @@ def run_high_sparse_lognormal_experiment(
     print(f"  beta_peak={beta_peak}, prior_scale={prior_scale}")
     print(f"  lambda_q={lambda_q}, kl_weight={kl_weight}, M_eval={M_eval}")
     print(f"  lambda_p70_under={lambda_p70_under}")
+    print(f"  loc_enn_scale={loc_enn_scale}")
     print("  oversampling=OFF, ENN loc-only")
     print("  magnitude=LogNormal distribution, ENN loc-only")
 
@@ -1198,6 +1208,7 @@ def run_high_sparse_lognormal_experiment(
         group_name='high_sparse_lognormal_no_os',
         prior_scale=prior_scale,
         beta_peak=beta_peak,
+        loc_enn_scale=loc_enn_scale,
         epochs=epochs,
         history=history,
         horizon=horizon,
@@ -1230,6 +1241,7 @@ high_sparse_lognormal_result, high_sparse_lognormal_summary_df, asin_zero_stats 
     zero_thresholds=(0.4, 0.7),
     prior_scale=0.5,
     beta_peak=1.5,
+    loc_enn_scale=0.30,
     epochs=20,
     history=52,
     horizon=20,
@@ -1237,7 +1249,7 @@ high_sparse_lognormal_result, high_sparse_lognormal_summary_df, asin_zero_stats 
     d_z=16,
     batch_size=64,
     M_eval=100,
-    lambda_q=0.10,
+    lambda_q=0.0,
     kl_weight=0.003,
     lambda_p70_under=0.0,
 )
