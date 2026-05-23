@@ -753,19 +753,33 @@ def train(
             enc_grad = model.encoder.input_proj.weight.grad
             loc_w    = model.encoder.loc_head[-1].weight
 
+            # 安全格式化：避免 grad=None 或 f-string 条件格式化报错
+            occ_grad_str = (
+                "None" if occ_grad is None
+                else f"{occ_grad.abs().mean().item():.4f}"
+            )
+            loc_grad_str = (
+                "None" if loc_grad is None
+                else f"{loc_grad.abs().mean().item():.4f}"
+            )
+            enc_grad_str = (
+                "None" if enc_grad is None
+                else f"{enc_grad.abs().mean().item():.4f}"
+            )
+
             # mag_nll 详情：只在有 active weeks 的 batch 里计算
             mag_nll_vals = [m.item() for m in mag_losses if m.item() > 0]
 
             print(
                 f"  [grad] "
-                f"occ={occ_grad.abs().mean():.4f} "
-                f"loc={loc_grad.abs().mean():.4f if loc_grad is not None else 'None'} "
-                f"enc={enc_grad.abs().mean():.4f}"
+                f"occ={occ_grad_str} "
+                f"loc={loc_grad_str} "
+                f"enc={enc_grad_str}"
             )
             print(
                 f"  [loc_head_w] "
-                f"mean={loc_w.abs().mean():.5f} "
-                f"max={loc_w.abs().max():.5f} "
+                f"mean={loc_w.abs().mean().item():.5f} "
+                f"max={loc_w.abs().max().item():.5f} "
                 f"(should grow from 0.01)"
             )
             if mag_nll_vals:
@@ -775,7 +789,7 @@ def train(
                     f"mean={sum(mag_nll_vals)/len(mag_nll_vals):.4f}"
                 )
             else:
-                print(f"  [mag_nll detail] all zero this epoch ← 还是有问题"  )
+                print("  [mag_nll detail] all zero this epoch ← 还是有问题")
 
         # validation
         model.eval()
