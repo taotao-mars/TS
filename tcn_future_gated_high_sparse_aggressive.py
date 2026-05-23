@@ -269,6 +269,9 @@ class DemandDataset(Dataset):
 
             for start in starts:
                 target_weeks = weeks[start+history:start+history+horizon]
+                y_window = demand[start+history:start+history+horizon]
+                # 标记该样本的 horizon 窗口里是否有活跃周
+                has_active = int((y_window > 0).any())
 
                 self.samples.append({
                     'x': torch.tensor(features[start:start+history], dtype=torch.float32),
@@ -276,10 +279,11 @@ class DemandDataset(Dataset):
                         future_context[start+history:start+history+horizon],
                         dtype=torch.float32
                     ),
-                    'y': torch.tensor(demand[start+history:start+history+horizon], dtype=torch.float32),
+                    'y': torch.tensor(y_window, dtype=torch.float32),
                     'asin': asin,
                     'target_week': [str(w)[:10] for w in target_weeks],
                     'oos': torch.tensor(oos[start+history:start+history+horizon], dtype=torch.float32),
+                    'has_active': has_active,
                 })
 
     def __len__(self):
@@ -287,6 +291,27 @@ class DemandDataset(Dataset):
 
     def __getitem__(self, i):
         return self.samples[i]
+
+
+def make_active_weighted_sampler(dataset, oversample_factor=3.0):
+    """
+    对含有活跃周的样本做过采样。
+    oversample_factor: 活跃样本相对于非活跃样本的采样权重倍数。
+    对于 high_sparse（zero_rate≥0.7），建议 3.0~5.0。
+    """
+    weights = []
+    for s in dataset.samples:
+        if s['has_active']:
+            weights.append(oversample_factor)
+        else:
+            weights.append(1.0)
+    weights = torch.tensor(weights, dtype=torch.float)
+    sampler = torch.utils.data.WeightedRandomSampler(
+        weights=weights,
+        num_samples=len(weights),
+        replacement=True,
+    )
+    return sampler
 
 
 # =====================================================
@@ -353,9 +378,14 @@ class SparsePeakAttention(nn.Module):
 
 class TCNSparseAttnEncoder(nn.Module):
     """
-    历史序列编码器，只负责 magnitude 和 alpha（量级分支）。
-    occurrence 预测已移至 TCN_ENN 层，由 future_context 直接驱动。
+    历史序列编码器。
+    核心改动：hist_nonzero_mean / hist_nonzero_p75 / recent_peak
+    这三个历史锚点直接跳过 TCN，shortcut 连接到 magnitude head，
+    让模型有一个强的先验起点，不需要从原始序列重新学量级信息。
     """
+    # feature 索引（对应 load_real_data 里 features 的列顺序）
+    ANCHOR_IDXS = [8, 9, 10]  # hist_nonzero_mean, hist_nonzero_p75, recent_peak
+
     def __init__(self, input_dim=11, d_model=32, horizon=20, beta_peak=1.5):
         super().__init__()
         self.horizon = horizon
@@ -368,16 +398,27 @@ class TCNSparseAttnEncoder(nn.Module):
         self.sparse_attn = SparsePeakAttention(d_model, n_heads=4, beta_peak=beta_peak)
         self.final_norm = nn.LayerNorm(d_model)
 
-        # occurrence_head 已移除，历史序列不再直接预测 occurrence
-        self.mag_proj = nn.Sequential(nn.Linear(d_model, d_model), nn.ReLU(), nn.LayerNorm(d_model))
-        self.alpha_proj = nn.Sequential(nn.Linear(d_model, d_model), nn.ReLU(), nn.LayerNorm(d_model))
+        n_anchors = len(self.ANCHOR_IDXS)
 
+        self.occ_proj = nn.Sequential(nn.Linear(d_model, d_model), nn.ReLU(), nn.LayerNorm(d_model))
+        # magnitude proj 接收 h_t + 历史锚点
+        self.mag_proj = nn.Sequential(
+            nn.Linear(d_model + n_anchors, d_model), nn.ReLU(), nn.LayerNorm(d_model)
+        )
+        self.alpha_proj = nn.Sequential(
+            nn.Linear(d_model + n_anchors, d_model), nn.ReLU(), nn.LayerNorm(d_model)
+        )
+
+        self.occurrence_head = nn.Sequential(nn.Linear(d_model, 64), nn.ReLU(), nn.Linear(64, horizon))
         self.magnitude_head = nn.Sequential(nn.Linear(d_model, 64), nn.ReLU(), nn.Linear(64, horizon))
         self.alpha_head = nn.Sequential(nn.Linear(d_model, 64), nn.ReLU(), nn.Linear(64, horizon))
 
     def forward(self, x, peak_gate=None):
         b_t = x[:, :, 1]
         peak_score = torch.sqrt(torch.expm1(x[:, :, 0]).clamp(min=0) + 1e-6)
+
+        # 提取历史锚点（用最后一个时间步，已经是 rolling 值，无泄漏）
+        anchor = x[:, -1, self.ANCHOR_IDXS]  # [B, 3]
 
         h = self.input_proj(x).permute(0, 2, 1)
 
@@ -391,59 +432,17 @@ class TCNSparseAttnEncoder(nn.Module):
         h = self.sparse_attn(h.permute(0, 2, 1), b_t, peak_score, peak_gate=peak_gate)
         h_t = self.final_norm(h[:, -1, :])
 
-        h_mag = self.mag_proj(h_t)
-        h_alpha = self.alpha_proj(h_t)
+        h_occ = self.occ_proj(h_t)
 
+        # magnitude 和 alpha 直接拼接历史锚点，提供强先验
+        h_mag = self.mag_proj(torch.cat([h_t, anchor], dim=-1))
+        h_alpha = self.alpha_proj(torch.cat([h_t, anchor], dim=-1))
+
+        occ_logit = self.occurrence_head(h_occ)
         mu = F.softplus(self.magnitude_head(h_mag))
         alpha = F.softplus(self.alpha_head(h_alpha)) + 1e-4
 
-        return mu, alpha, h_t
-
-
-class FutureOccurrencePredictor(nn.Module):
-    """
-    occurrence 预测器，直接由 future_context 和历史摘要 h_t 共同驱动。
-    future_context 是主要信号（权重更高），h_t 作为辅助条件。
-
-    对于 high_sparse ASIN，触发需求的是外部事件（价格、促销、库存），
-    而不是历史序列本身，因此 occurrence 应主要由 future_context 决定。
-    """
-    def __init__(self, context_dim=2, d_model=32, horizon=20):
-        super().__init__()
-        self.horizon = horizon
-        ctx_flat = horizon * context_dim
-
-        # future_context 分支：主要信号
-        self.ctx_branch = nn.Sequential(
-            nn.Linear(ctx_flat, 64),
-            nn.ReLU(),
-            nn.LayerNorm(64),
-            nn.Linear(64, 64),
-            nn.ReLU(),
-        )
-
-        # h_t 分支：辅助信号（历史稀疏程度、recent peak 等）
-        self.hist_branch = nn.Sequential(
-            nn.Linear(d_model, 32),
-            nn.ReLU(),
-        )
-
-        # 融合后输出 horizon 个 occurrence logit
-        self.fusion = nn.Sequential(
-            nn.Linear(64 + 32, 64),
-            nn.ReLU(),
-            nn.Linear(64, horizon),
-        )
-
-    def forward(self, future_context, h_t):
-        B = h_t.shape[0]
-        ctx = future_context.reshape(B, -1)
-
-        h_ctx = self.ctx_branch(ctx)       # [B, 64]
-        h_hist = self.hist_branch(h_t)     # [B, 32]
-
-        occ_logit = self.fusion(torch.cat([h_ctx, h_hist], dim=-1))  # [B, horizon]
-        return occ_logit
+        return occ_logit, mu, alpha, h_t
 
 
 class ContextZGenerator(nn.Module):
@@ -512,12 +511,7 @@ class TCN_ENN(nn.Module):
         self.d_z = d_z
         self.horizon = horizon
 
-        # 历史序列编码器：只负责 magnitude 和 alpha
         self.encoder = TCNSparseAttnEncoder(input_dim=input_dim, d_model=d_model, horizon=horizon, beta_peak=beta_peak)
-
-        # occurrence 预测器：由 future_context 主导，h_t 辅助
-        self.occ_predictor = FutureOccurrencePredictor(context_dim=context_dim, d_model=d_model, horizon=horizon)
-
         self.z_generator = ContextZGenerator(d_phi=d_model, context_dim=context_dim, d_z=d_z, horizon=horizon)
         self.epinet = Epinet(d_phi=d_model, d_z=d_z, horizon=horizon, prior_scale=prior_scale)
 
@@ -531,12 +525,7 @@ class TCN_ENN(nn.Module):
     def forward(self, x, future_context, nZ=8):
         B = x.shape[0]
         peak_gate = self.future_peak_gate(future_context.reshape(B, -1))
-
-        # encoder 只输出 magnitude 和 alpha
-        mu_base, alpha_base, h_t = self.encoder(x, peak_gate=peak_gate)
-
-        # occurrence 由 future_context 主导预测
-        occ_logit_base = self.occ_predictor(future_context, h_t)
+        occ_logit_base, mu_base, alpha_base, h_t = self.encoder(x, peak_gate=peak_gate)
 
         phi = h_t.detach()
         z_mean, z_std, kl = self.z_generator(phi, future_context)
@@ -560,10 +549,7 @@ class TCN_ENN(nn.Module):
         with torch.no_grad():
             B = x.shape[0]
             peak_gate = self.future_peak_gate(future_context.reshape(B, -1))
-
-            mu_base, alpha_base, h_t = self.encoder(x, peak_gate=peak_gate)
-            occ_logit_base = self.occ_predictor(future_context, h_t)
-
+            occ_logit_base, mu_base, alpha_base, h_t = self.encoder(x, peak_gate=peak_gate)
             phi = h_t.detach()
             z_mean, z_std, _ = self.z_generator(phi, future_context)
 
@@ -583,7 +569,7 @@ class TCN_ENN(nn.Module):
                     total_count=(1.0 / alpha).clamp(min=1e-4),
                     probs=(mu * alpha / (1 + mu * alpha)).clamp(1e-6, 1 - 1e-6),
                 )
-                mag = nb.sample().float().clamp(min=0)
+                mag = nb.sample().float().clamp(min=1)
                 sample = torch.where(active, mag, torch.zeros_like(mag))
                 samples.append(sample)
 
@@ -958,7 +944,9 @@ def run_one_group(
     tr_ds = DemandDataset(data, history=history, horizon=horizon, mode='train', val_weeks=horizon)
     va_ds = DemandDataset(data, history=history, horizon=horizon, mode='val', val_weeks=horizon)
 
-    tr_ld = DataLoader(tr_ds, batch_size=batch_size, shuffle=True)
+    # 对含活跃周的样本做过采样，解决 magnitude 梯度信号稀少的问题
+    tr_sampler = make_active_weighted_sampler(tr_ds, oversample_factor=3.0)
+    tr_ld = DataLoader(tr_ds, batch_size=batch_size, sampler=tr_sampler)
     va_ld = DataLoader(va_ds, batch_size=batch_size, shuffle=False)
 
     print(f"Train samples: {len(tr_ds)} | Val samples: {len(va_ds)}")
