@@ -405,7 +405,7 @@ class CausalConv1d(nn.Module):
             dilation=dilation
         )
 
-    def forward(self, x, future_peak_strength=None):
+    def forward(self, x):
         return self.conv(F.pad(x, (self.padding, 0)))
 
 
@@ -413,18 +413,17 @@ class SparsePeakAttention(nn.Module):
     """
     Future-conditioned Sparse Peak Attention.
 
-    Compared with the previous SparsePeakAttention:
-      - previous version always gave historical high-demand weeks a positive peak bias.
-      - this version gates that peak bias by future peak strength.
+    Previous version:
+      historical high-demand weeks always received stronger attention.
 
-    Intuition:
-      If future horizon has holiday / promo / peak-event signal,
-          historical peaks should matter more.
-      If future horizon has no peak-event signal,
-          historical peaks should not strongly carry over into forecasts.
+    This version:
+      historical peak attention is gated by future peak/event strength.
 
-    This borrows the main idea from SPADE:
-      peak information should be event-conditioned rather than always active.
+    If future horizon has holiday / peak-event signal:
+      historical peaks matter more.
+
+    If future horizon has no peak-event signal:
+      historical peaks are down-weighted to reduce peak carry-over.
     """
     def __init__(
         self,
@@ -454,14 +453,10 @@ class SparsePeakAttention(nn.Module):
         self.norm = nn.LayerNorm(d_model)
 
     def forward(self, x, b_t, peak_score, future_peak_strength=None):
-        """
-        x: [B, T, D]
-        b_t: [B, T], nonzero demand indicator
-        peak_score: [B, T], historical peak importance
-        future_peak_strength: [B], value in [0, 1]
-            0 means no future peak signal.
-            1 means strong future peak signal.
-        """
+        # x: [B, T, D]
+        # b_t: [B, T]
+        # peak_score: [B, T]
+        # future_peak_strength: [B], usually max holiday/promo signal over horizon
         B, T, D = x.shape
 
         q = self.q_proj(x).view(B, T, self.n_heads, self.d_head).transpose(1, 2)
@@ -470,8 +465,8 @@ class SparsePeakAttention(nn.Module):
 
         scores = torch.matmul(q, k.transpose(-2, -1)) / np.sqrt(self.d_head)
 
-        # Sparse mask:
-        # reduce attention to zero-demand weeks unless the whole sequence is zero.
+        # Sparse mask: reduce attention to zero-demand weeks,
+        # unless the whole sequence is zero.
         sparse_mask = (b_t == 0) & ~(b_t == 0).all(dim=1, keepdim=True)
         scores = scores.masked_fill(sparse_mask[:, None, None, :], -1e4)
 
@@ -479,22 +474,16 @@ class SparsePeakAttention(nn.Module):
         peak_norm = peak_score / (peak_score.max(dim=1, keepdim=True)[0] + 1e-6)
 
         if future_peak_strength is None:
-            # Backward-compatible behavior:
-            # if no future signal is provided, use full peak attention.
             gate = torch.ones(B, device=x.device, dtype=x.dtype)
         else:
             gate = future_peak_strength.to(device=x.device, dtype=x.dtype)
             gate = gate.clamp(0.0, 1.0)
 
-            # Keep a small floor so the model can still use historical peaks
-            # for non-holiday but naturally bursty sparse series.
+            # Small floor keeps some peak information for naturally bursty sparse demand.
             gate = self.peak_gate_floor + (1.0 - self.peak_gate_floor) * gate
             gate = gate.pow(self.peak_gate_power)
 
-        # Future-conditioned peak bias:
-        # historical peaks matter more only when future peak signal is strong.
         peak_bias = self.beta_peak * gate[:, None] * peak_norm
-
         scores = scores + peak_bias[:, None, None, :]
 
         attn = torch.softmax(scores, dim=-1)
@@ -555,7 +544,7 @@ class TCNSparseAttnEncoder(nn.Module):
             nn.Linear(64, horizon)
         )
 
-    def forward(self, x):
+    def forward(self, x, future_peak_strength=None):
         b_t = x[:, :, 1]
 
         # Encoder input uses log1p(demand), but peak attention uses sqrt(raw demand).
@@ -709,17 +698,14 @@ class TCN_ENN(nn.Module):
 
     def _future_peak_strength(self, future_context):
         """
-        Compute a [B] peak-event strength from future context.
+        Compute [B] future peak strength from future context.
 
-        For this NB-v2 data loader, future_context order is:
-            0: our_price
-            1: in_stock_dph
-            2+: holiday_indicator_*
+        For NB-v2 enhanced_features, future_context order is:
+          0: our_price
+          1: in_stock_dph
+          2+: holiday_indicator_*
 
-        So this uses max over horizon and holiday columns.
-        If no holiday columns exist, returns zeros.
-
-        This is intentionally simple and deterministic.
+        We use max over horizon and holiday columns.
         """
         if future_context is None:
             return None
@@ -727,20 +713,26 @@ class TCN_ENN(nn.Module):
         B, H, C = future_context.shape
 
         if C <= self.future_peak_start_idx:
-            return torch.zeros(B, device=future_context.device, dtype=future_context.dtype)
+            return torch.zeros(
+                B,
+                device=future_context.device,
+                dtype=future_context.dtype
+            )
 
         peak_ctx = future_context[:, :, self.future_peak_start_idx:]
 
         if peak_ctx.numel() == 0:
-            return torch.zeros(B, device=future_context.device, dtype=future_context.dtype)
+            return torch.zeros(
+                B,
+                device=future_context.device,
+                dtype=future_context.dtype
+            )
 
-        # Any holiday/promo indicator in the horizon can activate peak attention.
-        strength = peak_ctx.clamp(min=0.0, max=1.0).amax(dim=(1, 2))
-
-        return strength
+        return peak_ctx.clamp(min=0.0, max=1.0).amax(dim=(1, 2))
 
     def forward(self, x, future_context, nZ=8):
         future_peak_strength = self._future_peak_strength(future_context)
+
         mu_base, alpha_base, h_t = self.encoder(
             x,
             future_peak_strength=future_peak_strength
@@ -772,6 +764,7 @@ class TCN_ENN(nn.Module):
 
         with torch.no_grad():
             future_peak_strength = self._future_peak_strength(future_context)
+
             mu_base, alpha_base, h_t = self.encoder(
                 x,
                 future_peak_strength=future_peak_strength
@@ -1522,9 +1515,6 @@ def nb_forecast_distribution_check(forecast_df):
 def nb_peak_gate_diagnostic(model, va_ld):
     """
     Diagnostic for future-conditioned peak attention.
-
-    Reports how often the validation windows have future peak/holiday signal
-    according to model._future_peak_strength().
     """
     vals = []
 
