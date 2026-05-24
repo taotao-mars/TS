@@ -1179,7 +1179,10 @@ def main(
     batch_size=64,
     M_eval=50,
     lambda_q=0.05,
-    beta_tail=0.5
+    beta_tail=0.5,
+    beta_peak=1.0,
+    peak_gate_floor=0.15,
+    peak_gate_power=1.0
 ):
     print("NB-v2-SPADE-lite | Enhanced 25-feature TCN + Future-Conditioned SparsePeakAttn + ENN | Tail-aware NB + p99 clean high-sparse")
     print("=" * 60)
@@ -1428,7 +1431,10 @@ def run_nb_high_sparse_experiment(
         batch_size=batch_size,
         M_eval=M_eval,
         lambda_q=lambda_q,
-        beta_tail=beta_tail
+        beta_tail=beta_tail,
+        beta_peak=beta_peak,
+        peak_gate_floor=peak_gate_floor,
+        peak_gate_power=peak_gate_power
     )
 
     nb_filter_info = {
