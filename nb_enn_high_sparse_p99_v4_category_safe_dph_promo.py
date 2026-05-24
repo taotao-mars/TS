@@ -182,23 +182,23 @@ def load_real_data(data_raw):
 
     Adds:
       - category_code embedding id
-      - promotion_ratio + promotion_amount + promotion_pricing_amount
-      - lag-safe history features for in_stock_dph / buy_box_dph / total_dph
+      - promotion_ratio only
+      - lag-safe history features for in_stock_dph only
       - forecast-origin-safe future context overwrite for DPH columns in Dataset
     """
     holiday_cols = [c for c in data_raw.columns if c.startswith("holiday_indicator_")]
 
+    # Keep only promotion_ratio.
+    # Do not use promotion_amount / promotion_pricing_amount not used in this version.
     promo_context_cols = [
-        c for c in [
-            "promotion_ratio",
-            "promotion_amount",
-            "promotion_pricing_amount",
-        ]
+        c for c in ["promotion_ratio"]
         if c in data_raw.columns
     ]
 
+    # Keep only in_stock_dph.
+    # Do not use buy_box_dph / total_dph for now to avoid extra noise/leakage risk.
     dph_cols = [
-        c for c in ["in_stock_dph", "buy_box_dph", "total_dph"]
+        c for c in ["in_stock_dph"]
         if c in data_raw.columns
     ]
 
@@ -250,16 +250,6 @@ def load_real_data(data_raw):
     else:
         df["promotion_ratio"] = 0.0
 
-    if "promotion_amount" in df.columns:
-        df["promotion_amount"] = np.log1p(pd.to_numeric(df["promotion_amount"], errors="coerce").fillna(0.0).clip(lower=0.0))
-    else:
-        df["promotion_amount"] = 0.0
-
-    if "promotion_pricing_amount" in df.columns:
-        df["promotion_pricing_amount"] = np.log1p(pd.to_numeric(df["promotion_pricing_amount"], errors="coerce").fillna(0.0).clip(lower=0.0))
-    else:
-        df["promotion_pricing_amount"] = 0.0
-
     for c in holiday_cols:
         df[c] = df[c].clip(lower=0, upper=1)
 
@@ -309,8 +299,6 @@ def load_real_data(data_raw):
 
         price_log = group["our_price"].values.astype(float)
         promo_ratio = group["promotion_ratio"].values.astype(float)
-        promo_amount = group["promotion_amount"].values.astype(float)
-        promo_pricing_amount = group["promotion_pricing_amount"].values.astype(float)
 
         def lag_arr(col):
             if col in dph_cols:
@@ -318,8 +306,7 @@ def load_real_data(data_raw):
             return np.zeros(T, dtype=float)
 
         in_stock_lag = lag_arr("in_stock_dph")
-        buy_box_lag = lag_arr("buy_box_dph")
-        total_dph_lag = lag_arr("total_dph")
+        # buy_box_dph and total_dph are intentionally not used in this version.
 
         hist_nonzero_mean_52 = _rolling_positive_mean(demand, 52)
         hist_nonzero_p75_52 = _rolling_positive_quantile(demand, 52, 0.75)
@@ -334,11 +321,7 @@ def load_real_data(data_raw):
         instock_mean_4 = _rolling_mean(in_stock_lag, 4)
         instock_mean_13 = _rolling_mean(in_stock_lag, 13)
 
-        buybox_mean_4 = _rolling_mean(buy_box_lag, 4)
-        buybox_mean_13 = _rolling_mean(buy_box_lag, 13)
-
-        totaldph_mean_4 = _rolling_mean(total_dph_lag, 4)
-        totaldph_mean_13 = _rolling_mean(total_dph_lag, 13)
+        # No buy-box / total-DPH rolling features in this version.
 
         zero_streak = _zero_streak(b_t) / 52.0
 
@@ -381,17 +364,8 @@ def load_real_data(data_raw):
             positive_std_13,
 
             promo_ratio,
-            promo_amount,
-            promo_pricing_amount,
             promo_ratio_mean_4,
             promo_ratio_mean_13,
-
-            np.log1p(buy_box_lag),
-            np.log1p(total_dph_lag),
-            np.log1p(buybox_mean_4),
-            np.log1p(buybox_mean_13),
-            np.log1p(totaldph_mean_4),
-            np.log1p(totaldph_mean_13),
         ], axis=1).astype(np.float32)
 
         future_context = group[context_cols].values.astype(np.float32)
@@ -407,7 +381,7 @@ def load_real_data(data_raw):
             "context_cols": context_cols,
         }
 
-    print("History encoder dim: 36")
+    print("History encoder dim: 28")
     print(f"Conditional z context dim: {len(context_cols)}")
     print("Conditional z context columns:")
     print(context_cols)
@@ -565,7 +539,7 @@ class SparsePeakAttention(nn.Module):
 
 
 class TCNSparseAttnEncoder(nn.Module):
-    def __init__(self, input_dim=36, d_model=32, horizon=20):
+    def __init__(self, input_dim=28, d_model=32, horizon=20):
         super().__init__()
 
         self.horizon = horizon
@@ -704,7 +678,7 @@ class Epinet(nn.Module):
 class TCN_ENN(nn.Module):
     def __init__(
         self,
-        input_dim=36,
+        input_dim=28,
         context_dim=2,
         d_model=32,
         d_z=16,
@@ -1229,7 +1203,7 @@ def main(
     lambda_q=0.05,
     beta_tail=0.5
 ):
-    print("NB-v4 | 36-feature TCN + Category Embedding + ENN | safe DPH + promo features | p99 clean high-sparse")
+    print("NB-v4 | 28-feature TCN + Category Embedding + ENN | safe in_stock_dph + promotion_ratio | p99 clean high-sparse")
     print("=" * 60)
 
     data, context_dim, context_cols, n_categories = load_real_data(data_raw1)
@@ -1269,7 +1243,7 @@ def main(
     print(f"Train samples: {len(tr_ld.dataset)} | Val samples: {len(va_ld.dataset)}")
 
     model = TCN_ENN(
-        input_dim=36,
+        input_dim=28,
         context_dim=context_dim,
         d_model=d_model,
         d_z=d_z,
