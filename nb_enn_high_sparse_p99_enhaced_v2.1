@@ -1,13 +1,14 @@
 """
-TCN + SparseAttn + ENN
-NB version on HIGH-SPARSE group only
-NB-v2 with fixes:
-1. Data leakage fix in _rolling_positive_mean/_rolling_positive_quantile
-2. Early stopping (patience=5)
-3. z regularization
-4. Soft sparse mask
-5. Dilation sequence: [1,2,4,8,13,26,52]
-6. Diagnostics for encoder quality and training
+TCN + Sparse Attention + ENN with Negative Binomial likelihood.
+
+This version runs on the high-sparse group and includes:
+- leak-safe rolling positive features
+- soft sparse attention mask
+- dilation sequence [1, 2, 4, 8, 13, 26, 52]
+- early stopping
+- z regularization
+- encoder diagnostics
+- final WAPE summary
 """
 
 import torch
@@ -66,7 +67,7 @@ def add_zero_rate_group(data_raw, zero_thresholds=(0.4, 0.7)):
 
 
 # =====================================================
-# 1. Data Loading - with leakage fix
+# 1. Data loading
 # =====================================================
 
 def _safe_numeric(df, col, default=0.0):
@@ -117,7 +118,7 @@ def _rolling_positive_quantile(arr, window, q):
 
 
 def _rolling_max_lag(arr, window):
-    """Lag-safe rolling max: exclude current step."""
+    """Lag-safe rolling max excluding current step."""
     out = np.zeros(len(arr), dtype=np.float32)
     for i in range(len(arr)):
         lo = max(0, i - window)
@@ -335,7 +336,7 @@ class SparsePeakAttention(nn.Module):
         self.n_heads = n_heads
         self.d_head  = d_model // n_heads
         self.beta_peak = beta_peak
-        self.soft_mask_scale = soft_mask_scale  # 软mask强度
+        self.soft_mask_scale = soft_mask_scale
 
         self.q_proj   = nn.Linear(d_model, d_model)
         self.k_proj   = nn.Linear(d_model, d_model)
@@ -352,7 +353,7 @@ class SparsePeakAttention(nn.Module):
 
         scores = torch.matmul(q, k.transpose(-2,-1)) / np.sqrt(self.d_head)
 
-        # 软 mask：零时间步降低权重但不完全屏蔽，更稳定
+        # Softly down-weight zero-demand weeks.
         sparse_mask = (b_t == 0) & ~(b_t == 0).all(dim=1, keepdim=True)
         scores = scores - self.soft_mask_scale * sparse_mask.float()[:, None, None, :]
 
@@ -373,7 +374,7 @@ class TCNSparseAttnEncoder(nn.Module):
         self.horizon = horizon
         self.input_proj = nn.Linear(input_dim, d_model)
 
-        # 修改 dilation 序列：加入13周（季度）
+            # Dilations include quarterly and annual scales.
         dilations = [1, 2, 4, 8, 13, 26, 52]
         self.convs = nn.ModuleList([CausalConv1d(d_model, d_model, 2, d) for d in dilations])
         self.norms = nn.ModuleList([nn.LayerNorm(d_model) for _ in dilations])
@@ -633,7 +634,7 @@ def diagnose_encoder(model, va_ld):
 
 
 def diagnose_training_batch(b, preds, epoch, bi, n_diag_batches=3):
-    """在前几个 epoch 的前几个 batch 里打印诊断信息"""
+    """Print diagnostics for the first few batches."""
     if bi >= n_diag_batches:
         return
     y = b["y"]
@@ -650,7 +651,7 @@ def diagnose_training_batch(b, preds, epoch, bi, n_diag_batches=3):
 
 
 # =====================================================
-# 6. Training with early stopping + z reg
+# 6. Training
 # =====================================================
 
 def train(
@@ -702,7 +703,7 @@ def train(
             opt.step()
             tr_loss += loss.item()
 
-            # 只在第一个 epoch 打印 batch 诊断
+            # Print batch diagnostics only in the first epoch.
             if epoch == 0:
                 diagnose_training_batch(b, preds, epoch, bi)
 
@@ -741,7 +742,7 @@ def train(
 
 
 # =====================================================
-# 7. Eval + Forecast + Diagnosis
+# 7. Evaluation and forecast generation
 # =====================================================
 
 def evaluate(model, va_ld, M=100):
@@ -927,7 +928,7 @@ def run_nb_high_sparse(
           lambda_q=lambda_q, beta_tail=beta_tail,
           patience=patience, lambda_z_reg=lambda_z_reg)
 
-    # Encoder 诊断
+    # Encoder diagnostics.
     diagnose_encoder(model, va_ld)
 
     metrics = evaluate(model, va_ld, M=M_eval)
@@ -956,10 +957,140 @@ def run_nb_high_sparse(
     }
 
 
+
 # =====================================================
-# 9. Execute
+# 9. Final WAPE summary
 # =====================================================
 
+def run_final_wape(result, remove_oos_dp=True, source="lp"):
+    """
+    Compute final boss-style WAPE from result["forecast_df"].
+
+    This function expects these notebook functions to already exist:
+      - calculate_wape_using_lp_oos2
+      - quick_error_check
+    """
+    if "forecast_df" not in result:
+        raise KeyError('result must contain "forecast_df".')
+
+    if "calculate_wape_using_lp_oos2" not in globals():
+        raise RuntimeError("calculate_wape_using_lp_oos2 is not defined.")
+
+    if "quick_error_check" not in globals():
+        raise RuntimeError("quick_error_check is not defined.")
+
+    forecast_df = result["forecast_df"]
+
+    wape_df = calculate_wape_using_lp_oos2(
+        forecast_df,
+        [0.5, 0.7],
+        remove_oos_dp=remove_oos_dp,
+        source=source,
+    )
+
+    cols_p50 = [
+        "p50_amxl_penalty",
+        "p50_scot_penalty",
+        "p50_amxl_overbias",
+        "p50_scot_overbias",
+        "p50_amxl_underbias",
+        "p50_scot_underbias",
+        "fbi_demand",
+    ]
+
+    cols_p70 = [
+        "p70_amxl_penalty",
+        "p70_scot_penalty",
+        "p70_amxl_overbias",
+        "p70_scot_overbias",
+        "p70_amxl_underbias",
+        "p70_scot_underbias",
+        "fbi_demand",
+    ]
+
+    p50_wape, p50_penalty_diff = quick_error_check(wape_df, cols_p50)
+    p70_wape, p70_penalty_diff = quick_error_check(wape_df, cols_p70)
+
+    print("\n" + "=" * 80)
+    print("FINAL WAPE SUMMARY")
+    print("=" * 80)
+
+    print("\nP50 WAPE")
+    print(p50_wape)
+    print("P50 penalty diff:", p50_penalty_diff)
+
+    print("\nP70 WAPE")
+    print(p70_wape)
+    print("P70 penalty diff:", p70_penalty_diff)
+
+    return {
+        "wape_df": wape_df,
+        "p50_wape": p50_wape,
+        "p70_wape": p70_wape,
+        "p50_penalty_diff": p50_penalty_diff,
+        "p70_penalty_diff": p70_penalty_diff,
+    }
+
+
+def run_nb_high_sparse_with_wape(
+    data_raw1,
+    n_asins=5000,
+    zero_thresholds=(0.4, 0.7),
+    prior_scale=0.3,
+    epochs=60,
+    history=52,
+    horizon=20,
+    d_model=32,
+    d_z=16,
+    batch_size=64,
+    M_eval=100,
+    lambda_q=0.05,
+    beta_tail=0.5,
+    patience=5,
+    lambda_z_reg=1.0,
+    remove_extreme=True,
+    extreme_q=0.99,
+    remove_oos_dp=True,
+):
+    """
+    Run the full experiment and print final WAPE.
+    """
+    result = run_nb_high_sparse(
+        data_raw1=data_raw1,
+        n_asins=n_asins,
+        zero_thresholds=zero_thresholds,
+        prior_scale=prior_scale,
+        epochs=epochs,
+        history=history,
+        horizon=horizon,
+        d_model=d_model,
+        d_z=d_z,
+        batch_size=batch_size,
+        M_eval=M_eval,
+        lambda_q=lambda_q,
+        beta_tail=beta_tail,
+        patience=patience,
+        lambda_z_reg=lambda_z_reg,
+        remove_extreme=remove_extreme,
+        extreme_q=extreme_q,
+    )
+
+    wape_outputs = run_final_wape(
+        result,
+        remove_oos_dp=remove_oos_dp,
+        source="lp",
+    )
+
+    result["wape_outputs"] = wape_outputs
+
+    return result
+
+# =====================================================
+# 10. Execute
+# =====================================================
+
+# Option A: run model only.
+#
 # result = run_nb_high_sparse(
 #     data_raw1,
 #     n_asins=5000,
@@ -978,8 +1109,26 @@ def run_nb_high_sparse(
 #     extreme_q=0.99,
 # )
 #
-# # 之后跑 WAPE
-# if "calculate_wape_using_lp_oos2" in globals():
-#     wape_df = calculate_wape_using_lp_oos2(
-#         result["forecast_df"], [0.5, 0.7], remove_oos_dp=True, source="lp"
-#     )
+# wape_outputs = run_final_wape(result)
+
+
+# Option B: run model and WAPE together.
+#
+# result = run_nb_high_sparse_with_wape(
+#     data_raw1,
+#     n_asins=5000,
+#     zero_thresholds=(0.4, 0.7),
+#     prior_scale=0.3,
+#     epochs=60,
+#     d_model=32,
+#     d_z=16,
+#     batch_size=64,
+#     M_eval=100,
+#     lambda_q=0.05,
+#     beta_tail=0.5,
+#     patience=5,
+#     lambda_z_reg=1.0,
+#     remove_extreme=True,
+#     extreme_q=0.99,
+#     remove_oos_dp=True,
+# )
