@@ -1,611 +1,241 @@
-
 import pandas as pd
 import numpy as np
 
 
-def build_sample_asin_and_sparse_groups(
-    data_raw1,
-    n_asins=5000,
-    seed=42,
-    zero_thresholds=(0.4, 0.7),
+def run_high_sparse_scot_alignment_wape(
+    result,
+    scot_df,
+    remove_oos_dp=True,
+    source="lp",
 ):
-    df = data_raw1.copy()
-    df.columns = [c.strip() for c in df.columns]
+    """
+    Align real SCOT forecasts to your high-sparse NB forecast_df
+    and compute boss-style WAPE using existing WAPE functions.
 
-    for c in ["asin", "order_week", "fbi_demand"]:
-        if c not in df.columns:
-            raise ValueError(f"Missing required column in data_raw1: {c}")
+    Required:
+      result["forecast_df"] has:
+        asin, order_week, fbi_demand, p50_amxl, p70_amxl, oos_status/oos/scot_oos
 
-    df["asin"] = df["asin"].astype(str)
-    df["order_week"] = pd.to_datetime(df["order_week"])
-    df["fbi_demand"] = pd.to_numeric(
-        df["fbi_demand"],
+      scot_df has:
+        asin, order_week, forecast_qty_p50, forecast_qty_p70
+    """
+
+    if "calculate_wape_using_lp_oos2" not in globals():
+        raise RuntimeError("calculate_wape_using_lp_oos2 is not defined.")
+
+    if "quick_error_check" not in globals():
+        raise RuntimeError("quick_error_check is not defined.")
+
+    # -----------------------------
+    # 1. Prepare NB high-sparse forecast
+    # -----------------------------
+    forecast_df = result["forecast_df"].copy()
+    forecast_df.columns = [c.strip() for c in forecast_df.columns]
+
+    forecast_df["asin"] = forecast_df["asin"].astype(str)
+    forecast_df["order_week"] = pd.to_datetime(forecast_df["order_week"])
+
+    print("=" * 80)
+    print("NB HIGH-SPARSE FORECAST WINDOW")
+    print("=" * 80)
+    print("NB rows:", len(forecast_df))
+    print("NB ASINs:", forecast_df["asin"].nunique())
+    print("NB weeks:", forecast_df["order_week"].min(), "to", forecast_df["order_week"].max())
+    print("NB week count:", forecast_df["order_week"].nunique())
+
+    # -----------------------------
+    # 2. Prepare real SCOT forecast
+    # -----------------------------
+    scot = scot_df.copy()
+    scot.columns = [c.strip() for c in scot.columns]
+
+    required_scot_cols = [
+        "asin",
+        "order_week",
+        "forecast_qty_p50",
+        "forecast_qty_p70",
+    ]
+
+    for c in required_scot_cols:
+        if c not in scot.columns:
+            raise ValueError(f"Missing SCOT column: {c}")
+
+    scot["asin"] = scot["asin"].astype(str)
+    scot["order_week"] = pd.to_datetime(scot["order_week"])
+
+    scot["forecast_qty_p50"] = pd.to_numeric(
+        scot["forecast_qty_p50"],
         errors="coerce"
-    ).fillna(0).clip(lower=0)
-
-    rng = np.random.default_rng(seed)
-    unique_asins = df["asin"].dropna().unique()
-
-    sample_asins = rng.choice(
-        unique_asins,
-        size=min(n_asins, len(unique_asins)),
-        replace=False
     )
 
-    sample_asin_df = pd.DataFrame({"asin": sample_asins})
-    sample_df = df[df["asin"].isin(sample_asins)].copy()
+    scot["forecast_qty_p70"] = pd.to_numeric(
+        scot["forecast_qty_p70"],
+        errors="coerce"
+    )
 
-    asin_stats = (
-        sample_df
-        .groupby("asin", as_index=False)
+    if "fcst_start_week" in scot.columns:
+        scot["fcst_start_week"] = pd.to_datetime(scot["fcst_start_week"])
+
+    print("\n" + "=" * 80)
+    print("REAL SCOT FORECAST FILE")
+    print("=" * 80)
+    print("SCOT rows:", len(scot))
+    print("SCOT ASINs:", scot["asin"].nunique())
+    print("SCOT weeks:", scot["order_week"].min(), "to", scot["order_week"].max())
+    print("SCOT week count:", scot["order_week"].nunique())
+
+    if "fcst_start_week" in scot.columns:
+        print("\nSCOT fcst_start_week counts:")
+        print(scot["fcst_start_week"].value_counts().sort_index())
+
+    # -----------------------------
+    # 3. Align by asin + order_week
+    # -----------------------------
+    scot_keep = scot[
+        [
+            "asin",
+            "order_week",
+            "forecast_qty_p50",
+            "forecast_qty_p70",
+        ]
+    ].copy()
+
+    # In case SCOT has duplicate rows for the same ASIN-week
+    scot_keep = (
+        scot_keep
+        .groupby(["asin", "order_week"], as_index=False)
         .agg(
-            zero_rate=("fbi_demand", lambda x: (x == 0).mean()),
-            total_demand=("fbi_demand", "sum"),
-            n_weeks=("fbi_demand", "count"),
+            forecast_qty_p50=("forecast_qty_p50", "mean"),
+            forecast_qty_p70=("forecast_qty_p70", "mean"),
         )
     )
 
-    low, high = zero_thresholds
-
-    def assign_group(z):
-        if z < low:
-            return "low_sparse"
-        elif z < high:
-            return "mid_sparse"
-        else:
-            return "high_sparse"
-
-    asin_stats["zero_group"] = asin_stats["zero_rate"].apply(assign_group)
-
-    sample_asin_group_df = sample_asin_df.merge(
-        asin_stats[["asin", "zero_rate", "zero_group", "total_demand", "n_weeks"]],
-        on="asin",
-        how="left"
-    )
-
-    print("=" * 80)
-    print("SAMPLED ASIN GROUP SUMMARY")
-    print("=" * 80)
-    print("Sample ASINs:", sample_asin_group_df["asin"].nunique())
-    print(sample_asin_group_df.groupby("zero_group", dropna=False)["asin"].nunique())
-
-    return sample_asin_group_df, sample_df, asin_stats
-
-
-def get_true_demand_for_eval(data_raw1):
-    df = data_raw1.copy()
-    df.columns = [c.strip() for c in df.columns]
-
-    for c in ["asin", "order_week", "fbi_demand"]:
-        if c not in df.columns:
-            raise ValueError(f"Missing required column in data_raw1: {c}")
-
-    df["asin"] = df["asin"].astype(str)
-    df["order_week"] = pd.to_datetime(df["order_week"])
-    df["fbi_demand"] = pd.to_numeric(
-        df["fbi_demand"],
-        errors="coerce"
-    ).fillna(0).clip(lower=0)
-
-    keep_cols = ["asin", "order_week", "fbi_demand"]
-
-    for c in ["scot_oos", "oos_status", "oos"]:
-        if c in df.columns and c not in keep_cols:
-            keep_cols.append(c)
-
-    true_df = (
-        df[keep_cols]
-        .drop_duplicates(subset=["asin", "order_week"])
-        .reset_index(drop=True)
-    )
-
-    print("\nTRUE DEMAND DF")
-    print("rows:", len(true_df))
-    print("unique ASINs:", true_df["asin"].nunique())
-
-    return true_df
-
-
-def standardize_forecast_df(
-    forecast_df,
-    source="scot",
-    p50_col=None,
-    p70_col=None,
-):
-    df = forecast_df.copy()
-    df.columns = [c.strip() for c in df.columns]
-
-    for c in ["asin", "order_week"]:
-        if c not in df.columns:
-            raise ValueError(f"Missing required forecast column: {c}")
-
-    df["asin"] = df["asin"].astype(str)
-    df["order_week"] = pd.to_datetime(df["order_week"])
-
-    if p50_col is None:
-        p50_col = "forecast_qty_p50" if source == "scot" else "p50_amxl"
-
-    if p70_col is None:
-        p70_col = "forecast_qty_p70" if source == "scot" else "p70_amxl"
-
-    if p50_col not in df.columns:
-        raise ValueError(f"{p50_col} not found in forecast_df.")
-    if p70_col not in df.columns:
-        raise ValueError(f"{p70_col} not found in forecast_df.")
-
-    df["p50_pred"] = pd.to_numeric(df[p50_col], errors="coerce")
-    df["p70_pred"] = pd.to_numeric(df[p70_col], errors="coerce")
-
-    keep_cols = ["asin", "order_week", "p50_pred", "p70_pred"]
-
-    optional_cols = [
-        "forecast_qty_p50",
-        "forecast_qty_p70",
-        "forecast_qty_p90",
-        "p50_amxl",
-        "p70_amxl",
-        "model_id",
-        "fcst_start_week",
-        "fcst_week_index",
-    ]
-
-    for c in optional_cols:
-        if c in df.columns and c not in keep_cols:
-            keep_cols.append(c)
-
-    out = df[keep_cols].copy()
-
-    if "fcst_start_week" in out.columns:
-        out["fcst_start_week"] = pd.to_datetime(out["fcst_start_week"])
-
-    return out
-
-
-def build_eval_df_for_forecast(
-    forecast_df,
-    data_raw1,
-    sample_asin_group_df,
-    source="scot",
-    p50_col=None,
-    p70_col=None,
-):
-    pred_df = standardize_forecast_df(
-        forecast_df,
-        source=source,
-        p50_col=p50_col,
-        p70_col=p70_col,
-    )
-
-    true_df = get_true_demand_for_eval(data_raw1)
-
-    sample_group = sample_asin_group_df.copy()
-    sample_group["asin"] = sample_group["asin"].astype(str)
-
-    pred_before = pred_df.copy()
-
-    pred_df = pred_df.merge(
-        sample_group[["asin", "zero_rate", "zero_group"]],
-        on="asin",
-        how="inner"
-    )
-
-    eval_df = pred_df.merge(
-        true_df,
+    forecast_df_scot_real = forecast_df.merge(
+        scot_keep,
         on=["asin", "order_week"],
         how="inner"
     )
 
     print("\n" + "=" * 80)
-    print("BUILD EVAL DF")
+    print("ALIGNMENT CHECK")
     print("=" * 80)
-    print("source:", source)
-    print("forecast rows before sample ASIN filter:", len(pred_before))
-    print("forecast ASINs before sample ASIN filter:", pred_before["asin"].nunique())
-    print("rows after sample ASIN filter + true demand merge:", len(eval_df))
-    print("unique ASINs after merge:", eval_df["asin"].nunique())
-    print(eval_df.groupby("zero_group", dropna=False)["asin"].nunique())
+    print("NB forecast rows:", len(forecast_df))
+    print("After SCOT merge rows:", len(forecast_df_scot_real))
+    print("Matched ASINs:", forecast_df_scot_real["asin"].nunique())
+    print(
+        "Matched weeks:",
+        forecast_df_scot_real["order_week"].min(),
+        "to",
+        forecast_df_scot_real["order_week"].max()
+    )
+    print("Matched week count:", forecast_df_scot_real["order_week"].nunique())
 
-    return eval_df
-
-
-def add_boss_quantile_penalty(
-    df,
-    actual_col="fbi_demand",
-    pred_col="p50_pred",
-    prefix="p50",
-    quantile=0.5,
-):
-    out = df.copy()
-
-    y = pd.to_numeric(out[actual_col], errors="coerce").fillna(0)
-    pred = pd.to_numeric(out[pred_col], errors="coerce").fillna(0)
-
-    over_col = f"{prefix}_overbias"
-    under_col = f"{prefix}_underbias"
-    penalty_col = f"{prefix}_penalty"
-    row_wape_col = f"{prefix}_row_wape"
-
-    out[over_col] = np.where(
-        pred >= y,
-        np.abs(pred - y) * (1.0 - quantile),
-        0.0
+    row_match_rate = len(forecast_df_scot_real) / max(len(forecast_df), 1)
+    asin_match_rate = (
+        forecast_df_scot_real["asin"].nunique()
+        / max(forecast_df["asin"].nunique(), 1)
     )
 
-    out[under_col] = np.where(
-        pred < y,
-        np.abs(pred - y) * quantile,
-        0.0
-    )
+    print("Row match rate:", row_match_rate)
+    print("ASIN match rate:", asin_match_rate)
 
-    out[penalty_col] = out[over_col] + out[under_col]
+    if row_match_rate < 0.8:
+        print("\nWARNING: SCOT matched less than 80% of NB forecast rows.")
+        print("Check whether SCOT file has the same forecast window.")
 
-    out[row_wape_col] = np.where(
-        y != 0,
-        out[penalty_col] / y,
-        np.nan
-    )
+    # -----------------------------
+    # 4. Replace baseline SCOT columns
+    # -----------------------------
+    forecast_df_scot_real["p50_scot"] = forecast_df_scot_real["forecast_qty_p50"]
+    forecast_df_scot_real["p70_scot"] = forecast_df_scot_real["forecast_qty_p70"]
 
-    return out
-
-
-def _infer_oos_col(df, oos_col=None):
-    if oos_col is not None and oos_col in df.columns:
-        return oos_col
-
-    for c in ["oos_status", "scot_oos", "oos"]:
-        if c in df.columns:
-            return c
-
-    return None
-
-
-def calculate_group_wape_summary(
-    eval_df,
-    remove_oos_dp=True,
-    oos_col=None,
-    label="forecast",
-):
-    df = eval_df.copy()
-
-    oos_col = _infer_oos_col(df, oos_col=oos_col)
-
-    print("\n" + "=" * 80)
-    print(f"WAPE CALCULATION: {label}")
-    print("=" * 80)
-    print("Before OOS filtering:", df.shape)
-
-    if remove_oos_dp and oos_col is not None and oos_col in df.columns:
-        df[oos_col] = pd.to_numeric(df[oos_col], errors="coerce").fillna(0)
-        df = df[df[oos_col] == 0].copy()
-        print(f"After OOS filtering by {oos_col}:", df.shape)
-    else:
-        print("OOS filtering skipped.")
-
-    df = add_boss_quantile_penalty(
-        df,
-        actual_col="fbi_demand",
-        pred_col="p50_pred",
-        prefix="p50",
-        quantile=0.5,
-    )
-
-    df = add_boss_quantile_penalty(
-        df,
-        actual_col="fbi_demand",
-        pred_col="p70_pred",
-        prefix="p70",
-        quantile=0.7,
-    )
-
-    def summarize_one_group(g, group_name):
-        denom = g["fbi_demand"].sum()
-
-        if denom == 0:
-            p50_penalty = np.nan
-            p70_penalty = np.nan
-            p50_under = np.nan
-            p50_over = np.nan
-            p70_under = np.nan
-            p70_over = np.nan
-        else:
-            p50_penalty = g["p50_penalty"].sum() / denom
-            p50_under = g["p50_underbias"].sum() / denom
-            p50_over = g["p50_overbias"].sum() / denom
-
-            p70_penalty = g["p70_penalty"].sum() / denom
-            p70_under = g["p70_underbias"].sum() / denom
-            p70_over = g["p70_overbias"].sum() / denom
-
-        return {
-            "label": label,
-            "zero_group": group_name,
-            "n_rows": len(g),
-            "n_asins": g["asin"].nunique(),
-            "total_fbi_demand": denom,
-            "true_mean": g["fbi_demand"].mean(),
-            "p50_mean": g["p50_pred"].mean(),
-            "p70_mean": g["p70_pred"].mean(),
-            "true_zero_rate": (g["fbi_demand"] == 0).mean(),
-            "true_active_ratio": (g["fbi_demand"] > 0).mean(),
-            "p50_active_ratio": (g["p50_pred"] > 0.5).mean(),
-            "p70_active_ratio": (g["p70_pred"] > 0.5).mean(),
-            "p50_penalty": p50_penalty,
-            "p50_underbias": p50_under,
-            "p50_overbias": p50_over,
-            "p70_penalty": p70_penalty,
-            "p70_underbias": p70_under,
-            "p70_overbias": p70_over,
-        }
-
-    rows = []
-
-    for group_name, g in df.groupby("zero_group", dropna=False):
-        rows.append(summarize_one_group(g, group_name))
-
-    rows.append(summarize_one_group(df, "ALL"))
-
-    summary_df = pd.DataFrame(rows)
-
-    print("\nWAPE summary:")
-    display_cols = [
-        "label",
-        "zero_group",
-        "n_rows",
-        "n_asins",
-        "true_zero_rate",
-        "true_mean",
-        "p50_mean",
-        "p70_mean",
-        "p50_penalty",
-        "p70_penalty",
-        "p50_underbias",
-        "p50_overbias",
-        "p70_underbias",
-        "p70_overbias",
-    ]
-    existing = [c for c in display_cols if c in summary_df.columns]
-    print(summary_df[existing])
-
-    return df, summary_df
-
-
-def run_scot_wape_by_sparse_group(
-    scot_df_or_path,
-    data_raw1,
-    n_asins=5000,
-    seed=42,
-    zero_thresholds=(0.4, 0.7),
-    remove_oos_dp=True,
-    oos_col=None,
-):
-    if isinstance(scot_df_or_path, str):
-        scot_df = pd.read_csv(scot_df_or_path)
-    else:
-        scot_df = scot_df_or_path.copy()
-
-    sample_asin_group_df, sample_df, asin_stats = build_sample_asin_and_sparse_groups(
-        data_raw1=data_raw1,
-        n_asins=n_asins,
-        seed=seed,
-        zero_thresholds=zero_thresholds,
-    )
-
-    eval_df = build_eval_df_for_forecast(
-        forecast_df=scot_df,
-        data_raw1=data_raw1,
-        sample_asin_group_df=sample_asin_group_df,
-        source="scot",
-        p50_col="forecast_qty_p50",
-        p70_col="forecast_qty_p70",
-    )
-
-    detail_df, summary_df = calculate_group_wape_summary(
-        eval_df,
-        remove_oos_dp=remove_oos_dp,
-        oos_col=oos_col,
-        label="SCOT",
-    )
-
-    return {
-        "sample_asin_group_df": sample_asin_group_df,
-        "sample_df": sample_df,
-        "asin_stats": asin_stats,
-        "eval_df": eval_df,
-        "detail_df": detail_df,
-        "summary_df": summary_df,
-    }
-
-
-def run_amxl_wape_by_sparse_group(
-    forecast_df,
-    data_raw1,
-    n_asins=5000,
-    seed=42,
-    zero_thresholds=(0.4, 0.7),
-    remove_oos_dp=True,
-    oos_col=None,
-):
-    sample_asin_group_df, sample_df, asin_stats = build_sample_asin_and_sparse_groups(
-        data_raw1=data_raw1,
-        n_asins=n_asins,
-        seed=seed,
-        zero_thresholds=zero_thresholds,
-    )
-
-    eval_df = build_eval_df_for_forecast(
-        forecast_df=forecast_df,
-        data_raw1=data_raw1,
-        sample_asin_group_df=sample_asin_group_df,
-        source="amxl",
-        p50_col="p50_amxl",
-        p70_col="p70_amxl",
-    )
-
-    detail_df, summary_df = calculate_group_wape_summary(
-        eval_df,
-        remove_oos_dp=remove_oos_dp,
-        oos_col=oos_col,
-        label="AMXL",
-    )
-
-    return {
-        "sample_asin_group_df": sample_asin_group_df,
-        "sample_df": sample_df,
-        "asin_stats": asin_stats,
-        "eval_df": eval_df,
-        "detail_df": detail_df,
-        "summary_df": summary_df,
-    }
-
-
-def compare_scot_amxl_by_sparse_group(
-    scot_df_or_path,
-    forecast_df,
-    data_raw1,
-    n_asins=5000,
-    seed=42,
-    zero_thresholds=(0.4, 0.7),
-    remove_oos_dp=True,
-    oos_col=None,
-):
-    if isinstance(scot_df_or_path, str):
-        scot_df = pd.read_csv(scot_df_or_path)
-    else:
-        scot_df = scot_df_or_path.copy()
-
-    sample_asin_group_df, sample_df, asin_stats = build_sample_asin_and_sparse_groups(
-        data_raw1=data_raw1,
-        n_asins=n_asins,
-        seed=seed,
-        zero_thresholds=zero_thresholds,
-    )
-
-    scot_eval_df = build_eval_df_for_forecast(
-        forecast_df=scot_df,
-        data_raw1=data_raw1,
-        sample_asin_group_df=sample_asin_group_df,
-        source="scot",
-        p50_col="forecast_qty_p50",
-        p70_col="forecast_qty_p70",
-    )
-
-    scot_detail_df, scot_summary_df = calculate_group_wape_summary(
-        scot_eval_df,
-        remove_oos_dp=remove_oos_dp,
-        oos_col=oos_col,
-        label="SCOT",
-    )
-
-    amxl_eval_df = build_eval_df_for_forecast(
-        forecast_df=forecast_df,
-        data_raw1=data_raw1,
-        sample_asin_group_df=sample_asin_group_df,
-        source="amxl",
-        p50_col="p50_amxl",
-        p70_col="p70_amxl",
-    )
-
-    amxl_detail_df, amxl_summary_df = calculate_group_wape_summary(
-        amxl_eval_df,
-        remove_oos_dp=remove_oos_dp,
-        oos_col=oos_col,
-        label="AMXL",
-    )
-
-    combined_summary = pd.concat(
-        [scot_summary_df, amxl_summary_df],
-        ignore_index=True
-    )
-
-    metric_cols = [
-        "p50_penalty",
-        "p70_penalty",
-        "p50_underbias",
-        "p50_overbias",
-        "p70_underbias",
-        "p70_overbias",
-        "true_zero_rate",
-        "true_mean",
-        "p50_mean",
-        "p70_mean",
-    ]
-
-    pivot_summary = combined_summary.pivot_table(
-        index="zero_group",
-        columns="label",
-        values=[c for c in metric_cols if c in combined_summary.columns],
-        aggfunc="first"
+    # Keep p70 >= p50 just in case
+    forecast_df_scot_real["p70_scot"] = np.maximum(
+        forecast_df_scot_real["p70_scot"],
+        forecast_df_scot_real["p50_scot"]
     )
 
     print("\n" + "=" * 80)
-    print("COMBINED SCOT VS AMXL SUMMARY")
+    print("FORECAST MEAN CHECK")
     print("=" * 80)
-    print(combined_summary)
 
-    print("\nPivot summary:")
-    print(pivot_summary)
+    mean_check = pd.DataFrame([{
+        "n_rows": len(forecast_df_scot_real),
+        "n_asins": forecast_df_scot_real["asin"].nunique(),
+        "true_mean": forecast_df_scot_real["fbi_demand"].mean(),
+        "amxl_p50_mean": forecast_df_scot_real["p50_amxl"].mean(),
+        "amxl_p70_mean": forecast_df_scot_real["p70_amxl"].mean(),
+        "real_scot_p50_mean": forecast_df_scot_real["p50_scot"].mean(),
+        "real_scot_p70_mean": forecast_df_scot_real["p70_scot"].mean(),
+        "true_zero_rate": (forecast_df_scot_real["fbi_demand"] == 0).mean(),
+        "true_active_ratio": (forecast_df_scot_real["fbi_demand"] > 0).mean(),
+    }])
+
+    print(mean_check.T)
+
+    # -----------------------------
+    # 5. Run WAPE logic
+    # -----------------------------
+    wape_df = calculate_wape_using_lp_oos2(
+        forecast_df_scot_real,
+        [0.5, 0.7],
+        remove_oos_dp=remove_oos_dp,
+        source=source,
+    )
+
+    cols_p50 = [
+        "p50_amxl_penalty",
+        "p50_scot_penalty",
+        "p50_amxl_overbias",
+        "p50_scot_overbias",
+        "p50_amxl_underbias",
+        "p50_scot_underbias",
+        "fbi_demand",
+    ]
+
+    cols_p70 = [
+        "p70_amxl_penalty",
+        "p70_scot_penalty",
+        "p70_amxl_overbias",
+        "p70_scot_overbias",
+        "p70_amxl_underbias",
+        "p70_scot_underbias",
+        "fbi_demand",
+    ]
+
+    p50_wape, p50_penalty_diff = quick_error_check(wape_df, cols_p50)
+    p70_wape, p70_penalty_diff = quick_error_check(wape_df, cols_p70)
+
+    print("\n" + "=" * 80)
+    print("FINAL HIGH-SPARSE WAPE WITH REAL SCOT")
+    print("=" * 80)
+
+    print("\nP50 WAPE:")
+    print(p50_wape)
+    print("P50 penalty diff AMXL - SCOT:", p50_penalty_diff)
+
+    print("\nP70 WAPE:")
+    print(p70_wape)
+    print("P70 penalty diff AMXL - SCOT:", p70_penalty_diff)
 
     return {
-        "sample_asin_group_df": sample_asin_group_df,
-        "sample_df": sample_df,
-        "asin_stats": asin_stats,
-        "scot_eval_df": scot_eval_df,
-        "scot_detail_df": scot_detail_df,
-        "scot_summary_df": scot_summary_df,
-        "amxl_eval_df": amxl_eval_df,
-        "amxl_detail_df": amxl_detail_df,
-        "amxl_summary_df": amxl_summary_df,
-        "combined_summary": combined_summary,
-        "pivot_summary": pivot_summary,
+        "forecast_df_scot_real": forecast_df_scot_real,
+        "wape_df": wape_df,
+        "mean_check": mean_check,
+        "p50_wape": p50_wape,
+        "p70_wape": p70_wape,
+        "p50_penalty_diff": p50_penalty_diff,
+        "p70_penalty_diff": p70_penalty_diff,
     }
-
-
-"""
-Example 1: SCOT only
-
-scot_outputs = run_scot_wape_by_sparse_group(
-    scot_df_or_path="scotforecast_2025-12-07_2026-04-19.csv",
-    data_raw1=data_raw1,
-    n_asins=5000,
-    seed=42,
-    zero_thresholds=(0.4, 0.7),
+##
+scot_real_outputs = run_high_sparse_scot_alignment_wape(
+    result=result,
+    scot_df=scot_df,
     remove_oos_dp=True,
+    source="lp",
 )
 
-scot_summary_df = scot_outputs["summary_df"]
-print(scot_summary_df)
-
-
-Example 2: AMXL only
-
-amxl_outputs = run_amxl_wape_by_sparse_group(
-    forecast_df=forecast_df,
-    data_raw1=data_raw1,
-    n_asins=5000,
-    seed=42,
-    zero_thresholds=(0.4, 0.7),
-    remove_oos_dp=True,
-)
-
-amxl_summary_df = amxl_outputs["summary_df"]
-print(amxl_summary_df)
-
-
-Example 3: SCOT vs AMXL together
-
-comparison_outputs = compare_scot_amxl_by_sparse_group(
-    scot_df_or_path="scotforecast_2025-12-07_2026-04-19.csv",
-    forecast_df=forecast_df,
-    data_raw1=data_raw1,
-    n_asins=5000,
-    seed=42,
-    zero_thresholds=(0.4, 0.7),
-    remove_oos_dp=True,
-)
-
-combined_summary = comparison_outputs["combined_summary"]
-pivot_summary = comparison_outputs["pivot_summary"]
-
-print(combined_summary)
-print(pivot_summary)
-"""
+forecast_df_scot_real = scot_real_outputs["forecast_df_scot_real"]
+wape_df_real_scot = scot_real_outputs["wape_df"]
+p50_wape_real_scot = scot_real_outputs["p50_wape"]
+p70_wape_real_scot = scot_real_outputs["p70_wape"]
