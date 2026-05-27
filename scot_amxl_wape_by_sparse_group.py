@@ -1,3 +1,65 @@
+
+def summarize_asin_demand_from_data_raw1(data_raw1, asin_list, label="ASIN set"):
+    """
+    Summarize average demand for a given ASIN list using data_raw1.
+    """
+    if data_raw1 is None:
+        print(f"{label}: data_raw1 is None, skip demand summary.")
+        return pd.DataFrame()
+
+    df = data_raw1.copy()
+    df.columns = [c.strip() for c in df.columns]
+
+    if "asin" not in df.columns or "fbi_demand" not in df.columns:
+        print(f"{label}: data_raw1 needs asin and fbi_demand columns.")
+        return pd.DataFrame()
+
+    df["asin"] = df["asin"].astype(str)
+    df["fbi_demand"] = pd.to_numeric(
+        df["fbi_demand"],
+        errors="coerce"
+    ).fillna(0).clip(lower=0)
+
+    asin_df = pd.DataFrame({
+        "asin": pd.Series(list(asin_list)).astype(str).unique()
+    })
+
+    sub = df.merge(asin_df, on="asin", how="inner")
+
+    if len(sub) == 0:
+        print(f"{label}: no matching ASINs found in data_raw1.")
+        return pd.DataFrame()
+
+    asin_level = (
+        sub.groupby("asin", as_index=False)
+        .agg(
+            n_weeks=("fbi_demand", "count"),
+            total_demand=("fbi_demand", "sum"),
+            avg_demand_per_week=("fbi_demand", "mean"),
+            zero_rate=("fbi_demand", lambda x: (x == 0).mean()),
+        )
+    )
+
+    summary = pd.DataFrame([{
+        "label": label,
+        "n_asins": asin_level["asin"].nunique(),
+        "n_rows": len(sub),
+        "avg_demand_per_row": sub["fbi_demand"].mean(),
+        "total_demand": sub["fbi_demand"].sum(),
+        "avg_total_demand_per_asin": asin_level["total_demand"].mean(),
+        "avg_weekly_demand_per_asin": asin_level["avg_demand_per_week"].mean(),
+        "median_weekly_demand_per_asin": asin_level["avg_demand_per_week"].median(),
+        "avg_zero_rate": asin_level["zero_rate"].mean(),
+    }])
+
+    print("\n" + "=" * 80)
+    print(f"DATA_RAW1 DEMAND SUMMARY: {label}")
+    print("=" * 80)
+    print(summary.T)
+
+    return summary
+
+
 import pandas as pd
 import numpy as np
 
@@ -5,6 +67,7 @@ import numpy as np
 def run_high_sparse_scot_alignment_wape(
     result,
     scot_df,
+    data_raw1=None,
     remove_oos_dp=True,
     source="lp",
 ):
@@ -139,6 +202,28 @@ def run_high_sparse_scot_alignment_wape(
     print("Row match rate:", row_match_rate)
     print("ASIN match rate:", asin_match_rate)
 
+    nb_high_asins = forecast_df["asin"].drop_duplicates()
+    matched_asins = forecast_df_scot_real["asin"].drop_duplicates()
+
+    print("\n" + "=" * 80)
+    print("ASIN SELECTION CHECK")
+    print("=" * 80)
+    print("Selected high-sparse NB ASINs:", nb_high_asins.nunique())
+    print("Matched high-sparse ASINs with SCOT:", matched_asins.nunique())
+    print("Missing ASINs after SCOT merge:", nb_high_asins.nunique() - matched_asins.nunique())
+
+    nb_asin_demand_summary = summarize_asin_demand_from_data_raw1(
+        data_raw1=data_raw1,
+        asin_list=nb_high_asins,
+        label="selected high-sparse NB ASINs"
+    )
+
+    matched_asin_demand_summary = summarize_asin_demand_from_data_raw1(
+        data_raw1=data_raw1,
+        asin_list=matched_asins,
+        label="SCOT-matched high-sparse ASINs"
+    )
+
     if row_match_rate < 0.8:
         print("\nWARNING: SCOT matched less than 80% of NB forecast rows.")
         print("Check whether SCOT file has the same forecast window.")
@@ -222,6 +307,8 @@ def run_high_sparse_scot_alignment_wape(
         "forecast_df_scot_real": forecast_df_scot_real,
         "wape_df": wape_df,
         "mean_check": mean_check,
+        "nb_asin_demand_summary": nb_asin_demand_summary,
+        "matched_asin_demand_summary": matched_asin_demand_summary,
         "p50_wape": p50_wape,
         "p70_wape": p70_wape,
         "p50_penalty_diff": p50_penalty_diff,
@@ -231,6 +318,7 @@ def run_high_sparse_scot_alignment_wape(
 scot_real_outputs = run_high_sparse_scot_alignment_wape(
     result=result,
     scot_df=scot_df,
+    data_raw1=data_raw1,
     remove_oos_dp=True,
     source="lp",
 )
