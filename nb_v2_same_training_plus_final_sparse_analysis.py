@@ -1270,6 +1270,10 @@ def summarize_wape_by_sparse_group(wape_df, joined_df_with_group):
 
     work = work.merge(group_map, on=["asin", "order_week"], how="left")
 
+    total_demand_all = work["fbi_demand"].sum()
+    total_rows_all = len(work)
+    total_asins_all = work["asin"].nunique()
+
     rows = []
 
     for group_name, g in work.groupby("zero_group", dropna=False):
@@ -1308,7 +1312,33 @@ def summarize_wape_by_sparse_group(wape_df, joined_df_with_group):
     print("\n" + "=" * 80)
     print("SPARSE-GROUP WAPE DIAGNOSTICS")
     print("=" * 80)
-    print(out)
+
+    display_cols = [
+        "zero_group",
+        "n_asins",
+        "n_rows",
+        "total_fbi_demand",
+        "demand_share",
+        "avg_total_demand_per_asin",
+        "true_mean",
+        "true_zero_rate",
+        "p50_amxl_penalty",
+        "p50_scot_penalty",
+        "p50_bps_improvement",
+        "p70_amxl_penalty",
+        "p70_scot_penalty",
+        "p70_bps_improvement",
+        "p50_amxl_underbias",
+        "p50_scot_underbias",
+        "p50_amxl_overbias",
+        "p50_scot_overbias",
+        "p70_amxl_underbias",
+        "p70_scot_underbias",
+        "p70_amxl_overbias",
+        "p70_scot_overbias",
+    ]
+    display_cols = [c for c in display_cols if c in out.columns]
+    print(out[display_cols])
 
     return out
 
