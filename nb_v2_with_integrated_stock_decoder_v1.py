@@ -11,6 +11,7 @@ This version runs on the high-sparse group and includes:
 - final WAPE summary
 - history uses raw in_stock_dph; future context excludes in_stock_dph
 - future context includes distance-to-holiday scalar features
+- stock decoder uses extra product/popularity/promo/package features
 - total amount diagnostics: sum(fbi_demand * raw our_price)
 - total size diagnostics: sum(fbi_demand * pkg_height * pkg_length * pkg_width)
 """
@@ -158,6 +159,134 @@ def _infer_pkg_dimension_cols(df):
     return out
 
 
+
+def _select_stock_decoder_extra_cols(data_raw):
+    """
+    Select additional features to help the stock decoder predict future in_stock_dph_hat.
+
+    These are NOT true future in_stock_dph. They are product / popularity / price / promo
+    / package features that can help predict future exposure.
+
+    We keep a conservative list to avoid leakage-prone realized future outcomes.
+    """
+    candidate_cols = [
+        # Product/category/static identity proxies
+        "gl_product_group",
+        "category_code",
+        "brand_class",
+        "sort_type",
+        "variation",
+        "ind_new_asin",
+        "ind_amxl_hb",
+        "hbt",
+        "ind_target_audience",
+        "ind_top10_brand",
+        "ind_top10_review_brand",
+
+        # Review / popularity / traffic proxies
+        "cust_avg_active_review_rating",
+        "customer_active_review_count",
+        "customer_average_review_rating",
+        "customer_review_count",
+        "glance_view_band_cat",
+        "total_dph",
+        "buy_box_dph",
+        "hb_rank",
+        "hb_score",
+        "facebook_fan_count",
+        "instagram_fan_count",
+        "twitter_follower_count",
+        "youtube_subscriber_count",
+
+        # Price / promotion
+        "list_price",
+        "price_bands",
+        "ind_promotion",
+        "promotion_amount",
+        "promotion_ratio",
+        "promotion_pricing_amount",
+        "promotion_type",
+        "pricing_type",
+        "asin_promo_start_week",
+        "asin_promo_end_week",
+        "asin_promo_wordcount",
+
+        # Package / AMXL size
+        "pkg_height",
+        "pkg_length",
+        "pkg_width",
+        "pkg_weight",
+
+        # Calendar-ish columns
+        "order_month",
+        "order_year",
+        "week_index",
+        "ind_prime_week",
+    ]
+
+    # Avoid realized target / future outcome columns.
+    exclude_cols = {
+        "fbi_demand",
+        "order_units",
+        "scot_oos",
+        "in_stock_dph",
+        "asin",
+        "order_week",
+    }
+
+    cols = [
+        c for c in candidate_cols
+        if c in data_raw.columns and c not in exclude_cols
+    ]
+
+    return cols
+
+
+def _encode_stock_decoder_extra_features(df, extra_cols):
+    """
+    Convert extra stock-decoder features to numeric features.
+
+    Object/categorical columns are ordinal-encoded by pandas.factorize.
+    This keeps the implementation lightweight and avoids requiring sklearn encoders.
+    """
+    out_cols = []
+
+    for c in extra_cols:
+        new_c = f"stock_extra__{c}"
+
+        if c not in df.columns:
+            continue
+
+        if pd.api.types.is_numeric_dtype(df[c]):
+            val = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
+
+            # Conservative transforms by feature type.
+            cl = c.lower()
+            if (
+                "count" in cl or "dph" in cl or "price" in cl
+                or "amount" in cl or "rank" in cl or "score" in cl
+                or "height" in cl or "length" in cl or "width" in cl
+                or "weight" in cl or "wordcount" in cl
+            ):
+                val = np.log1p(val.clip(lower=0))
+
+            # Scale robustly to avoid huge values.
+            std = float(val.std()) if float(val.std()) > 1e-8 else 1.0
+            mean = float(val.mean())
+            df[new_c] = ((val - mean) / std).clip(-5, 5)
+
+        else:
+            codes, uniques = pd.factorize(df[c].astype(str).fillna("MISSING"))
+            # normalize category code to roughly [0,1]
+            denom = max(len(uniques) - 1, 1)
+            df[new_c] = codes.astype(float) / denom
+
+        out_cols.append(new_c)
+
+    return df, out_cols
+
+
+
 def _safe_numeric(df, col, default=0.0):
     if col not in df.columns:
         df[col] = default
@@ -257,6 +386,7 @@ def load_real_data(data_raw):
     """
     holiday_cols = [c for c in data_raw.columns if c.startswith("holiday_indicator_")]
     distance_cols = [c for c in data_raw.columns if c.startswith("distance_")]
+    stock_extra_raw_cols = _select_stock_decoder_extra_cols(data_raw)
     pkg_cols = _infer_pkg_dimension_cols(data_raw)
     # Future-known context features. Exclude in_stock_dph because future traffic is unknown.
     # Future-known context features. Exclude in_stock_dph because future traffic is unknown.
@@ -272,11 +402,18 @@ def load_real_data(data_raw):
     extra_diag_cols = [c for c in pkg_cols.values() if c is not None]
 
     keep_cols = [
-        c for c in base_cols + context_cols + history_only_cols + extra_diag_cols
+        c for c in base_cols + context_cols + history_only_cols + extra_diag_cols + stock_extra_raw_cols
         if c in data_raw.columns
     ]
 
     df = data_raw[keep_cols].copy()
+
+    # Encode additional product / popularity / promo / size features for stock decoder.
+    df, stock_extra_cols = _encode_stock_decoder_extra_features(df, stock_extra_raw_cols)
+
+    # Add encoded stock-extra columns to future_context.
+    # These features help the stock decoder predict future in_stock_dph_hat.
+    context_cols = context_cols + stock_extra_cols
     df = df.rename(columns={"asin":"ASIN","order_week":"Week","fbi_demand":"Demand","scot_oos":"OOS"})
 
     h_col = pkg_cols.get("height")
@@ -939,7 +1076,15 @@ def diagnose_encoder(model, va_ld):
         for b in va_ld:
             _, _, h_t = model.encoder(b["x"])
             phi = h_t.detach()
-            zm, zs = model.z_generator(phi, b["future_context"])
+
+            # Stock-decoder version:
+            # z_generator expects future_context augmented with predicted stock_hat.
+            if hasattr(model, "_augment_context_with_stock_hat"):
+                fc_for_z, _ = model._augment_context_with_stock_hat(h_t, b["future_context"])
+            else:
+                fc_for_z = b["future_context"]
+
+            zm, zs = model.z_generator(phi, fc_for_z)
             z_means.append(zm.numpy())
             z_stds.append(zs.numpy())
 
@@ -2455,3 +2600,35 @@ def diagnose_stock_decoder(result):
 # diagnose_stock_decoder(result_all_intersection)
 # joined_df = result_all_intersection["real_scot_outputs"]["forecast_df_scot_real_with_group"]
 # sparse_group_wape = result_all_intersection["real_scot_outputs"]["sparse_group_wape"]
+
+
+
+def check_stock_decoder_extra_feature_columns(data_raw1):
+    """
+    Check which additional stock-decoder features will be used.
+    """
+    cols = _select_stock_decoder_extra_cols(data_raw1)
+
+    print("\n" + "=" * 80)
+    print("STOCK DECODER EXTRA FEATURE COLUMN CHECK")
+    print("=" * 80)
+    print("count:", len(cols))
+    print(cols)
+
+    missing_interesting = [
+        c for c in [
+            "gl_product_group", "category_code", "brand_class",
+            "total_dph", "buy_box_dph", "glance_view_band_cat",
+            "hb_rank", "hb_score", "customer_review_count",
+            "customer_average_review_rating", "ind_promotion",
+            "promotion_amount", "promotion_ratio",
+            "pkg_height", "pkg_length", "pkg_width", "pkg_weight",
+        ]
+        if c not in data_raw1.columns
+    ]
+
+    print("\nMissing from recommended list:")
+    print(missing_interesting)
+
+    return cols
+
