@@ -376,12 +376,11 @@ def load_real_data(data_raw):
         future_context = group[context_cols].values.astype(np.float32)
 
         # Forecast-origin safe option B:
-        # Future in_stock_dph is unknown, so use the last observed lagged value
-        # at each forecast origin and repeat it across the full horizon.
-        # The history encoder still uses lagged in_stock_dph features.
+        # Keep the full lagged in_stock_dph sequence here.
+        # In DemandDataset, each future horizon will be overwritten by
+        # the forecast-origin last observed value.
         if "in_stock_dph" in context_cols:
             instock_ctx_idx = context_cols.index("in_stock_dph")
-            future_context[:, instock_ctx_idx] = np.nan  # filled in Dataset by forecast origin
 
         data[asin] = {
             "features": features,
@@ -444,6 +443,9 @@ class DemandDataset(Dataset):
         Option B for future in_stock_dph:
         use the last observed lagged in_stock_dph at forecast origin
         and repeat it across all future weeks.
+
+        d["future_context"] keeps the original lagged in_stock_dph sequence.
+        Only the forecast horizon slice is overwritten here.
         """
         fc = d["future_context"][start+history:start+history+horizon].copy()
 
@@ -451,8 +453,12 @@ class DemandDataset(Dataset):
         if instock_idx is not None:
             origin_idx = start + history - 1
             last_visible_instock = d["future_context"][origin_idx, instock_idx]
+
             if np.isnan(last_visible_instock):
-                last_visible_instock = 0.0
+                hist_vals = d["future_context"][start:start+history, instock_idx]
+                hist_vals = hist_vals[~np.isnan(hist_vals)]
+                last_visible_instock = hist_vals[-1] if len(hist_vals) > 0 else 0.0
+
             fc[:, instock_idx] = last_visible_instock
 
         return fc
@@ -2176,3 +2182,39 @@ def print_final_diagnostics(result):
 # sparse_group_wape = result_all_intersection["real_scot_outputs"]["sparse_group_wape"]
 # joined_df = result_all_intersection["real_scot_outputs"]["forecast_df_scot_real_with_group"]
 # print(sparse_group_wape)
+
+
+# =====================================================
+# 15. Option B in_stock_dph checker
+# =====================================================
+
+def check_option_b_instock_context(result, n_batches=1):
+    """
+    Check whether option B correctly repeats one in_stock_dph value
+    across each forecast horizon in future_context.
+    """
+    va_ld = result.get("va_ld", None)
+    if va_ld is None:
+        print("No va_ld found in result.")
+        return
+
+    checked = 0
+    for batch in va_ld:
+        fc = batch["future_context"].detach().cpu().numpy()
+
+        # context_cols = ["our_price", "in_stock_dph"] + holiday_cols
+        if fc.shape[-1] <= 1:
+            print("future_context has no in_stock_dph column.")
+            return
+
+        instock_future = fc[:, :, 1]
+
+        print("\nOption B in_stock_dph future-context check:")
+        print("first sample future in_stock_dph:", instock_future[0])
+        print("first sample unique values:", np.unique(instock_future[0]))
+        print("batch mean:", np.nanmean(instock_future))
+        print("batch std within horizon mean:", np.nanmean(np.std(instock_future, axis=1)))
+
+        checked += 1
+        if checked >= n_batches:
+            break
