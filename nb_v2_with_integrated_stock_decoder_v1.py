@@ -1780,6 +1780,7 @@ def run_nb_high_sparse_from_sample_scot_intersection(
     beta_tail=0.5,
     patience=5,
     lambda_z_reg=1.0,
+    lambda_stock=0.05,
     remove_extreme=True,
     extreme_q=0.99,
     run_wape=True,
@@ -1934,6 +1935,7 @@ def run_nb_all_sample_scot_intersection(
     beta_tail=0.5,
     patience=5,
     lambda_z_reg=1.0,
+    lambda_stock=0.05,
     remove_extreme=True,
     extreme_q=0.99,
     run_wape=True,
@@ -2029,6 +2031,7 @@ def run_nb_all_sample_scot_intersection(
         beta_tail=beta_tail,
         patience=patience,
         lambda_z_reg=lambda_z_reg,
+        lambda_stock=lambda_stock,
     )
 
     diagnose_encoder(model, va_ld)
