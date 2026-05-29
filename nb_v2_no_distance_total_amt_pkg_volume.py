@@ -9,7 +9,7 @@ This version runs on the high-sparse group and includes:
 - z regularization
 - encoder diagnostics
 - final WAPE summary
-- future in_stock_dph context uses option C1: repeat forecast-origin recent 4-week mean
+- history uses raw in_stock_dph; future context excludes in_stock_dph
 - total amount diagnostics: sum(fbi_demand * raw our_price)
 - total size diagnostics: sum(fbi_demand * pkg_height * pkg_length * pkg_width)
 """
@@ -256,7 +256,8 @@ def load_real_data(data_raw):
     """
     holiday_cols = [c for c in data_raw.columns if c.startswith("holiday_indicator_")]
     pkg_cols = _infer_pkg_dimension_cols(data_raw)
-    context_cols = ["our_price", "in_stock_dph"] + holiday_cols
+    # Future-known context features. Exclude in_stock_dph because future traffic is unknown.
+    context_cols = ["our_price"] + holiday_cols
 
     base_cols = ["asin", "order_week", "fbi_demand", "scot_oos"]
     extra_diag_cols = [c for c in pkg_cols.values() if c is not None]
@@ -286,7 +287,9 @@ def load_real_data(data_raw):
     df["our_price_raw"] = df["our_price"].clip(lower=0)
     df["our_price"] = np.log1p(df["our_price_raw"])
     df["in_stock_dph"] = df["in_stock_dph"].clip(lower=0)
-    df["in_stock_dph"] = df.groupby("ASIN")["in_stock_dph"].shift(1).fillna(0)
+    # Use historical in_stock_dph directly in the encoder; no lag shift.
+    # Future in_stock_dph is not used in future_context.
+    df["in_stock_dph"] = pd.to_numeric(df["in_stock_dph"], errors="coerce").fillna(0.0)
     for c in holiday_cols:
         df[c] = df[c].clip(lower=0, upper=1)
 
@@ -375,17 +378,10 @@ def load_real_data(data_raw):
 
         future_context = group[context_cols].values.astype(np.float32)
 
-        # Forecast-origin safe option C1:
-        # Keep the full lagged in_stock_dph sequence here.
-        # In DemandDataset, each future horizon will be overwritten by
-        # the forecast-origin recent 4-week mean.
-        if "in_stock_dph" in context_cols:
-            instock_ctx_idx = context_cols.index("in_stock_dph")
 
         data[asin] = {
             "features": features,
             "future_context": future_context,
-            "instock_context_idx": context_cols.index("in_stock_dph") if "in_stock_dph" in context_cols else None,
             "demand": demand.astype(np.float32),
             "week": weeks,
             "oos": oos.astype(np.float32),
@@ -394,8 +390,9 @@ def load_real_data(data_raw):
         }
 
     print("History encoder dim: 25 (all leak-free)")
-    print("Future in_stock_dph context: option C1, repeat forecast-origin recent 4-week mean")
     print(f"Package dimension columns for total_size: {pkg_cols}")
+    print("History in_stock_dph: raw historical value, no lag shift")
+    print("Future context excludes in_stock_dph")
     print(f"Context dim: {len(context_cols)}")
     return data, len(context_cols), context_cols
 
@@ -419,13 +416,7 @@ class DemandDataset(Dataset):
                 self.samples.append({
                     "x": torch.tensor(d["features"][start:start+history], dtype=torch.float32),
                     "future_context": torch.tensor(
-                        self._make_future_context_c1(
-                            d,
-                            start=start,
-                            history=history,
-                            horizon=horizon,
-                            mean_window=4,
-                        ),
+                        d["future_context"][start+history:start+history+horizon],
                         dtype=torch.float32),
                     "y": torch.tensor(d["demand"][start+history:start+history+horizon], dtype=torch.float32),
                     "asin": asin,
@@ -438,32 +429,6 @@ class DemandDataset(Dataset):
                         d["pkg_volume_raw"][start+history:start+history+horizon],
                         dtype=torch.float32),
                 })
-
-    def _make_future_context_c1(self, d, start, history, horizon, mean_window=4):
-        """
-        Option C1 for future in_stock_dph:
-        use the recent mean of lagged in_stock_dph before forecast origin
-        and repeat it across all future weeks.
-
-        This is forecast-origin safe because it only uses values in the history window.
-        """
-        fc = d["future_context"][start+history:start+history+horizon].copy()
-
-        instock_idx = d.get("instock_context_idx", None)
-        if instock_idx is not None:
-            hist_start = max(start, start + history - mean_window)
-            hist_end = start + history
-            hist_vals = d["future_context"][hist_start:hist_end, instock_idx]
-            hist_vals = hist_vals[~np.isnan(hist_vals)]
-
-            if len(hist_vals) > 0:
-                future_instock_proxy = float(np.mean(hist_vals))
-            else:
-                future_instock_proxy = 0.0
-
-            fc[:, instock_idx] = future_instock_proxy
-
-        return fc
 
     def __len__(self): return len(self.samples)
     def __getitem__(self, i): return self.samples[i]
@@ -2186,44 +2151,32 @@ def print_final_diagnostics(result):
 # print(sparse_group_wape)
 
 
-
-
 # =====================================================
-# 15. Option C1 in_stock_dph checker
+# 15. In-stock feature checker
 # =====================================================
 
-def check_option_c1_instock_context(result, n_batches=1):
+def check_instock_feature_setup(result):
     """
-    Check whether option C1 correctly repeats one recent-mean in_stock_dph value
-    across each forecast horizon in future_context.
+    Check the current in_stock_dph setup:
+      - history encoder uses raw historical in_stock_dph features
+      - future_context excludes in_stock_dph
     """
+    data_train = result.get("data_train", None)
     va_ld = result.get("va_ld", None)
-    if va_ld is None:
-        print("No va_ld found in result.")
-        return
 
-    checked = 0
-    for batch in va_ld:
-        fc = batch["future_context"].detach().cpu().numpy()
+    print("\n" + "=" * 80)
+    print("IN_STOCK_DPH FEATURE SETUP CHECK")
+    print("=" * 80)
+    print("History encoder: raw historical in_stock_dph, no shift")
+    print("Future context: excludes in_stock_dph")
 
-        # context_cols = ["our_price", "in_stock_dph"] + holiday_cols
-        if fc.shape[-1] <= 1:
-            print("future_context has no in_stock_dph column.")
-            return
-
-        instock_future = fc[:, :, 1]
-
-        print("\nOption C1 in_stock_dph future-context check:")
-        print("first sample future in_stock_dph:", instock_future[0])
-        print("first sample unique values:", np.unique(instock_future[0]))
-        print("batch mean:", np.nanmean(instock_future))
-        print("batch std within horizon mean:", np.nanmean(np.std(instock_future, axis=1)))
-
-        checked += 1
-        if checked >= n_batches:
+    if va_ld is not None:
+        for batch in va_ld:
+            fc = batch["future_context"]
+            print("future_context shape:", tuple(fc.shape))
             break
 
+    if data_train is not None:
+        print("data_train columns containing instock/in_stock:")
+        print([c for c in data_train.columns if "stock" in c.lower() or "instock" in c.lower()])
 
-# Option C1 check after training:
-#
-# check_option_c1_instock_context(result_all_intersection)
