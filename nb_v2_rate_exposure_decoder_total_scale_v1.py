@@ -173,6 +173,44 @@ def _get_1d_col(df, col):
     return x
 
 
+
+def _compute_total_dph_cap(df, q=0.995):
+    """
+    Compute a global cap from total_dph.
+
+    For fast experiments, this uses the current modeling dataframe.
+    For a stricter production backtest, compute this cap using training weeks only.
+    """
+    if "total_dph" not in df.columns:
+        return np.inf
+
+    s = pd.to_numeric(df["total_dph"], errors="coerce").fillna(0.0).clip(lower=0)
+
+    if len(s) == 0 or s.sum() <= 0:
+        return np.inf
+
+    cap = float(s.quantile(q))
+
+    if not np.isfinite(cap) or cap <= 0:
+        return np.inf
+
+    return cap
+
+
+def _apply_dph_cap(df, cap):
+    """
+    Apply one total_dph-based cap to total_dph, buy_box_dph, and in_stock_dph.
+    This stabilizes heavy-tailed exposure decoder targets.
+    """
+    for c in ["total_dph", "buy_box_dph", "in_stock_dph"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0).clip(lower=0)
+            if np.isfinite(cap):
+                df[c] = df[c].clip(upper=cap)
+    return df
+
+
+
 def _select_stock_decoder_extra_cols(data_raw):
     """
     Select additional features to help the stock decoder predict future in_stock_dph_hat.
@@ -367,7 +405,7 @@ def _zero_streak(active):
     return out
 
 
-def load_real_data(data_raw):
+def load_real_data(data_raw, dph_cap_q=0.995):
     """
     34 history features.
     Feature index map:
@@ -498,6 +536,11 @@ def load_real_data(data_raw):
             df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0).clip(lower=0)
         else:
             df[c] = 0.0
+
+    # Cap heavy-tailed DPH targets using total_dph as a unified exposure scale cap.
+    # This cap is applied before constructing decoder targets.
+    dph_cap = _compute_total_dph_cap(df, q=dph_cap_q)
+    df = _apply_dph_cap(df, dph_cap)
     for c in holiday_cols:
         df[c] = df[c].clip(lower=0, upper=1)
 
@@ -520,6 +563,51 @@ def load_real_data(data_raw):
         df["promo_t"] = 0.0
 
     df["t"] = ((df["Week"] - df["Week"].min()).dt.days // 7).astype(int)
+
+    # Explicit business seasonality features.
+    # These are future-known calendar features and are safe for decoder/demand context.
+    df["order_month"] = df["Week"].dt.month.astype(float)
+    df["month_sin"] = np.sin(2 * np.pi * df["order_month"] / 12.0)
+    df["month_cos"] = np.cos(2 * np.pi * df["order_month"] / 12.0)
+
+    # Business seasons:
+    # winter: Dec-Feb, spring: Mar-May, summer: Jun-Aug, fall: Sep-Nov
+    df["season_winter"] = df["order_month"].isin([12, 1, 2]).astype(float)
+    df["season_spring"] = df["order_month"].isin([3, 4, 5]).astype(float)
+    df["season_summer"] = df["order_month"].isin([6, 7, 8]).astype(float)
+    df["season_fall"] = df["order_month"].isin([9, 10, 11]).astype(float)
+
+    # Major shopping-event proximity features using distance_* columns if available.
+    # These capture ramp-up / ramp-down before discount events such as Black Friday and Prime Day.
+    major_event_distance_cols = [
+        c for c in [
+            "distance_blackfriday",
+            "distance_cybermonday",
+            "distance_primeday",
+            "distance_christmasday",
+            "distance_thanksgivingday",
+        ]
+        if c in df.columns
+    ]
+
+    for c in major_event_distance_cols:
+        # after previous scaling, distance is roughly in [-1, 1].
+        # Convert to proximity: 1 near event, 0 far away.
+        df[f"{c}_proximity"] = (1.0 - df[c].abs()).clip(lower=0.0, upper=1.0)
+
+    seasonal_extra_cols = [
+        "order_month",
+        "month_sin",
+        "month_cos",
+        "season_winter",
+        "season_spring",
+        "season_summer",
+        "season_fall",
+    ] + [f"{c}_proximity" for c in major_event_distance_cols]
+
+    # Add these explicit seasonal features to future context.
+    # They are appended after basic holiday/distance features but before DPH proxy cols.
+    context_cols = context_cols + [c for c in seasonal_extra_cols if c not in context_cols]
 
     data = {}
     for asin, group in df.groupby("ASIN"):
@@ -641,10 +729,12 @@ def load_real_data(data_raw):
     print("History in_stock_dph: raw historical value, no lag shift")
     print("Future context excludes in_stock_dph")
     print("Future context includes distance_* calendar features")
-    print("Rate exposure decoder: total_dph as safe scale; predicts buy_box_rate and in_stock_given_buybox")
+    print("Buy/In-stock decoder: total_dph used as cap/scale; predicts buy_box_dph_hat and in_stock_dph_hat")
     print("Stock decoder safe mode: excludes future true total_dph and buy_box_dph")
     print("Safe historical DPH proxies: total_dph/buy_box_dph last/mean4/mean13")
     print("History encoder includes DPH funnel features")
+    print(f"DPH cap q: {dph_cap_q} | cap value: {dph_cap}")
+    print("Explicit seasonal context: month/season/proximity to major shopping events")
     print(f"Context dim: {len(context_cols)}")
     return data, len(context_cols), context_cols
 
@@ -873,18 +963,17 @@ class Epinet(nn.Module):
 
 
 
-class RateExposureDecoder(nn.Module):
+class BuyInStockDecoder(nn.Module):
     """
-    Rate-based exposure decoder.
+    Decoder for buy-box DPH and in-stock DPH.
 
-    total_dph is not predicted directly because it is heavy-tailed.
-    Instead, historical total_dph is used as a safe scale/cap proxy.
+    total_dph is NOT predicted. It is heavy-tailed and is used as a cap / scale reference.
+    The decoder predicts:
+      1. log1p(buy_box_dph_hat)
+      2. log1p(in_stock_dph_hat)
 
-    Decoder predicts two bounded funnel rates:
-      1. buy_box_rate_hat = buy_box_dph / total_dph
-      2. in_stock_given_buybox_hat = in_stock_dph / buy_box_dph
-
-    These rates are converted into predicted DPH hats using a safe total_proxy.
+    Input includes h_t, future-known calendar/season/distance features,
+    static product context, and safe historical DPH proxies.
     """
     def __init__(self, d_model, context_dim, horizon=20, hidden=64):
         super().__init__()
@@ -910,10 +999,10 @@ class RateExposureDecoder(nn.Module):
 
         inp = torch.cat([h_rep, future_context, horizon_sin, horizon_cos], dim=-1)
 
-        # Rates are bounded in [0, 1].
-        rate_hat = torch.sigmoid(self.net(inp))
+        exposure_log_hat = self.net(inp)
+        exposure_log_hat = F.softplus(exposure_log_hat)  # log1p buy-box / in-stock hats
 
-        return rate_hat
+        return exposure_log_hat
 
 
 
@@ -930,10 +1019,8 @@ class TCN_ENN(nn.Module):
         self.encoder = TCNSparseAttnEncoder(input_dim, d_model, horizon)
 
         if use_stock_decoder:
-            self.stock_decoder = RateExposureDecoder(d_model, context_dim, horizon)
-            # Add four predicted/safe exposure features:
-            # log1p(total_proxy), buy_box_rate_hat, in_stock_given_buybox_hat, log1p(in_stock_dph_hat)
-            z_context_dim = context_dim + 4
+            self.stock_decoder = BuyInStockDecoder(d_model, context_dim, horizon)
+            z_context_dim = context_dim + 2  # add predicted log1p(buy_box_dph_hat, in_stock_dph_hat)
         else:
             self.stock_decoder = None
             z_context_dim = context_dim
@@ -943,57 +1030,23 @@ class TCN_ENN(nn.Module):
 
     def _augment_context_with_stock_hat(self, h_t, future_context):
         """
-        Predict funnel rates and append reconstructed safe exposure features.
+        Predict buy-box and in-stock DPH hats and append them to future_context.
 
-        The last 6 columns of future_context are historical DPH proxies:
-            hist_total_dph_last_log
-            hist_total_dph_mean4_log
-            hist_total_dph_mean13_log
-            hist_buy_box_dph_last_log
-            hist_buy_box_dph_mean4_log
-            hist_buy_box_dph_mean13_log
+        Demand head sees only predicted hats:
+            buy_box_dph_hat, in_stock_dph_hat
 
-        We use hist_total_dph_mean13_log as a stable total_proxy.
+        It never sees true future DPH values.
+        total_dph is not predicted; it is only used in preprocessing as a cap/scale reference.
         """
         if not self.use_stock_decoder:
             return future_context, None
 
-        rate_hat = self.stock_decoder(h_t, future_context)  # [B, H, 2]
-
-        buy_box_rate_hat = rate_hat[..., 0].clamp(0.0, 1.0)
-        instock_given_buybox_hat = rate_hat[..., 1].clamp(0.0, 1.0)
-
-        # Use safe historical total DPH proxy as scale.
-        # In this code, dph_proxy_cols are appended at the end of context_cols.
-        hist_total_mean13_log = future_context[..., -4]
-        total_proxy = torch.expm1(hist_total_mean13_log).clamp(min=0.0)
-
-        buy_box_hat = total_proxy * buy_box_rate_hat
-        instock_hat = buy_box_hat * instock_given_buybox_hat
-
-        exposure_features = torch.stack([
-            torch.log1p(total_proxy),
-            buy_box_rate_hat,
-            instock_given_buybox_hat,
-            torch.log1p(instock_hat),
-        ], dim=-1)
-
+        exposure_log_hat = self.stock_decoder(h_t, future_context)  # [B, H, 2]
         future_context_aug = torch.cat(
-            [future_context, exposure_features],
+            [future_context, exposure_log_hat],
             dim=-1,
         )
-
-        # Return compact tensor for loss/diagnostics:
-        # [buy_box_rate_hat, instock_given_buybox_hat, total_proxy, buy_box_hat, instock_hat]
-        exposure_hat = torch.stack([
-            buy_box_rate_hat,
-            instock_given_buybox_hat,
-            total_proxy,
-            buy_box_hat,
-            instock_hat,
-        ], dim=-1)
-
-        return future_context_aug, exposure_hat
+        return future_context_aug, exposure_log_hat
 
     def forward(self, x, future_context, nZ=8):
         mu_base, alpha_base, h_t = self.encoder(x)
@@ -1076,67 +1129,45 @@ def pinball(y, pred, q):
 
 
 
-def stock_decoder_loss(exposure_hat, future_instock_true,
+def stock_decoder_loss(exposure_log_hat, future_instock_true,
                        future_total_dph_true=None,
                        future_buy_box_dph_true=None,
-                       mean_weight=0.10):
+                       mean_weight=0.30):
     """
-    Rate-based exposure decoder loss.
+    Buy-box / in-stock decoder loss.
 
-    exposure_hat[..., 0] = buy_box_rate_hat
-    exposure_hat[..., 1] = in_stock_given_buybox_hat
-    exposure_hat[..., 2] = total_proxy
-    exposure_hat[..., 3] = buy_box_dph_hat
-    exposure_hat[..., 4] = in_stock_dph_hat
+    exposure_log_hat[..., 0] = log1p(buy_box_dph_hat)
+    exposure_log_hat[..., 1] = log1p(in_stock_dph_hat)
 
-    True future DPH values are used only as auxiliary supervision.
-    Demand prediction uses predicted/reconstructed features only.
+    total_dph is not predicted. It is used only as a cap / scale reference in preprocessing.
+    True future buy-box and in-stock DPH are used only as auxiliary supervision.
+    Demand prediction uses predicted hats only.
     """
-    if exposure_hat is None:
+    if exposure_log_hat is None:
         return torch.tensor(0.0, device=future_instock_true.device)
-
-    if future_total_dph_true is None:
-        future_total_dph_true = torch.zeros_like(future_instock_true)
 
     if future_buy_box_dph_true is None:
         future_buy_box_dph_true = torch.zeros_like(future_instock_true)
 
-    total_true = future_total_dph_true.clamp(min=0.0)
-    buy_true = future_buy_box_dph_true.clamp(min=0.0)
-    instock_true = future_instock_true.clamp(min=0.0)
+    true_stack = torch.stack([
+        future_buy_box_dph_true.clamp(min=0.0),
+        future_instock_true.clamp(min=0.0),
+    ], dim=-1)
 
-    buy_rate_true = (buy_true / (total_true + 1.0)).clamp(0.0, 1.0)
-    instock_given_buybox_true = (instock_true / (buy_true + 1.0)).clamp(0.0, 1.0)
+    target_log = torch.log1p(true_stack)
 
-    buy_rate_hat = exposure_hat[..., 0].clamp(1e-6, 1.0 - 1e-6)
-    instock_given_buybox_hat = exposure_hat[..., 1].clamp(1e-6, 1.0 - 1e-6)
-    buy_hat = exposure_hat[..., 3].clamp(min=0.0)
-    instock_hat = exposure_hat[..., 4].clamp(min=0.0)
+    point_loss = F.huber_loss(exposure_log_hat, target_log, delta=1.0)
 
-    # Rate loss: direct supervision on funnel rates.
-    rate_loss = (
-        F.huber_loss(buy_rate_hat, buy_rate_true, delta=0.10)
-        + F.huber_loss(instock_given_buybox_hat, instock_given_buybox_true, delta=0.10)
-    )
+    pred_level = torch.expm1(exposure_log_hat).clamp(min=0.0)
+    true_level = true_stack
 
-    # Level loss: reconstructed DPH hats should be close in log scale.
-    level_loss = (
-        F.huber_loss(torch.log1p(buy_hat), torch.log1p(buy_true), delta=1.0)
-        + F.huber_loss(torch.log1p(instock_hat), torch.log1p(instock_true), delta=1.0)
-    )
+    # Mean calibration in log scale, for buy-box and in-stock only.
+    mean_pred = torch.log1p(pred_level.mean(dim=(0, 1)))
+    mean_true = torch.log1p(true_level.mean(dim=(0, 1)))
 
-    # Mean calibration on reconstructed buy_box and in_stock DPH.
-    mean_pred = torch.stack([
-        torch.log1p(buy_hat.mean()),
-        torch.log1p(instock_hat.mean()),
-    ])
-    mean_true = torch.stack([
-        torch.log1p(buy_true.mean()),
-        torch.log1p(instock_true.mean()),
-    ])
     mean_loss = torch.mean(torch.abs(mean_pred - mean_true))
 
-    return rate_loss + level_loss + mean_weight * mean_loss
+    return point_loss + mean_weight * mean_loss
 
 
 
@@ -1370,7 +1401,8 @@ def train(
     beta_tail=0.5,
     patience=5,        # early stop
     lambda_z_reg=1.0,  # z regularization
-    lambda_stock=0.05, # auxiliary stock decoder loss weight
+    lambda_stock=0.05, # auxiliary exposure decoder loss weight
+    lambda_stock_mean_weight=0.30, # mean calibration inside exposure decoder loss
 ):
     opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
     sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
@@ -1407,6 +1439,7 @@ def train(
                     b["future_instock"],
                     b.get("future_total_dph", None),
                     b.get("future_buy_box_dph", None),
+                    mean_weight=lambda_stock_mean_weight,
                 )
             else:
                 s_loss = torch.tensor(0.0, device=y.device)
@@ -1512,15 +1545,14 @@ def generate_forecast_df(model, va_ld, M=50):
                         "true_future_instock": b["future_instock"][i,h].item()
                             if "future_instock" in b else np.nan,
 
-                        "pred_total_proxy": stock_log_hat[i,h,2].item()
+                        "pred_buy_box_dph_hat": torch.expm1(stock_log_hat[i,h,0]).item()
                             if stock_log_hat is not None else np.nan,
-                        "pred_buy_box_rate_hat": stock_log_hat[i,h,0].item()
+                        "pred_instock_dph_hat": torch.expm1(stock_log_hat[i,h,1]).item()
                             if stock_log_hat is not None else np.nan,
-                        "pred_instock_given_buybox_hat": stock_log_hat[i,h,1].item()
+
+                        "pred_buy_box_dph_log_hat": stock_log_hat[i,h,0].item()
                             if stock_log_hat is not None else np.nan,
-                        "pred_buy_box_dph_hat": stock_log_hat[i,h,3].item()
-                            if stock_log_hat is not None else np.nan,
-                        "pred_instock_dph_hat": stock_log_hat[i,h,4].item()
+                        "pred_instock_log_hat": stock_log_hat[i,h,1].item()
                             if stock_log_hat is not None else np.nan,
                         "scot_oos": b["oos"][i,h].item(),
                         "oos": b["oos"][i,h].item(),
@@ -1636,6 +1668,8 @@ def run_nb_high_sparse(
     patience=5,
     lambda_z_reg=1.0,
     lambda_stock=0.05,
+    lambda_stock_mean_weight=0.30,
+    dph_cap_q=0.995,
     remove_extreme=True,
     extreme_q=0.99,
 ):
@@ -1651,7 +1685,7 @@ def run_nb_high_sparse(
     if remove_extreme:
         data_high, _, _ = filter_extreme_asins(data_high, q=extreme_q)
 
-    data, context_dim, context_cols = load_real_data(data_high)
+    data, context_dim, context_cols = load_real_data(data_high, dph_cap_q=dph_cap_q)
     all_demand = np.concatenate([d["demand"] for d in data.values()])
     print(f"ASINs: {len(data)} | Zero rate: {(all_demand==0).mean():.1%}")
 
@@ -1669,7 +1703,7 @@ def run_nb_high_sparse(
     train(model, tr_ld, va_ld,
           epochs=epochs, nZ=8, lr=1e-3,
           lambda_q=lambda_q, beta_tail=beta_tail,
-          patience=patience, lambda_z_reg=lambda_z_reg, lambda_stock=lambda_stock)
+          patience=patience, lambda_z_reg=lambda_z_reg, lambda_stock=lambda_stock, lambda_stock_mean_weight=lambda_stock_mean_weight)
 
     # Encoder diagnostics.
     diagnose_encoder(model, va_ld)
@@ -1792,6 +1826,8 @@ def run_nb_high_sparse_with_wape(
     patience=5,
     lambda_z_reg=1.0,
     lambda_stock=0.05,
+    lambda_stock_mean_weight=0.30,
+    dph_cap_q=0.995,
     remove_extreme=True,
     extreme_q=0.99,
     remove_oos_dp=True,
@@ -2177,6 +2213,8 @@ def run_nb_high_sparse_from_sample_scot_intersection(
     patience=5,
     lambda_z_reg=1.0,
     lambda_stock=0.05,
+    lambda_stock_mean_weight=0.30,
+    dph_cap_q=0.995,
     remove_extreme=True,
     extreme_q=0.99,
     run_wape=True,
@@ -2216,7 +2254,7 @@ def run_nb_high_sparse_from_sample_scot_intersection(
         removed_extreme = pd.DataFrame()
         extreme_cap = np.nan
 
-    data, context_dim, context_cols = load_real_data(data_high)
+    data, context_dim, context_cols = load_real_data(data_high, dph_cap_q=dph_cap_q)
 
     all_demand = np.concatenate([d["demand"] for d in data.values()])
     print(f"ASINs used for training: {len(data)}")
@@ -2255,6 +2293,7 @@ def run_nb_high_sparse_from_sample_scot_intersection(
         patience=patience,
         lambda_z_reg=lambda_z_reg,
         lambda_stock=lambda_stock,
+        lambda_stock_mean_weight=lambda_stock_mean_weight,
     )
 
     diagnose_encoder(model, va_ld)
@@ -2332,6 +2371,8 @@ def run_nb_all_sample_scot_intersection(
     patience=5,
     lambda_z_reg=1.0,
     lambda_stock=0.05,
+    lambda_stock_mean_weight=0.30,
+    dph_cap_q=0.995,
     remove_extreme=True,
     extreme_q=0.99,
     run_wape=True,
@@ -2428,6 +2469,7 @@ def run_nb_all_sample_scot_intersection(
         patience=patience,
         lambda_z_reg=lambda_z_reg,
         lambda_stock=lambda_stock,
+        lambda_stock_mean_weight=lambda_stock_mean_weight,
     )
 
     diagnose_encoder(model, va_ld)
@@ -2762,7 +2804,13 @@ def check_context_feature_columns(data_raw1):
 
 def diagnose_stock_decoder(result):
     """
-    Diagnose rate-based exposure decoder.
+    Diagnose buy-box / in-stock decoder.
+
+    Reports:
+      1. Overall quality
+      2. Horizon-level quality
+      3. Season-level quality
+      4. Major-event proximity quality
     """
     forecast_df = result.get("forecast_df", None)
     if forecast_df is None:
@@ -2770,76 +2818,131 @@ def diagnose_stock_decoder(result):
         return {}
 
     df = forecast_df.copy()
-    df["true_buy_box_rate"] = (
-        pd.to_numeric(df["true_future_buy_box_dph"], errors="coerce").fillna(0).clip(lower=0)
-        / (pd.to_numeric(df["true_future_total_dph"], errors="coerce").fillna(0).clip(lower=0) + 1.0)
-    ).clip(0, 1)
-    df["true_instock_given_buybox"] = (
-        pd.to_numeric(df["true_future_instock"], errors="coerce").fillna(0).clip(lower=0)
-        / (pd.to_numeric(df["true_future_buy_box_dph"], errors="coerce").fillna(0).clip(lower=0) + 1.0)
-    ).clip(0, 1)
+    df["order_week"] = pd.to_datetime(df["order_week"])
+    df["month"] = df["order_week"].dt.month
+
+    def _season(m):
+        if m in [12, 1, 2]:
+            return "winter"
+        if m in [3, 4, 5]:
+            return "spring"
+        if m in [6, 7, 8]:
+            return "summer"
+        return "fall"
+
+    df["season"] = df["month"].apply(_season)
+
+    # Shopping-event window using calendar month/week approximation.
+    # This is a diagnostic label, not a model feature.
+    df["event_window"] = "regular"
+    if "order_week" in df.columns:
+        # Nov / Dec roughly captures Black Friday, Cyber Monday, Christmas window.
+        df.loc[df["month"].isin([11, 12]), "event_window"] = "holiday_shopping"
+        # July-ish / October-ish can capture many Prime Day windows depending on year.
+        df.loc[df["month"].isin([7, 10]), "event_window"] = "prime_like_window"
 
     pairs = [
         ("buy_box_dph", "true_future_buy_box_dph", "pred_buy_box_dph_hat"),
         ("in_stock_dph", "true_future_instock", "pred_instock_dph_hat"),
-        ("buy_box_rate", "true_buy_box_rate", "pred_buy_box_rate_hat"),
-        ("in_stock_given_buybox", "true_instock_given_buybox", "pred_instock_given_buybox_hat"),
     ]
 
-    overall_rows = []
+    def _summarize(g, group_name=None, group_value=None):
+        rows = []
+        for name, true_col, pred_col in pairs:
+            if true_col not in g.columns or pred_col not in g.columns:
+                continue
+
+            y = pd.to_numeric(g[true_col], errors="coerce").fillna(0).clip(lower=0).values
+            p = pd.to_numeric(g[pred_col], errors="coerce").fillna(0).clip(lower=0).values
+
+            denom = np.abs(y).sum()
+            row = {
+                "target": name,
+                "rows": len(g),
+                "true_mean": y.mean() if len(y) else np.nan,
+                "pred_mean": p.mean() if len(p) else np.nan,
+                "pred_true_ratio": p.mean() / (y.mean() + 1e-8) if len(y) else np.nan,
+                "WAPE": np.abs(y - p).sum() / denom if denom > 0 else np.nan,
+                "log_MAE": np.mean(np.abs(np.log1p(y) - np.log1p(p))) if len(y) else np.nan,
+                "corr": np.corrcoef(y, p)[0, 1] if len(y) and np.std(y) > 0 and np.std(p) > 0 else np.nan,
+                "true_zero_rate": (y <= 0).mean() if len(y) else np.nan,
+                "pred_zero_rate": (p <= 0).mean() if len(p) else np.nan,
+            }
+            if group_name is not None:
+                row[group_name] = group_value
+            rows.append(row)
+        return rows
+
+    overall = pd.DataFrame(_summarize(df))
+
     by_horizon_rows = []
-
-    for name, true_col, pred_col in pairs:
-        if true_col not in df.columns or pred_col not in df.columns:
-            continue
-
-        y = pd.to_numeric(df[true_col], errors="coerce").fillna(0).clip(lower=0).values
-        p = pd.to_numeric(df[pred_col], errors="coerce").fillna(0).clip(lower=0).values
-
-        denom = np.abs(y).sum()
-        overall_rows.append({
-            "target": name,
-            "rows": len(df),
-            "true_mean": y.mean(),
-            "pred_mean": p.mean(),
-            "WAPE": np.abs(y - p).sum() / denom if denom > 0 else np.nan,
-            "log_MAE": np.mean(np.abs(np.log1p(y) - np.log1p(p))),
-            "corr": np.corrcoef(y, p)[0, 1] if np.std(y) > 0 and np.std(p) > 0 else np.nan,
-            "true_zero_rate": (y <= 0).mean(),
-            "pred_zero_rate": (p <= 0).mean(),
-        })
-
-        if "horizon" in df.columns:
-            for h, g in df.groupby("horizon"):
-                yh = pd.to_numeric(g[true_col], errors="coerce").fillna(0).clip(lower=0).values
-                ph = pd.to_numeric(g[pred_col], errors="coerce").fillna(0).clip(lower=0).values
-                dh = np.abs(yh).sum()
-                by_horizon_rows.append({
-                    "target": name,
-                    "horizon": h,
-                    "rows": len(g),
-                    "true_mean": yh.mean(),
-                    "pred_mean": ph.mean(),
-                    "WAPE": np.abs(yh - ph).sum() / dh if dh > 0 else np.nan,
-                    "log_MAE": np.mean(np.abs(np.log1p(yh) - np.log1p(ph))),
-                    "corr": np.corrcoef(yh, ph)[0, 1] if np.std(yh) > 0 and np.std(ph) > 0 else np.nan,
-                })
-
-    overall = pd.DataFrame(overall_rows)
+    if "horizon" in df.columns:
+        for h, g in df.groupby("horizon"):
+            by_horizon_rows.extend(_summarize(g, "horizon", h))
     by_horizon = pd.DataFrame(by_horizon_rows)
 
+    by_season_rows = []
+    for season, g in df.groupby("season"):
+        by_season_rows.extend(_summarize(g, "season", season))
+    by_season = pd.DataFrame(by_season_rows)
+
+    by_event_rows = []
+    for event_name, g in df.groupby("event_window"):
+        by_event_rows.extend(_summarize(g, "event_window", event_name))
+    by_event = pd.DataFrame(by_event_rows)
+
     print("\n" + "=" * 80)
-    print("RATE-BASED EXPOSURE DECODER DIAGNOSTIC")
+    print("BUY-BOX / IN-STOCK DECODER DIAGNOSTIC")
     print("=" * 80)
+    print("\nOverall:")
     print(overall)
 
     if len(by_horizon) > 0:
         print("\nBy horizon:")
         print(by_horizon)
 
+    print("\nBy season:")
+    print(by_season)
+
+    print("\nBy event window:")
+    print(by_event)
+
     return {
         "overall": overall,
         "by_horizon": by_horizon,
+        "by_season": by_season,
+        "by_event": by_event,
+    }
+
+
+def diagnose_seasonal_context_columns(result):
+    """
+    Check whether explicit season / month / major event proximity features are present in context_cols.
+    """
+    context_cols = result.get("context_cols", [])
+    expected = [
+        "order_month",
+        "month_sin",
+        "month_cos",
+        "season_winter",
+        "season_spring",
+        "season_summer",
+        "season_fall",
+    ]
+
+    proximity_cols = [c for c in context_cols if c.endswith("_proximity")]
+
+    print("\n" + "=" * 80)
+    print("SEASONAL CONTEXT COLUMN CHECK")
+    print("=" * 80)
+    print("Basic seasonal cols present:")
+    print({c: (c in context_cols) for c in expected})
+    print("\nMajor event proximity cols:")
+    print(proximity_cols)
+
+    return {
+        "basic": {c: (c in context_cols) for c in expected},
+        "proximity_cols": proximity_cols,
     }
 
 
@@ -2933,7 +3036,7 @@ def check_safe_historical_dph_proxy_context(result, n_batches=1):
 
 
 
-# Main usage for rate-based exposure-decoder version:
+# Main usage for buy/in-stock decoder with total cap and seasonal context:
 #
 # result_all_intersection = run_nb_all_sample_scot_intersection(
 #     data_raw1=data_raw1,
@@ -2953,7 +3056,9 @@ def check_safe_historical_dph_proxy_context(result, n_batches=1):
 #     beta_tail=0.5,
 #     patience=5,
 #     lambda_z_reg=1.0,
-#     lambda_stock=0.05,
+#     lambda_stock=0.1,
+#     lambda_stock_mean_weight=0.30,
+#     dph_cap_q=0.995,
 #     remove_extreme=True,
 #     extreme_q=0.99,
 #     run_wape=True,
@@ -2965,7 +3070,38 @@ def check_safe_historical_dph_proxy_context(result, n_batches=1):
 # forecast_df = result_all_intersection["forecast_df"]
 # print(forecast_df[[
 #     "asin", "order_week",
-#     "pred_total_proxy",
-#     "true_future_buy_box_dph", "pred_buy_box_dph_hat", "pred_buy_box_rate_hat",
-#     "true_future_instock", "pred_instock_dph_hat", "pred_instock_given_buybox_hat",
+#     "true_future_total_dph",
+#     "true_future_buy_box_dph", "pred_buy_box_dph_hat",
+#     "true_future_instock", "pred_instock_dph_hat",
 # ]].head())
+
+
+
+def diagnose_dph_cap_effect(data_raw1, q=0.995):
+    """
+    Show the cap value and how many DPH rows would be capped.
+    """
+    df = data_raw1.copy()
+    cap = _compute_total_dph_cap(df, q=q)
+
+    rows = []
+    for c in ["total_dph", "buy_box_dph", "in_stock_dph"]:
+        if c in df.columns:
+            s = pd.to_numeric(df[c], errors="coerce").fillna(0.0).clip(lower=0)
+            rows.append({
+                "col": c,
+                "cap": cap,
+                "mean_before": s.mean(),
+                "mean_after": s.clip(upper=cap).mean() if np.isfinite(cap) else s.mean(),
+                "median": s.median(),
+                "max_before": s.max(),
+                "share_capped": (s > cap).mean() if np.isfinite(cap) else 0.0,
+            })
+
+    out = pd.DataFrame(rows)
+    print("\n" + "=" * 80)
+    print("DPH CAP EFFECT")
+    print("=" * 80)
+    print(out)
+    return out
+
