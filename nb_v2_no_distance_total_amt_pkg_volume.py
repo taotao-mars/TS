@@ -260,8 +260,18 @@ def load_real_data(data_raw):
     context_cols = ["our_price"] + holiday_cols
 
     base_cols = ["asin", "order_week", "fbi_demand", "scot_oos"]
+
+    # Keep in_stock_dph for history encoder only.
+    # It is intentionally excluded from future_context.
+    history_only_cols = ["in_stock_dph"]
+
     extra_diag_cols = [c for c in pkg_cols.values() if c is not None]
-    keep_cols = [c for c in base_cols + context_cols + extra_diag_cols if c in data_raw.columns]
+
+    keep_cols = [
+        c for c in base_cols + context_cols + history_only_cols + extra_diag_cols
+        if c in data_raw.columns
+    ]
+
     df = data_raw[keep_cols].copy()
     df = df.rename(columns={"asin":"ASIN","order_week":"Week","fbi_demand":"Demand","scot_oos":"OOS"})
 
@@ -286,10 +296,14 @@ def load_real_data(data_raw):
     # Keep raw price for amount diagnostics, then use log price for model context.
     df["our_price_raw"] = df["our_price"].clip(lower=0)
     df["our_price"] = np.log1p(df["our_price_raw"])
-    df["in_stock_dph"] = df["in_stock_dph"].clip(lower=0)
+
     # Use historical in_stock_dph directly in the encoder; no lag shift.
     # Future in_stock_dph is not used in future_context.
-    df["in_stock_dph"] = pd.to_numeric(df["in_stock_dph"], errors="coerce").fillna(0.0)
+    if "in_stock_dph" in df.columns:
+        df["in_stock_dph"] = pd.to_numeric(df["in_stock_dph"], errors="coerce").fillna(0.0)
+        df["in_stock_dph"] = df["in_stock_dph"].clip(lower=0)
+    else:
+        df["in_stock_dph"] = 0.0
     for c in holiday_cols:
         df[c] = df[c].clip(lower=0, upper=1)
 
@@ -389,7 +403,7 @@ def load_real_data(data_raw):
             "pkg_volume_raw": pkg_volume_raw.astype(np.float32),
         }
 
-    print("History encoder dim: 25 (all leak-free)")
+    print("History encoder dim: 25")
     print(f"Package dimension columns for total_size: {pkg_cols}")
     print("History in_stock_dph: raw historical value, no lag shift")
     print("Future context excludes in_stock_dph")
@@ -2172,11 +2186,15 @@ def check_instock_feature_setup(result):
 
     if va_ld is not None:
         for batch in va_ld:
+            x = batch["x"]
             fc = batch["future_context"]
+            print("history x shape:", tuple(x.shape))
             print("future_context shape:", tuple(fc.shape))
+            print("history in_stock_dph feature example, first sample:")
+            print(x[0, :, 11].detach().cpu().numpy()[:10])
             break
 
     if data_train is not None:
-        print("data_train columns containing instock/in_stock:")
+        print("data_train columns containing stock/instock:")
         print([c for c in data_train.columns if "stock" in c.lower() or "instock" in c.lower()])
 
