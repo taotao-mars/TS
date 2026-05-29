@@ -10,6 +10,7 @@ This version runs on the high-sparse group and includes:
 - encoder diagnostics
 - final WAPE summary
 - history uses raw in_stock_dph; future context excludes in_stock_dph
+- future context includes distance-to-holiday scalar features
 - total amount diagnostics: sum(fbi_demand * raw our_price)
 - total size diagnostics: sum(fbi_demand * pkg_height * pkg_length * pkg_width)
 """
@@ -255,9 +256,12 @@ def load_real_data(data_raw):
       24 positive_std_13
     """
     holiday_cols = [c for c in data_raw.columns if c.startswith("holiday_indicator_")]
+    distance_cols = [c for c in data_raw.columns if c.startswith("distance_")]
     pkg_cols = _infer_pkg_dimension_cols(data_raw)
     # Future-known context features. Exclude in_stock_dph because future traffic is unknown.
-    context_cols = ["our_price"] + holiday_cols
+    # Future-known context features. Exclude in_stock_dph because future traffic is unknown.
+    # Include holiday indicators and distance-to-holiday scalar features.
+    context_cols = ["our_price"] + holiday_cols + distance_cols
 
     base_cols = ["asin", "order_week", "fbi_demand", "scot_oos"]
 
@@ -306,6 +310,12 @@ def load_real_data(data_raw):
         df["in_stock_dph"] = 0.0
     for c in holiday_cols:
         df[c] = df[c].clip(lower=0, upper=1)
+
+    # Distance-to-holiday features are future-known scalar calendar features.
+    # Keep direction if raw values are signed: negative = before holiday, positive = after holiday.
+    for c in distance_cols:
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
+        df[c] = df[c].clip(lower=-12, upper=12) / 12.0
 
     df = df.sort_values(["ASIN", "Week"]).reset_index(drop=True)
 
@@ -407,6 +417,7 @@ def load_real_data(data_raw):
     print(f"Package dimension columns for total_size: {pkg_cols}")
     print("History in_stock_dph: raw historical value, no lag shift")
     print("Future context excludes in_stock_dph")
+    print("Future context includes distance_* calendar features")
     print(f"Context dim: {len(context_cols)}")
     return data, len(context_cols), context_cols
 
@@ -2197,4 +2208,30 @@ def check_instock_feature_setup(result):
     if data_train is not None:
         print("data_train columns containing stock/instock:")
         print([c for c in data_train.columns if "stock" in c.lower() or "instock" in c.lower()])
+
+
+
+# =====================================================
+# 16. Context feature checker
+# =====================================================
+
+def check_context_feature_columns(data_raw1):
+    """
+    Print holiday indicator and distance feature columns available in data_raw1.
+    """
+    holiday_cols = [c for c in data_raw1.columns if c.startswith("holiday_indicator_")]
+    distance_cols = [c for c in data_raw1.columns if c.startswith("distance_")]
+
+    print("\n" + "=" * 80)
+    print("CONTEXT FEATURE COLUMN CHECK")
+    print("=" * 80)
+    print("holiday_indicator_* count:", len(holiday_cols))
+    print(holiday_cols)
+    print("\ndistance_* count:", len(distance_cols))
+    print(distance_cols)
+
+    return {
+        "holiday_cols": holiday_cols,
+        "distance_cols": distance_cols,
+    }
 
