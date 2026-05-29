@@ -1265,7 +1265,7 @@ def generate_forecast_df(model, va_ld, M=50):
     model.eval()
     with torch.no_grad():
         for b in va_ld:
-            p50, p70 = model.predict(b["x"], b["future_context"], M=M)
+            p50, p70, stock_log_hat = model.predict(b["x"], b["future_context"], M=M, return_stock=True)
             hist_mean = (b["x"][:,:,0].exp()-1).mean(dim=1,keepdim=True).clamp(min=0)
             hm50 = hist_mean.expand_as(b["y"])
             hm70 = hm50 * 1.25
