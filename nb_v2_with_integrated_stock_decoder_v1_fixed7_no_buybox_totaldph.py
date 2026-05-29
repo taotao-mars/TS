@@ -12,7 +12,8 @@ This version runs on the high-sparse group and includes:
 - history uses raw in_stock_dph; future context excludes in_stock_dph
 - future context includes distance-to-holiday scalar features
 - stock decoder uses extra product/popularity/promo/package features
-- stock decoder extra future context excludes total_dph and buy_box_dph
+- stock decoder extra future context excludes true future total_dph and buy_box_dph
+- safe historical total_dph/buy_box_dph proxy features are repeated across horizon
 - total amount diagnostics: sum(fbi_demand * raw our_price)
 - total size diagnostics: sum(fbi_demand * pkg_height * pkg_length * pkg_width)
 """
@@ -409,7 +410,9 @@ def load_real_data(data_raw):
 
     # Keep in_stock_dph for history encoder only.
     # It is intentionally excluded from future_context.
-    history_only_cols = ["in_stock_dph"]
+    # Keep DPH variables for history-only safe proxy features.
+    # They are not used as raw future context.
+    history_only_cols = ["in_stock_dph", "total_dph", "buy_box_dph"]
 
     extra_diag_cols = [c for c in pkg_cols.values() if c is not None]
 
@@ -430,6 +433,22 @@ def load_real_data(data_raw):
     # Add encoded stock-extra columns to future_context.
     # These features help the stock decoder predict future in_stock_dph_hat.
     context_cols = context_cols + stock_extra_cols
+
+    # Forecast-origin-safe historical DPH proxy features.
+    # These columns are placeholders here and are filled inside DemandDataset
+    # using only history up to each forecast origin.
+    dph_proxy_cols = [
+        "hist_total_dph_last_log",
+        "hist_total_dph_mean4_log",
+        "hist_total_dph_mean13_log",
+        "hist_buy_box_dph_last_log",
+        "hist_buy_box_dph_mean4_log",
+        "hist_buy_box_dph_mean13_log",
+    ]
+    for c in dph_proxy_cols:
+        df[c] = 0.0
+
+    context_cols = context_cols + dph_proxy_cols
     df = df.rename(columns={"asin":"ASIN","order_week":"Week","fbi_demand":"Demand","scot_oos":"OOS"})
 
     h_col = pkg_cols.get("height")
@@ -461,6 +480,13 @@ def load_real_data(data_raw):
         df["in_stock_dph"] = df["in_stock_dph"].clip(lower=0)
     else:
         df["in_stock_dph"] = 0.0
+
+    # Historical total_dph / buy_box_dph are used only as forecast-origin-safe summaries.
+    for c in ["total_dph", "buy_box_dph"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0).clip(lower=0)
+        else:
+            df[c] = 0.0
     for c in holiday_cols:
         df[c] = df[c].clip(lower=0, upper=1)
 
@@ -507,6 +533,8 @@ def load_real_data(data_raw):
         price_log    = group["our_price"].values.astype(float)
         price_raw    = group["our_price_raw"].values.astype(float)
         pkg_volume_raw = group["pkg_volume_raw"].values.astype(float)
+        total_dph_raw = group["total_dph"].values.astype(float)
+        buy_box_dph_raw = group["buy_box_dph"].values.astype(float)
 
         # All rolling features now exclude current step (leak-free)
         hist_nonzero_mean_52 = _rolling_positive_mean(demand, 52)
@@ -566,6 +594,11 @@ def load_real_data(data_raw):
             "price_raw": price_raw.astype(np.float32),
             "pkg_volume_raw": pkg_volume_raw.astype(np.float32),
             "instock_raw": instock_raw.astype(np.float32),
+            "total_dph_raw": total_dph_raw.astype(np.float32),
+            "buy_box_dph_raw": buy_box_dph_raw.astype(np.float32),
+            "dph_proxy_context_idx": {
+                c: context_cols.index(c) for c in dph_proxy_cols if c in context_cols
+            },
         }
 
     print("History encoder dim: 25")
@@ -574,7 +607,8 @@ def load_real_data(data_raw):
     print("Future context excludes in_stock_dph")
     print("Future context includes distance_* calendar features")
     print("Integrated stock decoder: predicts future in_stock_dph_hat")
-    print("Stock decoder safe mode: excludes total_dph and buy_box_dph")
+    print("Stock decoder safe mode: excludes future true total_dph and buy_box_dph")
+    print("Safe historical DPH proxies: total_dph/buy_box_dph last/mean4/mean13")
     print(f"Context dim: {len(context_cols)}")
     return data, len(context_cols), context_cols
 
@@ -598,7 +632,12 @@ class DemandDataset(Dataset):
                 self.samples.append({
                     "x": torch.tensor(d["features"][start:start+history], dtype=torch.float32),
                     "future_context": torch.tensor(
-                        d["future_context"][start+history:start+history+horizon],
+                        self._make_future_context_with_dph_proxies(
+                            d=d,
+                            start=start,
+                            history=history,
+                            horizon=horizon,
+                        ),
                         dtype=torch.float32),
                     "y": torch.tensor(d["demand"][start+history:start+history+horizon], dtype=torch.float32),
                     "asin": asin,
@@ -614,6 +653,42 @@ class DemandDataset(Dataset):
                         d["instock_raw"][start+history:start+history+horizon],
                         dtype=torch.float32),
                 })
+
+    def _safe_hist_mean(self, arr, start, history, window):
+        hist = arr[start:start+history]
+        if len(hist) == 0:
+            return 0.0
+        hist = hist[-min(window, len(hist)):]
+        return float(np.mean(hist))
+
+    def _make_future_context_with_dph_proxies(self, d, start, history, horizon):
+        """
+        Fill historical DPH summary proxy features using only values up to forecast origin.
+        These are repeated across the horizon and do not use future true DPH.
+        """
+        fc = d["future_context"][start+history:start+history+horizon].copy()
+        idx = d.get("dph_proxy_context_idx", {})
+
+        total_hist = d.get("total_dph_raw", None)
+        buy_hist = d.get("buy_box_dph_raw", None)
+
+        def fill(col, val):
+            if col in idx:
+                fc[:, idx[col]] = np.log1p(max(float(val), 0.0))
+
+        if total_hist is not None:
+            total_last = total_hist[start+history-1] if history > 0 else 0.0
+            fill("hist_total_dph_last_log", total_last)
+            fill("hist_total_dph_mean4_log", self._safe_hist_mean(total_hist, start, history, 4))
+            fill("hist_total_dph_mean13_log", self._safe_hist_mean(total_hist, start, history, 13))
+
+        if buy_hist is not None:
+            buy_last = buy_hist[start+history-1] if history > 0 else 0.0
+            fill("hist_buy_box_dph_last_log", buy_last)
+            fill("hist_buy_box_dph_mean4_log", self._safe_hist_mean(buy_hist, start, history, 4))
+            fill("hist_buy_box_dph_mean13_log", self._safe_hist_mean(buy_hist, start, history, 13))
+
+        return fc
 
     def __len__(self): return len(self.samples)
     def __getitem__(self, i): return self.samples[i]
@@ -908,17 +983,31 @@ def pinball(y, pred, q):
     return torch.mean(torch.max(q*d, (q-1)*d))
 
 
-def stock_decoder_loss(stock_log_hat, future_instock_true):
+def stock_decoder_loss(stock_log_hat, future_instock_true, mean_weight=0.10):
     """
-    Huber loss on log1p(in_stock_dph).
+    Huber loss on log1p(in_stock_dph), plus a small mean-calibration penalty.
+
     true future in_stock_dph is used only as an auxiliary supervision target.
     Demand prediction uses stock_log_hat, not true future in_stock_dph.
+
+    The mean-calibration term helps prevent systematic underprediction or overprediction
+    of the stock decoder scale.
     """
     if stock_log_hat is None:
         return torch.tensor(0.0, device=future_instock_true.device)
 
     target = torch.log1p(future_instock_true.clamp(min=0.0))
-    return F.huber_loss(stock_log_hat, target, delta=1.0)
+
+    point_loss = F.huber_loss(stock_log_hat, target, delta=1.0)
+
+    pred_level = torch.expm1(stock_log_hat).clamp(min=0.0)
+    true_level = future_instock_true.clamp(min=0.0)
+
+    mean_loss = torch.abs(
+        torch.log1p(pred_level.mean()) - torch.log1p(true_level.mean())
+    )
+
+    return point_loss + mean_weight * mean_loss
 
 
 
@@ -2672,4 +2761,39 @@ def check_no_buybox_total_dph_in_context(data_raw1):
         print("WARNING: leakage-risk columns are still selected:", bad)
 
     return cols
+
+
+
+
+def check_safe_historical_dph_proxy_context(result, n_batches=1):
+    """
+    Check that historical DPH proxy columns are present and constant within horizon.
+    """
+    va_ld = result.get("va_ld", None)
+    context_cols = result.get("context_cols", None)
+
+    print("\n" + "=" * 80)
+    print("SAFE HISTORICAL DPH PROXY CONTEXT CHECK")
+    print("=" * 80)
+
+    if context_cols is not None:
+        proxy_cols = [c for c in context_cols if c.startswith("hist_total_dph") or c.startswith("hist_buy_box_dph")]
+        print("Proxy cols:", proxy_cols)
+
+    if va_ld is None:
+        print("No va_ld found.")
+        return
+
+    for bi, b in enumerate(va_ld):
+        fc = b["future_context"].detach().cpu().numpy()
+        print("future_context shape:", fc.shape)
+
+        if context_cols is not None:
+            for c in proxy_cols:
+                j = context_cols.index(c)
+                print(c, "first sample values:", fc[0, :, j])
+                print(c, "unique first sample:", np.unique(fc[0, :, j]))
+
+        if bi + 1 >= n_batches:
+            break
 
