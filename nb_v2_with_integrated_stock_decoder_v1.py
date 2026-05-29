@@ -160,6 +160,17 @@ def _infer_pkg_dimension_cols(df):
 
 
 
+
+def _get_1d_col(df, col):
+    """
+    Return one 1-D Series even if df has duplicate column names.
+    """
+    x = df[col]
+    if isinstance(x, pd.DataFrame):
+        x = x.iloc[:, 0]
+    return x
+
+
 def _select_stock_decoder_extra_cols(data_raw):
     """
     Select additional features to help the stock decoder predict future in_stock_dph_hat.
@@ -258,7 +269,7 @@ def _encode_stock_decoder_extra_features(df, extra_cols):
             continue
 
         if pd.api.types.is_numeric_dtype(df[c]):
-            val = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
+            val = pd.to_numeric(_get_1d_col(df, c), errors="coerce").fillna(0.0)
 
             # Conservative transforms by feature type.
             cl = c.lower()
@@ -276,7 +287,7 @@ def _encode_stock_decoder_extra_features(df, extra_cols):
             df[new_c] = ((val - mean) / std).clip(-5, 5)
 
         else:
-            codes, uniques = pd.factorize(df[c].astype(str).fillna("MISSING"))
+            codes, uniques = pd.factorize(_get_1d_col(df, c).astype(str).fillna("MISSING"))
             # normalize category code to roughly [0,1]
             denom = max(len(uniques) - 1, 1)
             df[new_c] = codes.astype(float) / denom
@@ -406,6 +417,10 @@ def load_real_data(data_raw):
         if c in data_raw.columns
     ]
 
+    # Remove duplicate column names. Duplicates can happen because package columns
+    # are used both for total_size diagnostics and stock-decoder extra features.
+    keep_cols = list(dict.fromkeys(keep_cols))
+
     df = data_raw[keep_cols].copy()
 
     # Encode additional product / popularity / promo / size features for stock decoder.
@@ -421,9 +436,9 @@ def load_real_data(data_raw):
     w_col = pkg_cols.get("width")
 
     if h_col is not None and l_col is not None and w_col is not None:
-        pkg_h = pd.to_numeric(df[h_col], errors="coerce").fillna(0).clip(lower=0)
-        pkg_l = pd.to_numeric(df[l_col], errors="coerce").fillna(0).clip(lower=0)
-        pkg_w = pd.to_numeric(df[w_col], errors="coerce").fillna(0).clip(lower=0)
+        pkg_h = pd.to_numeric(_get_1d_col(df, h_col), errors="coerce").fillna(0).clip(lower=0)
+        pkg_l = pd.to_numeric(_get_1d_col(df, l_col), errors="coerce").fillna(0).clip(lower=0)
+        pkg_w = pd.to_numeric(_get_1d_col(df, w_col), errors="coerce").fillna(0).clip(lower=0)
         df["pkg_volume_raw"] = pkg_h * pkg_l * pkg_w
     else:
         df["pkg_volume_raw"] = np.nan
