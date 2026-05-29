@@ -9,7 +9,7 @@ This version runs on the high-sparse group and includes:
 - z regularization
 - encoder diagnostics
 - final WAPE summary
-- future in_stock_dph context zero-filled to avoid leakage
+- future in_stock_dph context uses option B: repeat forecast-origin last observed value
 - total amount diagnostics: sum(fbi_demand * raw our_price)
 - total size diagnostics: sum(fbi_demand * pkg_height * pkg_length * pkg_width)
 """
@@ -375,16 +375,18 @@ def load_real_data(data_raw):
 
         future_context = group[context_cols].values.astype(np.float32)
 
-        # Forecast-origin safe option A:
-        # in_stock_dph is not known for future weeks, so set its future_context value to 0.
+        # Forecast-origin safe option B:
+        # Future in_stock_dph is unknown, so use the last observed lagged value
+        # at each forecast origin and repeat it across the full horizon.
         # The history encoder still uses lagged in_stock_dph features.
         if "in_stock_dph" in context_cols:
             instock_ctx_idx = context_cols.index("in_stock_dph")
-            future_context[:, instock_ctx_idx] = 0.0
+            future_context[:, instock_ctx_idx] = np.nan  # filled in Dataset by forecast origin
 
         data[asin] = {
             "features": features,
             "future_context": future_context,
+            "instock_context_idx": context_cols.index("in_stock_dph") if "in_stock_dph" in context_cols else None,
             "demand": demand.astype(np.float32),
             "week": weeks,
             "oos": oos.astype(np.float32),
@@ -393,7 +395,7 @@ def load_real_data(data_raw):
         }
 
     print("History encoder dim: 25 (all leak-free)")
-    print("Future in_stock_dph context: zero-filled option A")
+    print("Future in_stock_dph context: option B, repeat forecast-origin last observed value")
     print(f"Package dimension columns for total_size: {pkg_cols}")
     print(f"Context dim: {len(context_cols)}")
     return data, len(context_cols), context_cols
@@ -418,7 +420,12 @@ class DemandDataset(Dataset):
                 self.samples.append({
                     "x": torch.tensor(d["features"][start:start+history], dtype=torch.float32),
                     "future_context": torch.tensor(
-                        d["future_context"][start+history:start+history+horizon],
+                        self._make_future_context_b(
+                            d,
+                            start=start,
+                            history=history,
+                            horizon=horizon,
+                        ),
                         dtype=torch.float32),
                     "y": torch.tensor(d["demand"][start+history:start+history+horizon], dtype=torch.float32),
                     "asin": asin,
@@ -431,6 +438,24 @@ class DemandDataset(Dataset):
                         d["pkg_volume_raw"][start+history:start+history+horizon],
                         dtype=torch.float32),
                 })
+
+    def _make_future_context_b(self, d, start, history, horizon):
+        """
+        Option B for future in_stock_dph:
+        use the last observed lagged in_stock_dph at forecast origin
+        and repeat it across all future weeks.
+        """
+        fc = d["future_context"][start+history:start+history+horizon].copy()
+
+        instock_idx = d.get("instock_context_idx", None)
+        if instock_idx is not None:
+            origin_idx = start + history - 1
+            last_visible_instock = d["future_context"][origin_idx, instock_idx]
+            if np.isnan(last_visible_instock):
+                last_visible_instock = 0.0
+            fc[:, instock_idx] = last_visible_instock
+
+        return fc
 
     def __len__(self): return len(self.samples)
     def __getitem__(self, i): return self.samples[i]
