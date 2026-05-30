@@ -1,3 +1,15 @@
+# ============================================================
+# BEST CLEAN EXPOSURE PIPELINE
+# Recommended current version:
+#   Direct TCN exposure model + learnable anchor/source attention
+#
+# Main focus:
+#   Improve long-horizon active AUC and reduce low/zero exposure false positives.
+#
+# Main entry point:
+#   run_best_exposure_anchor_attention(...)
+# ============================================================
+
 
 # ============================================================
 # Clean Exposure-Only Forecasting Script
@@ -2137,6 +2149,305 @@ def make_external_hat_df_from_anchor_attention(attn_df, include_prob_cols=True):
 # attn_eval = evaluate_anchor_attention_blender(attn_df)
 #
 # exposure_hat_for_demand = make_external_hat_df_from_anchor_attention(attn_df)
+#
+
+
+
+# ============================================================
+# 11. Clean best pipeline: Direct TCN + Anchor Attention
+# ============================================================
+
+def diagnose_long_horizon_auc(attn_df, pred_prefix="attn"):
+    """
+    Focused diagnostic for the long-horizon AUC issue.
+
+    pred_prefix:
+      "attn" uses:
+        attn_total_dph / attn_buy_box_dph / attn_instock_dph
+      "pred" uses:
+        pred_total_dph / pred_buy_box_dph / pred_instock_dph
+
+    This function prints:
+      1. by-horizon active AUC
+      2. short/mid/long block active AUC
+      3. model-vs-anchor-attention comparison if both exist
+    """
+    df = attn_df.copy()
+
+    if pred_prefix == "attn":
+        pred_cols = {
+            "total_dph": "attn_total_dph",
+            "buy_box_dph": "attn_buy_box_dph",
+            "in_stock_dph": "attn_instock_dph",
+        }
+    else:
+        pred_cols = {
+            "total_dph": "pred_total_dph",
+            "buy_box_dph": "pred_buy_box_dph",
+            "in_stock_dph": "pred_instock_dph",
+        }
+
+    true_cols = {
+        "total_dph": "true_total_dph",
+        "buy_box_dph": "true_buy_box_dph",
+        "in_stock_dph": "true_instock_dph",
+    }
+
+    missing = []
+    for k in pred_cols:
+        if pred_cols[k] not in df.columns:
+            missing.append(pred_cols[k])
+        if true_cols[k] not in df.columns:
+            missing.append(true_cols[k])
+    if missing:
+        raise ValueError(f"Missing columns for long horizon AUC diagnostic: {missing}")
+
+    print("\n" + "=" * 100)
+    print("LONG-HORIZON ACTIVE AUC DIAGNOSTIC")
+    print("=" * 100)
+
+    # By horizon.
+    rows = []
+    for h, g in df.groupby("horizon"):
+        for target in ["total_dph", "buy_box_dph", "in_stock_dph"]:
+            y = (g[true_cols[target]].values > 0).astype(int)
+            p = g[pred_cols[target]].values
+            rows.append({
+                "horizon": int(h),
+                "target": target,
+                "true_active_rate": y.mean(),
+                "pred_mean": np.mean(p),
+                "active_AUC": _auc(y, p),
+                "WAPE": _wape(g[true_cols[target]].values, p),
+                "Pearson": _corr(g[true_cols[target]].values, p),
+                "Spearman": _safe_spearman(g[true_cols[target]].values, p),
+            })
+
+    by_h = pd.DataFrame(rows)
+
+    print("\nBy horizon: in_stock_dph")
+    print(
+        by_h[by_h["target"] == "in_stock_dph"]
+        .round(5)
+        .to_string(index=False)
+    )
+
+    # By block.
+    df["horizon_block"] = pd.cut(
+        df["horizon"],
+        bins=[0, 5, 12, 20],
+        labels=["short_1_5", "mid_6_12", "long_13_20"],
+        include_lowest=True,
+    )
+
+    block_rows = []
+    for block, g in df.groupby("horizon_block", observed=True):
+        for target in ["total_dph", "buy_box_dph", "in_stock_dph"]:
+            y = (g[true_cols[target]].values > 0).astype(int)
+            p = g[pred_cols[target]].values
+            block_rows.append({
+                "block": block,
+                "target": target,
+                "true_active_rate": y.mean(),
+                "pred_mean": np.mean(p),
+                "active_AUC": _auc(y, p),
+                "WAPE": _wape(g[true_cols[target]].values, p),
+                "Pearson": _corr(g[true_cols[target]].values, p),
+                "Spearman": _safe_spearman(g[true_cols[target]].values, p),
+            })
+
+    by_block = pd.DataFrame(block_rows)
+
+    print("\nBy horizon block")
+    print(by_block.round(5).to_string(index=False))
+
+    # Compare raw model vs attention if available.
+    if all(c in df.columns for c in ["pred_instock_dph", "attn_instock_dph"]):
+        comp_rows = []
+
+        for method, col in [
+            ("raw_model", "pred_instock_dph"),
+            ("anchor_attention", "attn_instock_dph"),
+            ("naive_last", "pred_instock_dph_last"),
+            ("naive_mean13", "pred_instock_dph_mean13"),
+        ]:
+            if col not in df.columns:
+                continue
+
+            for block, g in df.groupby("horizon_block", observed=True):
+                y_level = g["true_instock_dph"].values
+                y_active = (y_level > 0).astype(int)
+                p = g[col].values
+
+                comp_rows.append({
+                    "method": method,
+                    "block": block,
+                    "target": "in_stock_dph",
+                    "active_AUC": _auc(y_active, p),
+                    "WAPE": _wape(y_level, p),
+                    "Pearson": _corr(y_level, p),
+                    "Spearman": _safe_spearman(y_level, p),
+                    "pred_true_ratio": np.mean(p) / (np.mean(y_level) + 1e-8),
+                })
+
+        comp = pd.DataFrame(comp_rows)
+
+        print("\nRaw model vs anchor attention vs naive: in_stock_dph")
+        print(comp.round(5).to_string(index=False))
+    else:
+        comp = None
+
+    return {
+        "by_horizon": by_h,
+        "by_block": by_block,
+        "comparison": comp,
+    }
+
+
+def run_best_exposure_anchor_attention(
+    data_raw1,
+    scot_df,
+    n_asins=5000,
+    seed=42,
+    history=52,
+    horizon=20,
+    d_model=64,
+    batch_size=64,
+    exposure_epochs=60,
+    exposure_lr=1e-3,
+    exposure_patience=8,
+    attn_epochs=80,
+    attn_batch_size=1024,
+    attn_lr=1e-3,
+    attn_patience=10,
+    attn_hidden=64,
+    attn_dropout=0.10,
+    remove_extreme=True,
+    extreme_q=0.99,
+):
+    """
+    Clean best pipeline currently recommended:
+
+      Step 1:
+        Train direct TCN exposure-only model.
+        This predicts:
+          pred_total_dph
+          pred_buy_box_dph
+          pred_instock_dph
+
+      Step 2:
+        Train post-hoc anchor/source attention blender.
+        It combines:
+          model_hat
+          naive_last
+          naive_mean4
+          naive_mean13
+
+      Step 3:
+        Evaluate long-horizon active AUC.
+        This directly targets the long-horizon AUC problem.
+
+      Step 4:
+        Create exposure_hat_for_demand.
+        This can be fed into the demand model.
+
+    Recommended downstream:
+      Use exposure_hat_for_demand as external exposure_hat input.
+    """
+    print("\n" + "=" * 100)
+    print("BEST CLEAN PIPELINE: DIRECT TCN + ANCHOR ATTENTION")
+    print("=" * 100)
+
+    base_result = run_exposure_only(
+        data_raw1=data_raw1,
+        scot_df=scot_df,
+        n_asins=n_asins,
+        seed=seed,
+        history=history,
+        horizon=horizon,
+        d_model=d_model,
+        batch_size=batch_size,
+        epochs=exposure_epochs,
+        lr=exposure_lr,
+        patience=exposure_patience,
+        remove_extreme=remove_extreme,
+        extreme_q=extreme_q,
+    )
+
+    pred_df = base_result["forecast_df"]
+
+    print("\n" + "=" * 100)
+    print("TRAIN ANCHOR/SOURCE ATTENTION BLENDER")
+    print("=" * 100)
+
+    attn_result = train_and_apply_anchor_attention_blender(
+        pred_df,
+        targets=("total_dph", "buy_box_dph", "in_stock_dph"),
+        epochs=attn_epochs,
+        batch_size=attn_batch_size,
+        lr=attn_lr,
+        patience=attn_patience,
+        hidden=attn_hidden,
+        dropout=attn_dropout,
+        seed=seed,
+    )
+
+    attn_df = attn_result["attn_df"]
+
+    attn_eval = evaluate_anchor_attention_blender(attn_df)
+
+    long_auc_diag = diagnose_long_horizon_auc(
+        attn_df,
+        pred_prefix="attn",
+    )
+
+    exposure_hat_for_demand = make_external_hat_df_from_anchor_attention(
+        attn_df,
+        include_prob_cols=True,
+    )
+
+    print("\n" + "=" * 100)
+    print("READY FOR DEMAND MODEL")
+    print("=" * 100)
+    print("Use this dataframe as exposure_hat_df:")
+    print("    result_best['exposure_hat_for_demand']")
+    print("\nColumns:")
+    print(exposure_hat_for_demand.columns.tolist())
+
+    return {
+        "base_result": base_result,
+        "pred_df": pred_df,
+        "attn_result": attn_result,
+        "attn_df": attn_df,
+        "attn_eval": attn_eval,
+        "long_auc_diag": long_auc_diag,
+        "exposure_hat_for_demand": exposure_hat_for_demand,
+    }
+
+
+# ============================================================
+# Clean usage:
+# ============================================================
+#
+# result_best = run_best_exposure_anchor_attention(
+#     data_raw1=data_raw1,
+#     scot_df=scot_df,
+#     n_asins=5000,
+#     seed=42,
+#     history=52,
+#     horizon=20,
+#     d_model=64,
+#     batch_size=64,
+#     exposure_epochs=60,
+#     exposure_lr=1e-3,
+#     exposure_patience=8,
+# )
+#
+# # Focus on long-horizon active AUC:
+# long_auc = result_best["long_auc_diag"]
+#
+# # Final exposure hat for demand model:
+# exposure_hat_for_demand = result_best["exposure_hat_for_demand"]
 #
 
 # ============================================================
