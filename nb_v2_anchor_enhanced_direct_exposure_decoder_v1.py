@@ -530,7 +530,6 @@ def load_real_data(data_raw, dph_cap_q=0.995):
     # These columns are placeholders here and are filled inside DemandDataset
     # using only history up to each forecast origin.
     dph_proxy_cols = [
-        # Raw historical level anchors.
         "hist_total_dph_last_log",
         "hist_total_dph_mean4_log",
         "hist_total_dph_mean13_log",
@@ -540,28 +539,6 @@ def load_real_data(data_raw, dph_cap_q=0.995):
         "hist_instock_dph_last_log",
         "hist_instock_dph_mean4_log",
         "hist_instock_dph_mean13_log",
-
-        # Horizon decay scalars.
-        "horizon_decay_4",
-        "horizon_decay_8",
-        "horizon_decay_13",
-
-        # Horizon-aware level anchors.
-        # Near horizon: closer to last/mean4.
-        # Far horizon: closer to mean13 baseline.
-        "anchor_total_last_to_mean13_decay4_log",
-        "anchor_buy_box_last_to_mean13_decay4_log",
-        "anchor_instock_last_to_mean13_decay4_log",
-
-        "anchor_total_mean4_to_mean13_decay8_log",
-        "anchor_buy_box_mean4_to_mean13_decay8_log",
-        "anchor_instock_mean4_to_mean13_decay8_log",
-
-        # Funnel ratio anchors.
-        "hist_buybox_rate_mean4",
-        "hist_instock_given_buybox_mean4",
-        "hist_buybox_rate_mean13",
-        "hist_instock_given_buybox_mean13",
     ]
     for c in dph_proxy_cols:
         df[c] = 0.0
@@ -753,10 +730,10 @@ def load_real_data(data_raw, dph_cap_q=0.995):
     print("History in_stock_dph: raw historical value, no lag shift")
     print("Future context excludes in_stock_dph")
     print("Future context includes distance_* calendar features")
-    print("Anchor-enhanced direct exposure decoder: last/mean4/mean13 + horizon decay anchors")
+    print("Lag-aware direct demand: predicted same-week DPH + lag1/lag2/lag4 DPH features")
     print("Stock decoder safe mode: excludes future true total_dph and buy_box_dph")
     print("Safe historical DPH proxies: total/buy_box/in_stock last/mean4/mean13")
-    print("Anchor decoder uses hist total/buy_box/in_stock last/mean4/mean13 plus horizon decay")
+    print("Lag-aware direct demand uses historical DPH proxies and predicted future DPH lags")
     print("History encoder includes DPH funnel features")
     print(f"DPH cap q: {dph_cap_q} | cap value: {dph_cap}")
     print(f"Context dim: {len(context_cols)}")
@@ -820,16 +797,7 @@ class DemandDataset(Dataset):
     def _make_future_context_with_dph_proxies(self, d, start, history, horizon):
         """
         Fill historical DPH summary proxy features using only values up to forecast origin.
-
-        This anchor-enhanced version creates:
-          1. raw historical anchors: last / mean4 / mean13
-          2. horizon decay features
-          3. horizon-aware anchors:
-                near horizon uses last/mean4 more
-                far horizon reverts to mean13
-          4. historical funnel ratio anchors
-
-        No true future DPH is used.
+        These are repeated across the horizon and do not use future true DPH.
         """
         fc = d["future_context"][start+history:start+history+horizon].copy()
         idx = d.get("dph_proxy_context_idx", {})
@@ -838,97 +806,27 @@ class DemandDataset(Dataset):
         buy_hist = d.get("buy_box_dph_raw", None)
         instock_hist = d.get("instock_raw", None)
 
-        def set_const(col, val):
+        def fill(col, val):
             if col in idx:
-                fc[:, idx[col]] = float(val)
+                fc[:, idx[col]] = np.log1p(max(float(val), 0.0))
 
-        def set_vec(col, vals):
-            if col in idx:
-                fc[:, idx[col]] = np.asarray(vals, dtype=np.float32)
+        if total_hist is not None:
+            total_last = total_hist[start+history-1] if history > 0 else 0.0
+            fill("hist_total_dph_last_log", total_last)
+            fill("hist_total_dph_mean4_log", self._safe_hist_mean(total_hist, start, history, 4))
+            fill("hist_total_dph_mean13_log", self._safe_hist_mean(total_hist, start, history, 13))
 
-        def log1p_nonneg(v):
-            return np.log1p(max(float(v), 0.0))
+        if buy_hist is not None:
+            buy_last = buy_hist[start+history-1] if history > 0 else 0.0
+            fill("hist_buy_box_dph_last_log", buy_last)
+            fill("hist_buy_box_dph_mean4_log", self._safe_hist_mean(buy_hist, start, history, 4))
+            fill("hist_buy_box_dph_mean13_log", self._safe_hist_mean(buy_hist, start, history, 13))
 
-        def safe_last(arr):
-            return float(arr[start+history-1]) if arr is not None and history > 0 else 0.0
-
-        # Raw-level historical anchors.
-        total_last = safe_last(total_hist)
-        total_m4 = self._safe_hist_mean(total_hist, start, history, 4) if total_hist is not None else 0.0
-        total_m13 = self._safe_hist_mean(total_hist, start, history, 13) if total_hist is not None else 0.0
-
-        buy_last = safe_last(buy_hist)
-        buy_m4 = self._safe_hist_mean(buy_hist, start, history, 4) if buy_hist is not None else 0.0
-        buy_m13 = self._safe_hist_mean(buy_hist, start, history, 13) if buy_hist is not None else 0.0
-
-        instock_last = safe_last(instock_hist)
-        instock_m4 = self._safe_hist_mean(instock_hist, start, history, 4) if instock_hist is not None else 0.0
-        instock_m13 = self._safe_hist_mean(instock_hist, start, history, 13) if instock_hist is not None else 0.0
-
-        # Log anchors.
-        total_last_log = log1p_nonneg(total_last)
-        total_m4_log = log1p_nonneg(total_m4)
-        total_m13_log = log1p_nonneg(total_m13)
-
-        buy_last_log = log1p_nonneg(buy_last)
-        buy_m4_log = log1p_nonneg(buy_m4)
-        buy_m13_log = log1p_nonneg(buy_m13)
-
-        instock_last_log = log1p_nonneg(instock_last)
-        instock_m4_log = log1p_nonneg(instock_m4)
-        instock_m13_log = log1p_nonneg(instock_m13)
-
-        # Raw historical level anchors repeated across horizon.
-        set_const("hist_total_dph_last_log", total_last_log)
-        set_const("hist_total_dph_mean4_log", total_m4_log)
-        set_const("hist_total_dph_mean13_log", total_m13_log)
-
-        set_const("hist_buy_box_dph_last_log", buy_last_log)
-        set_const("hist_buy_box_dph_mean4_log", buy_m4_log)
-        set_const("hist_buy_box_dph_mean13_log", buy_m13_log)
-
-        set_const("hist_instock_dph_last_log", instock_last_log)
-        set_const("hist_instock_dph_mean4_log", instock_m4_log)
-        set_const("hist_instock_dph_mean13_log", instock_m13_log)
-
-        # Horizon-aware decay. h = 1,...,H.
-        h_arr = np.arange(1, horizon + 1, dtype=np.float32)
-        decay4 = np.exp(-h_arr / 4.0)
-        decay8 = np.exp(-h_arr / 8.0)
-        decay13 = np.exp(-h_arr / 13.0)
-
-        set_vec("horizon_decay_4", decay4)
-        set_vec("horizon_decay_8", decay8)
-        set_vec("horizon_decay_13", decay13)
-
-        # Horizon-aware anchors in log space.
-        # near horizon: last/mean4
-        # far horizon: mean13 baseline
-        set_vec("anchor_total_last_to_mean13_decay4_log",
-                decay4 * total_last_log + (1.0 - decay4) * total_m13_log)
-        set_vec("anchor_buy_box_last_to_mean13_decay4_log",
-                decay4 * buy_last_log + (1.0 - decay4) * buy_m13_log)
-        set_vec("anchor_instock_last_to_mean13_decay4_log",
-                decay4 * instock_last_log + (1.0 - decay4) * instock_m13_log)
-
-        set_vec("anchor_total_mean4_to_mean13_decay8_log",
-                decay8 * total_m4_log + (1.0 - decay8) * total_m13_log)
-        set_vec("anchor_buy_box_mean4_to_mean13_decay8_log",
-                decay8 * buy_m4_log + (1.0 - decay8) * buy_m13_log)
-        set_vec("anchor_instock_mean4_to_mean13_decay8_log",
-                decay8 * instock_m4_log + (1.0 - decay8) * instock_m13_log)
-
-        # Funnel ratio anchors. Use raw levels, clipped to [0, 2] for stability.
-        buybox_rate_m4 = np.clip(buy_m4 / (total_m4 + 1.0), 0.0, 2.0)
-        instock_given_buy_m4 = np.clip(instock_m4 / (buy_m4 + 1.0), 0.0, 2.0)
-
-        buybox_rate_m13 = np.clip(buy_m13 / (total_m13 + 1.0), 0.0, 2.0)
-        instock_given_buy_m13 = np.clip(instock_m13 / (buy_m13 + 1.0), 0.0, 2.0)
-
-        set_const("hist_buybox_rate_mean4", buybox_rate_m4)
-        set_const("hist_instock_given_buybox_mean4", instock_given_buy_m4)
-        set_const("hist_buybox_rate_mean13", buybox_rate_m13)
-        set_const("hist_instock_given_buybox_mean13", instock_given_buy_m13)
+        if instock_hist is not None:
+            instock_last = instock_hist[start+history-1] if history > 0 else 0.0
+            fill("hist_instock_dph_last_log", instock_last)
+            fill("hist_instock_dph_mean4_log", self._safe_hist_mean(instock_hist, start, history, 4))
+            fill("hist_instock_dph_mean13_log", self._safe_hist_mean(instock_hist, start, history, 13))
 
         return fc
 
@@ -1074,42 +972,28 @@ class Epinet(nn.Module):
 
 
 
-class AnchoredExposureDecoder(nn.Module):
+class DirectExposureDecoder(nn.Module):
     """
-    Anchor-enhanced direct exposure decoder.
+    Direct multi-output exposure decoder.
 
-    This is NOT autoregressive.
-
-    It predicts the full future exposure path in one forward pass:
-        log1p(total_dph_hat_{T+1:T+H})
-        log1p(buy_box_dph_hat_{T+1:T+H})
-        log1p(in_stock_dph_hat_{T+1:T+H})
-
-    The key idea:
-        historical observed DPH anchors are added into future_context:
-            last / mean4 / mean13
-            horizon-aware decay anchors
-            funnel ratio anchors
-
-    This uses no true future DPH and avoids recursive error accumulation.
+    Predicts the full future exposure path in one forward pass.
+    No future true DPH is used.
+    No recursive rollout is used.
     """
-    def __init__(self, d_model, context_dim, horizon=20, hidden=96):
+    def __init__(self, d_model, context_dim, horizon=20, hidden=64):
         super().__init__()
         self.horizon = horizon
-
         self.net = nn.Sequential(
             nn.Linear(d_model + context_dim + 2, hidden),
             nn.ReLU(),
             nn.Dropout(0.10),
             nn.Linear(hidden, hidden),
             nn.ReLU(),
-            nn.Dropout(0.05),
             nn.Linear(hidden, 3),
         )
 
     def forward(self, h_t, future_context):
         B, H, C = future_context.shape
-
         h_rep = h_t.unsqueeze(1).expand(B, H, h_t.shape[-1])
 
         horizon_idx = torch.arange(H, device=future_context.device).float()
@@ -1122,7 +1006,6 @@ class AnchoredExposureDecoder(nn.Module):
 
         exposure_log_hat = self.net(inp)
         exposure_log_hat = F.softplus(exposure_log_hat)
-
         return exposure_log_hat
 
 
@@ -1140,8 +1023,13 @@ class TCN_ENN(nn.Module):
         self.encoder = TCNSparseAttnEncoder(input_dim, d_model, horizon)
 
         if use_stock_decoder:
-            self.stock_decoder = AnchoredExposureDecoder(d_model, context_dim, horizon)
-            z_context_dim = context_dim + 3  # add predicted log1p(total/buy_box/in_stock DPH hats)
+            self.stock_decoder = DirectExposureDecoder(d_model, context_dim, horizon)
+            # Demand head receives:
+            #   same-week predicted DPH_hat: 3
+            #   lag1 exposure feature:       3
+            #   lag2 exposure feature:       3
+            #   lag4 exposure feature:       3
+            z_context_dim = context_dim + 12
         else:
             self.stock_decoder = None
             z_context_dim = context_dim
@@ -1149,22 +1037,126 @@ class TCN_ENN(nn.Module):
         self.z_generator = ContextZGenerator(d_model, z_context_dim, d_z, horizon)
         self.epinet = Epinet(d_model, d_z, horizon, prior_scale)
 
+    def _initial_hist_log_state_from_context(self, future_context):
+        """
+        Extract historical true DPH log states from context proxies.
+
+        Expected proxy order at the end of future_context:
+            -9 hist_total_dph_last_log
+            -8 hist_total_dph_mean4_log
+            -7 hist_total_dph_mean13_log
+            -6 hist_buy_box_dph_last_log
+            -5 hist_buy_box_dph_mean4_log
+            -4 hist_buy_box_dph_mean13_log
+            -3 hist_instock_dph_last_log
+            -2 hist_instock_dph_mean4_log
+            -1 hist_instock_dph_mean13_log
+        """
+        B, H, C = future_context.shape
+
+        if C >= 9:
+            last = torch.stack([
+                future_context[:, 0, -9],
+                future_context[:, 0, -6],
+                future_context[:, 0, -3],
+            ], dim=-1)
+
+            mean4 = torch.stack([
+                future_context[:, 0, -8],
+                future_context[:, 0, -5],
+                future_context[:, 0, -2],
+            ], dim=-1)
+
+            mean13 = torch.stack([
+                future_context[:, 0, -7],
+                future_context[:, 0, -4],
+                future_context[:, 0, -1],
+            ], dim=-1)
+        else:
+            last = torch.zeros(B, 3, device=future_context.device, dtype=future_context.dtype)
+            mean4 = torch.zeros_like(last)
+            mean13 = torch.zeros_like(last)
+
+        return last, mean4, mean13
+
+    def _make_lag_exposure_features(self, exposure_log_hat, future_context):
+        """
+        Build leak-free lag exposure features for demand model.
+
+        For demand at future step h:
+            lag1 feature represents exposure at T+h-1
+            lag2 feature represents exposure at T+h-2
+            lag4 feature represents exposure at T+h-4
+
+        If that exposure time is <= T, use historical true proxy.
+        If that exposure time is future, use predicted exposure_log_hat.
+        """
+        B, H, _ = exposure_log_hat.shape
+        hist_last, hist_mean4, hist_mean13 = self._initial_hist_log_state_from_context(future_context)
+
+        lag1_list = []
+        lag2_list = []
+        lag4_list = []
+
+        for step in range(H):
+            if step - 1 >= 0:
+                lag1 = exposure_log_hat[:, step - 1, :]
+            else:
+                lag1 = hist_last
+
+            if step - 2 >= 0:
+                lag2 = exposure_log_hat[:, step - 2, :]
+            else:
+                lag2 = hist_mean4
+
+            if step - 4 >= 0:
+                lag4 = exposure_log_hat[:, step - 4, :]
+            else:
+                lag4 = hist_mean4
+
+            lag1_list.append(lag1.unsqueeze(1))
+            lag2_list.append(lag2.unsqueeze(1))
+            lag4_list.append(lag4.unsqueeze(1))
+
+        lag1_feat = torch.cat(lag1_list, dim=1)
+        lag2_feat = torch.cat(lag2_list, dim=1)
+        lag4_feat = torch.cat(lag4_list, dim=1)
+
+        return lag1_feat, lag2_feat, lag4_feat
+
     def _augment_context_with_stock_hat(self, h_t, future_context):
         """
-        Direct anchor-enhanced exposure prediction.
+        Direct exposure prediction + lag-aware demand features.
 
-        Demand head sees predicted exposure hats only.
-        No true future DPH and no recursive predicted lag are used.
+        Demand head receives:
+            same-week predicted exposure_log_hat
+            lag1 exposure feature
+            lag2 exposure feature
+            lag4 exposure feature
+
+        No true future DPH is used.
         """
         if not self.use_stock_decoder:
             return future_context, None
 
         exposure_log_hat = self.stock_decoder(h_t, future_context)  # [B, H, 3]
 
+        lag1_feat, lag2_feat, lag4_feat = self._make_lag_exposure_features(
+            exposure_log_hat,
+            future_context,
+        )
+
         future_context_aug = torch.cat(
-            [future_context, exposure_log_hat],
+            [
+                future_context,
+                exposure_log_hat,
+                lag1_feat,
+                lag2_feat,
+                lag4_feat,
+            ],
             dim=-1,
         )
+
         return future_context_aug, exposure_log_hat
 
     def forward(self, x, future_context, nZ=8):
@@ -3276,23 +3268,15 @@ def diagnose_ar_exposure_rollout(result):
 
 
 
-def diagnose_anchor_context_columns(result):
+def diagnose_lag_aware_demand_features(result, n_batches=1):
     """
-    Check whether anchor-enhanced direct decoder columns are present.
+    Check lag-aware direct demand feature construction.
     """
     context_cols = result.get("context_cols", [])
+    model = result.get("model", None)
+    forecast_df = result.get("forecast_df", None)
 
-    seasonal_cols = [
-        "order_month",
-        "month_sin",
-        "month_cos",
-        "season_winter",
-        "season_spring",
-        "season_summer",
-        "season_fall",
-    ]
-
-    raw_anchor_cols = [
+    proxy_cols = [
         "hist_total_dph_last_log",
         "hist_total_dph_mean4_log",
         "hist_total_dph_mean13_log",
@@ -3304,99 +3288,65 @@ def diagnose_anchor_context_columns(result):
         "hist_instock_dph_mean13_log",
     ]
 
-    decay_cols = [
-        "horizon_decay_4",
-        "horizon_decay_8",
-        "horizon_decay_13",
-    ]
-
-    anchor_cols = [
-        "anchor_total_last_to_mean13_decay4_log",
-        "anchor_buy_box_last_to_mean13_decay4_log",
-        "anchor_instock_last_to_mean13_decay4_log",
-        "anchor_total_mean4_to_mean13_decay8_log",
-        "anchor_buy_box_mean4_to_mean13_decay8_log",
-        "anchor_instock_mean4_to_mean13_decay8_log",
-        "hist_buybox_rate_mean4",
-        "hist_instock_given_buybox_mean4",
-        "hist_buybox_rate_mean13",
-        "hist_instock_given_buybox_mean13",
-    ]
-
-    proximity_cols = [c for c in context_cols if c.endswith("_proximity")]
-
-    print("\n" + "=" * 80)
-    print("ANCHOR-ENHANCED DIRECT DECODER CONTEXT CHECK")
+    print("\\n" + "=" * 80)
+    print("LAG-AWARE DIRECT DEMAND FEATURE CHECK")
     print("=" * 80)
 
-    print("\nSeasonal cols:")
-    print({c: (c in context_cols) for c in seasonal_cols})
+    print("\\nHistorical proxy columns:")
+    print({c: (c in context_cols) for c in proxy_cols})
 
-    print("\nRaw historical anchor cols:")
-    print({c: (c in context_cols) for c in raw_anchor_cols})
+    if model is not None:
+        print("\\nStock decoder class:")
+        print(type(model.stock_decoder).__name__ if hasattr(model, "stock_decoder") else "No stock_decoder")
 
-    print("\nHorizon decay cols:")
-    print({c: (c in context_cols) for c in decay_cols})
+    if forecast_df is not None:
+        needed = [
+            "pred_total_dph_hat",
+            "pred_buy_box_dph_hat",
+            "pred_instock_dph_hat",
+            "true_future_total_dph",
+            "true_future_buy_box_dph",
+            "true_future_instock",
+        ]
+        print("\\nForecast columns:")
+        print({c: (c in forecast_df.columns) for c in needed})
 
-    print("\nHorizon-aware anchor cols:")
-    print({c: (c in context_cols) for c in anchor_cols})
+        cols = [c for c in needed if c in forecast_df.columns]
+        print("\\nExposure prediction summary:")
+        print(forecast_df[cols].describe().round(4))
 
-    print("\nMajor event proximity cols:")
-    print(proximity_cols)
-
-    return {
-        "seasonal": {c: (c in context_cols) for c in seasonal_cols},
-        "raw_anchor": {c: (c in context_cols) for c in raw_anchor_cols},
-        "decay": {c: (c in context_cols) for c in decay_cols},
-        "anchor": {c: (c in context_cols) for c in anchor_cols},
-        "proximity_cols": proximity_cols,
-    }
-
-
-def diagnose_anchor_feature_values(result, n_batches=1):
-    """
-    Print a small sample of anchor feature values to verify horizon decay varies over horizon.
-    """
-    va_ld = result.get("va_ld", None)
-    context_cols = result.get("context_cols", [])
-    if va_ld is None:
-        print("No va_ld found.")
-        return None
-
-    watch_cols = [
-        "horizon_decay_4",
-        "horizon_decay_8",
-        "horizon_decay_13",
-        "anchor_total_last_to_mean13_decay4_log",
-        "anchor_buy_box_last_to_mean13_decay4_log",
-        "anchor_instock_last_to_mean13_decay4_log",
-        "anchor_total_mean4_to_mean13_decay8_log",
-        "anchor_buy_box_mean4_to_mean13_decay8_log",
-        "anchor_instock_mean4_to_mean13_decay8_log",
-    ]
-
-    idx = {c: context_cols.index(c) for c in watch_cols if c in context_cols}
-
-    print("\n" + "=" * 80)
-    print("ANCHOR FEATURE VALUE CHECK")
-    print("=" * 80)
-
-    for bi, b in enumerate(va_ld):
-        fc = b["future_context"].detach().cpu().numpy()
-        print("future_context shape:", fc.shape)
-
-        rows = []
-        for h in range(min(fc.shape[1], 20)):
-            row = {"horizon": h + 1}
-            for c, j in idx.items():
-                row[c] = fc[0, h, j]
-            rows.append(row)
-
-        out = pd.DataFrame(rows)
-        print(out.round(4).to_string(index=False))
-
-        if bi + 1 >= n_batches:
-            break
+    print("\\nInterpretation:")
+    print("""
+This version is strict leak-free:
+  - same-week future DPH is predicted by decoder
+  - lag1/lag2/lag4 demand features are constructed from:
+      historical true DPH proxies when available
+      previous predicted DPH_hat for future lag positions
+  - no true future DPH is fed as model input
+""")
 
     return None
 
+
+def explain_lag_aware_direct_setting():
+    print("\\n" + "=" * 80)
+    print("LAG-AWARE DIRECT SETTING")
+    print("=" * 80)
+    print("""
+This version uses the lag diagnostic result:
+
+  lag0 is strongest:
+      demand_t depends heavily on contemporaneous DPH_t
+
+  lag4 is still strong:
+      historical DPH has persistence / carry-over
+
+So the model gives demand head both:
+  1. predicted same-week future DPH_hat_{T+h}
+  2. lagged DPH features for T+h-1, T+h-2, T+h-4
+
+For early horizons, lagged features come from true historical DPH proxies.
+For later horizons, lagged features come from predicted DPH_hat.
+
+This is deployable as a strict fixed-origin 20-week forecast.
+""")
