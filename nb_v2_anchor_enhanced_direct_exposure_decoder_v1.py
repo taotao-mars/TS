@@ -213,40 +213,27 @@ def _apply_dph_cap(df, cap):
 
 def _select_stock_decoder_extra_cols(data_raw):
     """
-    Explicitly select static / product / popularity features for the TCN exposure decoder.
+    Minimal static / product features for the TCN exposure decoder.
 
-    These features help decoder distinguish ASIN-level exposure regimes:
-      - product family / category
-      - traffic band / top-band proxy
-      - review count / popularity / maturity
-      - price band / HB rank
+    Use only low-noise ASIN-level regime features:
+      1. gl_product_group
+      2. hb_rank
+      3. ind_top10_review_brand
 
-    We intentionally exclude gl_product_group_desc because it is raw text.
+    We intentionally exclude:
+      - gl_product_group_desc: raw text
+      - category_code: too granular / high-cardinality
+      - glance_view_band_cat: may overlap with DPH / traffic realization
+      - review_count: heavy-tail and noisy
+      - price_bands: may introduce noise
+      - asin_birthday / word_count: not included in this minimal version
     """
     candidate_cols = [
-        # Product/category identity proxies.
         "gl_product_group",
-        "category_code",
-
-        # Top-band / traffic-tier / product quality proxies.
-        "glance_view_band_cat",
-        "price_bands",
         "hb_rank",
         "ind_top10_review_brand",
-
-        # Review / popularity / maturity proxies.
-        "customer_review_count",
-        "customer_active_review_count",
-        "customer_average_review_rating",
-        "cust_avg_active_review_rating",
-
-        # Optional useful AMXL/product flags if available.
-        "ind_amxl_hb",
-        "ind_new_asin",
-        "ind_target_audience",
     ]
 
-    # Avoid realized target / future outcome columns.
     exclude_cols = {
         "fbi_demand",
         "order_units",
@@ -269,42 +256,26 @@ def _select_stock_decoder_extra_cols(data_raw):
 
 def _encode_stock_decoder_extra_features(df, extra_cols):
     """
-    Convert explicit static/product features to numeric decoder context features.
+    Encode minimal static features for decoder context.
 
-    Categorical-like fields:
-      add frequency encoding + normalized code encoding.
+    gl_product_group:
+      categorical-like -> code + frequency encoding
 
-    Numeric heavy-tail fields:
-      log1p + standardize.
+    ind_top10_review_brand:
+      binary/categorical-like -> code + frequency encoding
 
-    Rating fields:
-      standardize directly.
-
-    The output columns are named:
-      stock_static__<col>__...
+    hb_rank:
+      numeric rank -> log1p + standardize
     """
     out_cols = []
 
     categorical_like = {
         "gl_product_group",
-        "category_code",
-        "glance_view_band_cat",
-        "price_bands",
         "ind_top10_review_brand",
-        "ind_amxl_hb",
-        "ind_new_asin",
-        "ind_target_audience",
     }
 
     log_numeric_like = {
-        "customer_review_count",
-        "customer_active_review_count",
         "hb_rank",
-    }
-
-    rating_like = {
-        "customer_average_review_rating",
-        "cust_avg_active_review_rating",
     }
 
     for c in extra_cols:
@@ -340,18 +311,8 @@ def _encode_stock_decoder_extra_features(df, extra_cols):
             df[new_c] = ((val - mean) / std).clip(-5, 5)
             out_cols.append(new_c)
 
-        elif c in rating_like:
-            val = pd.to_numeric(s, errors="coerce").fillna(0.0)
-
-            mean = float(val.mean())
-            std = float(val.std()) if float(val.std()) > 1e-8 else 1.0
-
-            new_c = f"stock_static__{c}__std"
-            df[new_c] = ((val - mean) / std).clip(-5, 5)
-            out_cols.append(new_c)
-
         else:
-            # Safe fallback.
+            # Safe fallback: do not silently pass raw text.
             if pd.api.types.is_numeric_dtype(s):
                 val = pd.to_numeric(s, errors="coerce").fillna(0.0)
                 mean = float(val.mean())
@@ -3565,15 +3526,10 @@ This version is strict leak-free.
 Decoder inputs include:
   1. future-known calendar / holiday / distance context
   2. historical DPH anchors: last / mean4 / mean13
-  3. explicit static product features:
+  3. minimal explicit static product features:
        gl_product_group
-       category_code
-       glance_view_band_cat
-       price_bands
        hb_rank
-       review counts
-       review ratings
-       AMXL flags if available
+       ind_top10_review_brand
 
 Decoder outputs point predictions:
   log1p(total_dph_hat)
@@ -3585,3 +3541,66 @@ No future true DPH.
 No AR rollout.
 No ratio output.
 """)
+
+
+
+def diagnose_minimal_static_features_in_decoder(result, data_raw1=None):
+    """
+    Verify that only minimal static features are inside decoder future_context.
+    """
+    context_cols = result.get("context_cols", None)
+    va_ld = result.get("va_ld", None)
+
+    print("\n" + "=" * 90)
+    print("MINIMAL STATIC FEATURES INSIDE DECODER CHECK")
+    print("=" * 90)
+
+    if context_cols is None:
+        print("WARNING: result['context_cols'] is missing. Re-run the main function from this v5 file.")
+        return None
+
+    static_cols = [c for c in context_cols if c.startswith("stock_static__")]
+    print("Number of stock_static__ context cols:", len(static_cols))
+    print(static_cols)
+
+    expected_keywords = [
+        "gl_product_group",
+        "hb_rank",
+        "ind_top10_review_brand",
+    ]
+
+    unexpected_keywords = [
+        "category_code",
+        "glance_view_band_cat",
+        "customer_review_count",
+        "customer_active_review_count",
+        "price_bands",
+        "gl_product_group_desc",
+        "word_count",
+        "asin_birthday",
+    ]
+
+    print("\nExpected feature presence:")
+    print({k: any(k in c for c in static_cols) for k in expected_keywords})
+
+    print("\nUnexpected feature presence, should be False:")
+    print({k: any(k in c for c in static_cols) for k in unexpected_keywords})
+
+    print("\nHoliday / distance / DPH-proxy context counts:")
+    print("holiday_indicator_*:", len([c for c in context_cols if c.startswith("holiday_indicator_")]))
+    print("distance_*:", len([c for c in context_cols if c.startswith("distance_")]))
+    print("hist_* DPH proxies:", len([c for c in context_cols if c.startswith("hist_")]))
+
+    if va_ld is not None:
+        for b in va_ld:
+            fc = b["future_context"]
+            print("\nfuture_context shape:", tuple(fc.shape))
+            print("future_context dim:", fc.shape[-1])
+            break
+
+    if data_raw1 is not None:
+        raw_candidates = _select_stock_decoder_extra_cols(data_raw1)
+        print("\nRaw static candidates selected from data_raw1:")
+        print(raw_candidates)
+
+    return static_cols
