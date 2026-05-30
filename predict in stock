@@ -1,8 +1,8 @@
 
 # ============================================================
-# Clean Exposure-Only Forecasting Script | Occ x Magnitude
+# Clean Exposure-Only Forecasting Script | Direct + Aux Exposure/Demand Occ + Horizon Block Heads
 # Target:
-#   Predict future total_dph / buy_box_dph / in_stock_dph with occurrence x magnitude
+#   Predict future total_dph / buy_box_dph / in_stock_dph
 #
 # No demand model.
 # No NB head.
@@ -484,21 +484,30 @@ class HorizonTCNBlock(nn.Module):
 
 class ExposureTCNDecoder(nn.Module):
     """
-    Occurrence x Magnitude exposure decoder.
+    Direct exposure decoder with:
+      1. auxiliary exposure occurrence head
+      2. auxiliary demand occurrence head
+      3. horizon block-specific heads
 
-    Shared TCN hidden over horizon, then two heads:
-      1. occ_head: logits for P(DPH > 0)
-      2. mag_head: log1p positive DPH magnitude
+    Main output:
+      level_head directly predicts log1p(total/buy_box/in_stock DPH).
 
-    Final point prediction:
-      pred_level = sigmoid(occ_logit) * expm1(mag_log)
+    Auxiliary outputs:
+      exposure_occ_head predicts P(DPH > 0)
+      demand_occ_head predicts P(demand > 0)
 
-    This allows true zero / low exposure ASIN-weeks to be predicted near zero,
-    unlike pure softplus regression where zero_rate_pred is always 0.
+    Horizon blocks:
+      short: h=1-5
+      mid:   h=6-12
+      long:  h=13-20
+
+    Future true demand is used only as auxiliary label during training.
+    It is never used as model input.
     """
     def __init__(self, d_model, context_dim, horizon=20, hidden=96, dropout=0.10):
         super().__init__()
         self.horizon = horizon
+        self.hidden = hidden
 
         self.input_proj = nn.Sequential(
             nn.Linear(d_model + context_dim + 2, hidden),
@@ -518,12 +527,33 @@ class ExposureTCNDecoder(nn.Module):
             nn.Dropout(dropout * 0.5),
         )
 
-        # Three targets:
-        #   0 total_dph
-        #   1 buy_box_dph
-        #   2 in_stock_dph
-        self.occ_head = nn.Linear(hidden, 3)
-        self.mag_head = nn.Linear(hidden, 3)
+        # Block-specific direct level heads.
+        self.level_head_short = nn.Linear(hidden, 3)
+        self.level_head_mid = nn.Linear(hidden, 3)
+        self.level_head_long = nn.Linear(hidden, 3)
+
+        # Block-specific auxiliary exposure occurrence heads.
+        self.exp_occ_head_short = nn.Linear(hidden, 3)
+        self.exp_occ_head_mid = nn.Linear(hidden, 3)
+        self.exp_occ_head_long = nn.Linear(hidden, 3)
+
+        # Block-specific auxiliary demand occurrence heads.
+        # Single output per horizon: P(future_demand > 0)
+        self.dem_occ_head_short = nn.Linear(hidden, 1)
+        self.dem_occ_head_mid = nn.Linear(hidden, 1)
+        self.dem_occ_head_long = nn.Linear(hidden, 1)
+
+    def _block_masks(self, H, device):
+        """
+        short: h=1-5
+        mid:   h=6-12
+        long:  h=13-20
+        """
+        idx = torch.arange(H, device=device)
+        short = idx <= 4
+        mid = (idx >= 5) & (idx <= 11)
+        long = idx >= 12
+        return short, mid, long
 
     def forward(self, h_t, future_context, return_components=False):
         B, H, C = future_context.shape
@@ -545,23 +575,55 @@ class ExposureTCNDecoder(nn.Module):
 
         z = self.shared(z)
 
-        occ_logit = self.occ_head(z)
-        mag_log = F.softplus(self.mag_head(z))
+        # Compute all block heads.
+        level_short = self.level_head_short(z)
+        level_mid = self.level_head_mid(z)
+        level_long = self.level_head_long(z)
 
-        prob_active = torch.sigmoid(occ_logit)
-        positive_mag = torch.expm1(mag_log).clamp(min=0.0)
-        pred_level = prob_active * positive_mag
+        exp_occ_short = self.exp_occ_head_short(z)
+        exp_occ_mid = self.exp_occ_head_mid(z)
+        exp_occ_long = self.exp_occ_head_long(z)
+
+        dem_occ_short = self.dem_occ_head_short(z)
+        dem_occ_mid = self.dem_occ_head_mid(z)
+        dem_occ_long = self.dem_occ_head_long(z)
+
+        short_mask, mid_mask, long_mask = self._block_masks(H, z.device)
+
+        level_raw = torch.zeros(B, H, 3, device=z.device, dtype=z.dtype)
+        exp_occ_logit = torch.zeros(B, H, 3, device=z.device, dtype=z.dtype)
+        dem_occ_logit = torch.zeros(B, H, 1, device=z.device, dtype=z.dtype)
+
+        level_raw[:, short_mask, :] = level_short[:, short_mask, :]
+        level_raw[:, mid_mask, :] = level_mid[:, mid_mask, :]
+        level_raw[:, long_mask, :] = level_long[:, long_mask, :]
+
+        exp_occ_logit[:, short_mask, :] = exp_occ_short[:, short_mask, :]
+        exp_occ_logit[:, mid_mask, :] = exp_occ_mid[:, mid_mask, :]
+        exp_occ_logit[:, long_mask, :] = exp_occ_long[:, long_mask, :]
+
+        dem_occ_logit[:, short_mask, :] = dem_occ_short[:, short_mask, :]
+        dem_occ_logit[:, mid_mask, :] = dem_occ_mid[:, mid_mask, :]
+        dem_occ_logit[:, long_mask, :] = dem_occ_long[:, long_mask, :]
+
+        # Direct final exposure prediction.
+        level_log_hat = F.softplus(level_raw)
+        pred_level = torch.expm1(level_log_hat).clamp(min=0.0)
+
+        prob_exp_active = torch.sigmoid(exp_occ_logit)
+        prob_demand_active = torch.sigmoid(dem_occ_logit).squeeze(-1)
 
         if return_components:
             return {
                 "pred_level": pred_level,
-                "occ_logit": occ_logit,
-                "prob_active": prob_active,
-                "mag_log": mag_log,
-                "positive_mag": positive_mag,
+                "level_log_hat": level_log_hat,
+                "exp_occ_logit": exp_occ_logit,
+                "prob_exp_active": prob_exp_active,
+                "dem_occ_logit": dem_occ_logit.squeeze(-1),
+                "prob_demand_active": prob_demand_active,
             }
 
-        return pred_level
+        return level_log_hat
 
 
 class ExposureForecastModel(nn.Module):
@@ -577,8 +639,7 @@ class ExposureForecastModel(nn.Module):
 
     def forward(self, x, future_context, return_components=False):
         h_t = self.encoder(x)
-        out = self.decoder(h_t, future_context, return_components=return_components)
-        return out
+        return self.decoder(h_t, future_context, return_components=return_components)
 
 
 # ============================================================
@@ -590,34 +651,26 @@ def exposure_loss(
     true_total,
     true_buy,
     true_instock,
+    true_demand=None,
     w_total=0.30,
     w_buy=0.60,
     w_instock=1.00,
     mean_weight=0.20,
-    occ_weight=0.80,
-    mag_weight=1.00,
-    level_weight=0.50,
-    zero_calib_weight=0.10,
+    exp_occ_weight=0.30,
+    demand_occ_weight=0.08,
+    block_calib_weight=0.10,
 ):
     """
-    Occurrence x Magnitude exposure loss.
+    Direct level loss + auxiliary exposure occurrence + auxiliary demand occurrence.
 
-    model_out is a dict from decoder:
-      pred_level: final point prediction
-      occ_logit: active logits
-      mag_log: log1p positive magnitude
+    Important:
+      Future true demand is used only as an auxiliary label.
+      It is not used as input.
 
-    Loss pieces:
-      1. occ_loss:
-           BCE(active_logit, y > 0)
-      2. mag_loss:
-           positive-only Huber(log magnitude, log1p(y))
-      3. level_loss:
-           Huber(log1p(final_pred), log1p(y)) over all rows
-      4. mean_loss:
-           mean calibration in log space
-      5. zero_calib_loss:
-           encourage average predicted active probability to match true active rate
+    Main prediction remains direct level:
+      pred_total_dph
+      pred_buy_box_dph
+      pred_instock_dph
     """
     true = torch.stack(
         [
@@ -629,63 +682,78 @@ def exposure_loss(
     )
 
     target_log = torch.log1p(true)
-    active = (true > 0).float()
+    exp_active = (true > 0).float()
 
     pred_level = model_out["pred_level"]
-    occ_logit = model_out["occ_logit"]
-    mag_log = model_out["mag_log"]
-    prob_active = model_out["prob_active"]
+    level_log_hat = model_out["level_log_hat"]
+    exp_occ_logit = model_out["exp_occ_logit"]
 
     weights = torch.tensor(
         [w_total, w_buy, w_instock],
-        dtype=pred_level.dtype,
-        device=pred_level.device,
+        dtype=level_log_hat.dtype,
+        device=level_log_hat.device,
     ).view(1, 1, 3)
 
-    # Occurrence loss: helps zero / low-exposure ASINs.
-    bce = F.binary_cross_entropy_with_logits(
-        occ_logit,
-        active,
-        reduction="none",
-    )
-    occ_loss = (bce * weights).mean()
-
-    # Magnitude loss only on positive observations.
-    pos_mask = active
-    mag_err = F.huber_loss(
-        mag_log,
-        target_log,
-        delta=1.0,
-        reduction="none",
-    )
-    mag_loss = (mag_err * pos_mask * weights).sum() / ((pos_mask * weights).sum() + 1e-8)
-
-    # Final level loss on all rows.
-    pred_log_final = torch.log1p(pred_level.clamp(min=0.0))
+    # Main direct level loss.
     level_err = F.huber_loss(
-        pred_log_final,
+        level_log_hat,
         target_log,
         delta=1.0,
         reduction="none",
     )
     level_loss = (level_err * weights).mean()
 
-    # Mean calibration.
+    # Auxiliary exposure occurrence loss.
+    exp_occ_err = F.binary_cross_entropy_with_logits(
+        exp_occ_logit,
+        exp_active,
+        reduction="none",
+    )
+    exp_occ_loss = (exp_occ_err * weights).mean()
+
+    # Auxiliary demand occurrence loss.
+    dem_occ_loss = torch.tensor(0.0, device=level_log_hat.device)
+    if true_demand is not None and "dem_occ_logit" in model_out:
+        dem_active = (true_demand.clamp(min=0) > 0).float()
+        dem_occ_loss = F.binary_cross_entropy_with_logits(
+            model_out["dem_occ_logit"],
+            dem_active,
+            reduction="mean",
+        )
+
+    # Overall mean calibration.
     mean_pred = torch.log1p(pred_level.mean(dim=(0, 1)))
     mean_true = torch.log1p(true.mean(dim=(0, 1)))
     mean_loss = torch.mean(torch.abs(mean_pred - mean_true) * weights.view(3))
 
-    # Active-rate calibration.
-    prob_mean = prob_active.mean(dim=(0, 1))
-    active_mean = active.mean(dim=(0, 1))
-    zero_calib_loss = torch.mean(torch.abs(prob_mean - active_mean) * weights.view(3))
+    # Block-wise calibration.
+    B, H, _ = true.shape
+    idx = torch.arange(H, device=true.device)
+    masks = [
+        idx <= 4,
+        (idx >= 5) & (idx <= 11),
+        idx >= 12,
+    ]
+
+    block_losses = []
+    for m in masks:
+        if m.sum() == 0:
+            continue
+        pred_m = torch.log1p(pred_level[:, m, :].mean(dim=(0, 1)))
+        true_m = torch.log1p(true[:, m, :].mean(dim=(0, 1)))
+        block_losses.append(torch.mean(torch.abs(pred_m - true_m) * weights.view(3)))
+
+    if len(block_losses) > 0:
+        block_calib_loss = torch.stack(block_losses).mean()
+    else:
+        block_calib_loss = torch.tensor(0.0, device=true.device)
 
     return (
-        occ_weight * occ_loss
-        + mag_weight * mag_loss
-        + level_weight * level_loss
+        level_loss
+        + exp_occ_weight * exp_occ_loss
+        + demand_occ_weight * dem_occ_loss
         + mean_weight * mean_loss
-        + zero_calib_weight * zero_calib_loss
+        + block_calib_weight * block_calib_loss
     )
 
 def train_exposure_model(
@@ -719,6 +787,7 @@ def train_exposure_model(
                 b["future_total_dph"],
                 b["future_buy_box_dph"],
                 b["future_instock_dph"],
+                true_demand=b.get("future_demand", None),
                 w_total=w_total,
                 w_buy=w_buy,
                 w_instock=w_instock,
@@ -788,7 +857,8 @@ def predict_exposure(model, va_ld):
         for b in va_ld:
             model_out = model(b["x"], b["future_context"], return_components=True)
             pred = model_out["pred_level"].clamp(min=0).cpu().numpy()
-            prob_active = model_out["prob_active"].cpu().numpy()
+            prob_exp_active = model_out["prob_exp_active"].cpu().numpy()
+            prob_demand_active = model_out["prob_demand_active"].cpu().numpy()
 
             B, H = b["future_instock_dph"].shape
 
@@ -802,17 +872,18 @@ def predict_exposure(model, va_ld):
 
                             "true_total_dph": b["future_total_dph"][i, h].item(),
                             "pred_total_dph": pred[i, h, 0],
-                            "prob_total_active": prob_active[i, h, 0],
+                            "prob_total_active": prob_exp_active[i, h, 0],
 
                             "true_buy_box_dph": b["future_buy_box_dph"][i, h].item(),
                             "pred_buy_box_dph": pred[i, h, 1],
-                            "prob_buy_box_active": prob_active[i, h, 1],
+                            "prob_buy_box_active": prob_exp_active[i, h, 1],
 
                             "true_instock_dph": b["future_instock_dph"][i, h].item(),
                             "pred_instock_dph": pred[i, h, 2],
-                            "prob_instock_active": prob_active[i, h, 2],
+                            "prob_instock_active": prob_exp_active[i, h, 2],
 
                             "true_demand": b["future_demand"][i, h].item(),
+                            "prob_demand_active": prob_demand_active[i, h],
                         }
                     )
 
@@ -1085,14 +1156,16 @@ def run_exposure_only(
     pred_df = add_naive_baselines_from_loader(pred_df, va_ld, context_cols)
     diagnostics = print_exposure_diagnostics(pred_df)
     exposure_quality = diagnose_exposure_prediction_quality(pred_df)
-    active_head_diag = diagnose_occ_mag_active_head(pred_df)
+    block_head_diag = diagnose_block_head_direction(pred_df)
+    aux_demand_occ_diag = diagnose_aux_demand_occ_head(pred_df)
 
     return {
         "model": model,
         "forecast_df": pred_df,
         "diagnostics": diagnostics,
         "exposure_quality": exposure_quality,
-        "active_head_diag": active_head_diag,
+        "block_head_diag": block_head_diag,
+        "aux_demand_occ_diag": aux_demand_occ_diag,
         "tr_ld": tr_ld,
         "va_ld": va_ld,
         "context_cols": context_cols,
@@ -1198,7 +1271,7 @@ def diagnose_exposure_prediction_quality(pred_df):
             "top10_precision": top_precision,
             "top10_recall": top_recall,
             "zero_rate_true": np.mean(y <= 0),
-            "zero_rate_pred": np.mean(p <= 1e-3),
+            "zero_rate_pred": np.mean(p <= 1e-8),
         })
 
     overall_df = pd.DataFrame(overall_rows)
@@ -1379,29 +1452,162 @@ Prefer:
 
 
 
-def diagnose_occ_mag_active_head(pred_df):
+def diagnose_aux_occ_head_by_horizon(pred_df):
     """
-    Diagnostic for Occ x Mag active probabilities.
+    Check whether auxiliary occurrence head is useful by horizon.
+
+    Important:
+      This head is not multiplied into final prediction.
+      We only use it as auxiliary signal and optional future confidence feature.
     """
-    prob_cols = [
+    targets = [
         ("total_dph", "true_total_dph", "prob_total_active"),
         ("buy_box_dph", "true_buy_box_dph", "prob_buy_box_active"),
         ("in_stock_dph", "true_instock_dph", "prob_instock_active"),
     ]
 
     rows = []
-    for name, true_col, prob_col in prob_cols:
-        if prob_col not in pred_df.columns:
-            continue
+    for h, g in pred_df.groupby("horizon"):
+        for name, true_col, prob_col in targets:
+            if prob_col not in g.columns:
+                continue
+            y = (g[true_col].values > 0).astype(int)
+            p = g[prob_col].values
+            rows.append({
+                "horizon": h,
+                "target": name,
+                "true_active_rate": y.mean(),
+                "pred_prob_mean": np.mean(p),
+                "prob_AUC": _auc(y, p),
+                "prob_p10": np.quantile(p, 0.10),
+                "prob_p50": np.quantile(p, 0.50),
+                "prob_p90": np.quantile(p, 0.90),
+            })
 
-        y_active = (pred_df[true_col].values > 0).astype(int)
-        p = pred_df[prob_col].values
+    out = pd.DataFrame(rows)
 
+    print("\n" + "=" * 100)
+    print("AUX OCC HEAD BY HORIZON")
+    print("=" * 100)
+    if len(out) == 0:
+        print("No prob_*_active columns found.")
+    else:
+        print(out.round(5).to_string(index=False))
+
+    return out
+
+
+def diagnose_horizon_block_summary(pred_df):
+    """
+    Summarize exposure quality by horizon block:
+      short: h=1-5
+      mid:   h=6-12
+      long:  h=13-20
+
+    This is the key diagnostic for checking if block-specific heads help.
+    """
+    df = pred_df.copy()
+    df["horizon_block"] = pd.cut(
+        df["horizon"],
+        bins=[0, 5, 12, 20],
+        labels=["short_1_5", "mid_6_12", "long_13_20"],
+        include_lowest=True,
+    )
+
+    targets = [
+        ("total_dph", "true_total_dph", "pred_total_dph"),
+        ("buy_box_dph", "true_buy_box_dph", "pred_buy_box_dph"),
+        ("in_stock_dph", "true_instock_dph", "pred_instock_dph"),
+    ]
+
+    rows = []
+    for block, g in df.groupby("horizon_block", observed=True):
+        for name, true_col, pred_col in targets:
+            y = g[true_col].values
+            p = g[pred_col].values
+            rows.append({
+                "block": block,
+                "target": name,
+                "true_mean": np.mean(y),
+                "pred_mean": np.mean(p),
+                "ratio": np.mean(p) / (np.mean(y) + 1e-8),
+                "WAPE": _wape(y, p),
+                "Pearson": _corr(y, p),
+                "Spearman": _safe_spearman(y, p),
+                "active_AUC": _auc((y > 0).astype(int), p),
+            })
+
+    out = pd.DataFrame(rows)
+
+    print("\n" + "=" * 100)
+    print("HORIZON BLOCK SUMMARY")
+    print("=" * 100)
+    print(out.round(5).to_string(index=False))
+
+    print("\nFocus: if long_13_20 improves WAPE/corr without hurting short_1_5 too much, block heads are useful.")
+
+    return out
+
+
+def diagnose_block_head_direction(pred_df):
+    """
+    Compact judgement for whether block-specific heads help in_stock_dph.
+    """
+    block_summary = diagnose_horizon_block_summary(pred_df)
+    aux_occ = diagnose_aux_occ_head_by_horizon(pred_df)
+
+    focus = block_summary[block_summary["target"] == "in_stock_dph"].copy()
+
+    print("\n" + "=" * 100)
+    print("BLOCK HEAD QUICK JUDGMENT: IN_STOCK_DPH")
+    print("=" * 100)
+    print(focus.round(5).to_string(index=False))
+
+    return {
+        "block_summary": block_summary,
+        "aux_occ_by_horizon": aux_occ,
+    }
+
+
+
+
+def diagnose_aux_demand_occ_head(pred_df):
+    """
+    Check auxiliary demand occurrence head.
+
+    This is only an auxiliary training target for exposure representation.
+    It should not be interpreted as the final demand forecast.
+    """
+    if "prob_demand_active" not in pred_df.columns:
+        print("No prob_demand_active found.")
+        return None
+
+    df = pred_df.copy()
+    df["true_demand_active"] = (df["true_demand"] > 0).astype(int)
+
+    rows = []
+
+    y = df["true_demand_active"].values
+    p = df["prob_demand_active"].values
+
+    rows.append({
+        "scope": "overall",
+        "true_active_rate": y.mean(),
+        "pred_prob_mean": p.mean(),
+        "AUC": _auc(y, p),
+        "prob_p10": np.quantile(p, 0.10),
+        "prob_p50": np.quantile(p, 0.50),
+        "prob_p90": np.quantile(p, 0.90),
+    })
+
+    for h, g in df.groupby("horizon"):
+        y = g["true_demand_active"].values
+        p = g["prob_demand_active"].values
         rows.append({
-            "target": name,
-            "true_active_rate": y_active.mean(),
+            "scope": f"h{int(h)}",
+            "true_active_rate": y.mean(),
             "pred_prob_mean": p.mean(),
-            "prob_AUC": _auc(y_active, p),
+            "AUC": _auc(y, p),
             "prob_p10": np.quantile(p, 0.10),
             "prob_p50": np.quantile(p, 0.50),
             "prob_p90": np.quantile(p, 0.90),
@@ -1410,15 +1616,12 @@ def diagnose_occ_mag_active_head(pred_df):
     out = pd.DataFrame(rows)
 
     print("\n" + "=" * 100)
-    print("OCC x MAG ACTIVE HEAD DIAGNOSTIC")
+    print("AUX DEMAND OCC HEAD DIAGNOSTIC")
     print("=" * 100)
-
-    if len(out) == 0:
-        print("No prob_*_active columns found.")
-    else:
-        print(out.round(5).to_string(index=False))
+    print(out.round(5).to_string(index=False))
 
     return out
+
 
 # ============================================================
 # Usage
