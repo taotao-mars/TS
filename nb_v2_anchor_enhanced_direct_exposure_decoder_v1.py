@@ -730,10 +730,10 @@ def load_real_data(data_raw, dph_cap_q=0.995):
     print("History in_stock_dph: raw historical value, no lag shift")
     print("Future context excludes in_stock_dph")
     print("Future context includes distance_* calendar features")
-    print("Lag-aware direct demand: predicted same-week DPH + lag1/lag2/lag4 DPH features")
+    print("TCN exposure decoder: direct 20-week point prediction over future horizon")
     print("Stock decoder safe mode: excludes future true total_dph and buy_box_dph")
     print("Safe historical DPH proxies: total/buy_box/in_stock last/mean4/mean13")
-    print("Lag-aware direct demand uses historical DPH proxies and predicted future DPH lags")
+    print("TCN decoder uses hist total/buy_box/in_stock anchors plus season/event/static context")
     print("History encoder includes DPH funnel features")
     print(f"DPH cap q: {dph_cap_q} | cap value: {dph_cap}")
     print(f"Context dim: {len(context_cols)}")
@@ -972,28 +972,82 @@ class Epinet(nn.Module):
 
 
 
-class DirectExposureDecoder(nn.Module):
+class HorizonTCNBlock(nn.Module):
     """
-    Direct multi-output exposure decoder.
+    Residual TCN block over future horizon dimension.
+    """
+    def __init__(self, d_model, kernel_size=3, dilation=1, dropout=0.10):
+        super().__init__()
+        padding = dilation * (kernel_size - 1) // 2
+        self.conv1 = nn.Conv1d(d_model, d_model, kernel_size=kernel_size, dilation=dilation, padding=padding)
+        self.conv2 = nn.Conv1d(d_model, d_model, kernel_size=kernel_size, dilation=dilation, padding=padding)
+        self.dropout = nn.Dropout(dropout)
+        self.norm = nn.LayerNorm(d_model)
 
-    Predicts the full future exposure path in one forward pass.
-    No future true DPH is used.
-    No recursive rollout is used.
+    def forward(self, x):
+        residual = x
+        z = x.transpose(1, 2)
+        z = self.conv1(z)
+        z = F.relu(z)
+        z = self.dropout(z)
+        z = self.conv2(z)
+        z = F.relu(z)
+        z = self.dropout(z)
+        z = z.transpose(1, 2)
+
+        if z.shape[1] != residual.shape[1]:
+            min_len = min(z.shape[1], residual.shape[1])
+            z = z[:, :min_len, :]
+            residual = residual[:, :min_len, :]
+
+        return self.norm(residual + z)
+
+
+class TCNExposureDecoder(nn.Module):
     """
-    def __init__(self, d_model, context_dim, horizon=20, hidden=64):
+    TCN point exposure decoder.
+
+    Directly predicts the full future exposure path:
+        log1p(total_dph_hat)
+        log1p(buy_box_dph_hat)
+        log1p(in_stock_dph_hat)
+
+    No ratio output.
+    No future true DPH input.
+    No autoregressive rollout.
+    """
+    def __init__(self, d_model, context_dim, horizon=20, hidden=96,
+                 n_blocks=3, kernel_size=3, dropout=0.10):
         super().__init__()
         self.horizon = horizon
-        self.net = nn.Sequential(
+
+        self.input_proj = nn.Sequential(
             nn.Linear(d_model + context_dim + 2, hidden),
             nn.ReLU(),
-            nn.Dropout(0.10),
+            nn.Dropout(dropout),
+        )
+
+        dilations = [1, 2, 4][:n_blocks]
+        self.tcn = nn.ModuleList([
+            HorizonTCNBlock(
+                d_model=hidden,
+                kernel_size=kernel_size,
+                dilation=d,
+                dropout=dropout,
+            )
+            for d in dilations
+        ])
+
+        self.out = nn.Sequential(
             nn.Linear(hidden, hidden),
             nn.ReLU(),
+            nn.Dropout(dropout * 0.5),
             nn.Linear(hidden, 3),
         )
 
     def forward(self, h_t, future_context):
         B, H, C = future_context.shape
+
         h_rep = h_t.unsqueeze(1).expand(B, H, h_t.shape[-1])
 
         horizon_idx = torch.arange(H, device=future_context.device).float()
@@ -1002,10 +1056,15 @@ class DirectExposureDecoder(nn.Module):
         horizon_sin = torch.sin(2 * np.pi * horizon_idx)
         horizon_cos = torch.cos(2 * np.pi * horizon_idx)
 
-        inp = torch.cat([h_rep, future_context, horizon_sin, horizon_cos], dim=-1)
+        x = torch.cat([h_rep, future_context, horizon_sin, horizon_cos], dim=-1)
 
-        exposure_log_hat = self.net(inp)
+        z = self.input_proj(x)
+        for block in self.tcn:
+            z = block(z)
+
+        exposure_log_hat = self.out(z)
         exposure_log_hat = F.softplus(exposure_log_hat)
+
         return exposure_log_hat
 
 
@@ -1023,13 +1082,8 @@ class TCN_ENN(nn.Module):
         self.encoder = TCNSparseAttnEncoder(input_dim, d_model, horizon)
 
         if use_stock_decoder:
-            self.stock_decoder = DirectExposureDecoder(d_model, context_dim, horizon)
-            # Demand head receives:
-            #   same-week predicted DPH_hat: 3
-            #   lag1 exposure feature:       3
-            #   lag2 exposure feature:       3
-            #   lag4 exposure feature:       3
-            z_context_dim = context_dim + 12
+            self.stock_decoder = TCNExposureDecoder(d_model, context_dim, horizon)
+            z_context_dim = context_dim + 3  # add predicted log1p(total/buy_box/in_stock DPH hats)
         else:
             self.stock_decoder = None
             z_context_dim = context_dim
@@ -1037,126 +1091,24 @@ class TCN_ENN(nn.Module):
         self.z_generator = ContextZGenerator(d_model, z_context_dim, d_z, horizon)
         self.epinet = Epinet(d_model, d_z, horizon, prior_scale)
 
-    def _initial_hist_log_state_from_context(self, future_context):
-        """
-        Extract historical true DPH log states from context proxies.
-
-        Expected proxy order at the end of future_context:
-            -9 hist_total_dph_last_log
-            -8 hist_total_dph_mean4_log
-            -7 hist_total_dph_mean13_log
-            -6 hist_buy_box_dph_last_log
-            -5 hist_buy_box_dph_mean4_log
-            -4 hist_buy_box_dph_mean13_log
-            -3 hist_instock_dph_last_log
-            -2 hist_instock_dph_mean4_log
-            -1 hist_instock_dph_mean13_log
-        """
-        B, H, C = future_context.shape
-
-        if C >= 9:
-            last = torch.stack([
-                future_context[:, 0, -9],
-                future_context[:, 0, -6],
-                future_context[:, 0, -3],
-            ], dim=-1)
-
-            mean4 = torch.stack([
-                future_context[:, 0, -8],
-                future_context[:, 0, -5],
-                future_context[:, 0, -2],
-            ], dim=-1)
-
-            mean13 = torch.stack([
-                future_context[:, 0, -7],
-                future_context[:, 0, -4],
-                future_context[:, 0, -1],
-            ], dim=-1)
-        else:
-            last = torch.zeros(B, 3, device=future_context.device, dtype=future_context.dtype)
-            mean4 = torch.zeros_like(last)
-            mean13 = torch.zeros_like(last)
-
-        return last, mean4, mean13
-
-    def _make_lag_exposure_features(self, exposure_log_hat, future_context):
-        """
-        Build leak-free lag exposure features for demand model.
-
-        For demand at future step h:
-            lag1 feature represents exposure at T+h-1
-            lag2 feature represents exposure at T+h-2
-            lag4 feature represents exposure at T+h-4
-
-        If that exposure time is <= T, use historical true proxy.
-        If that exposure time is future, use predicted exposure_log_hat.
-        """
-        B, H, _ = exposure_log_hat.shape
-        hist_last, hist_mean4, hist_mean13 = self._initial_hist_log_state_from_context(future_context)
-
-        lag1_list = []
-        lag2_list = []
-        lag4_list = []
-
-        for step in range(H):
-            if step - 1 >= 0:
-                lag1 = exposure_log_hat[:, step - 1, :]
-            else:
-                lag1 = hist_last
-
-            if step - 2 >= 0:
-                lag2 = exposure_log_hat[:, step - 2, :]
-            else:
-                lag2 = hist_mean4
-
-            if step - 4 >= 0:
-                lag4 = exposure_log_hat[:, step - 4, :]
-            else:
-                lag4 = hist_mean4
-
-            lag1_list.append(lag1.unsqueeze(1))
-            lag2_list.append(lag2.unsqueeze(1))
-            lag4_list.append(lag4.unsqueeze(1))
-
-        lag1_feat = torch.cat(lag1_list, dim=1)
-        lag2_feat = torch.cat(lag2_list, dim=1)
-        lag4_feat = torch.cat(lag4_list, dim=1)
-
-        return lag1_feat, lag2_feat, lag4_feat
-
     def _augment_context_with_stock_hat(self, h_t, future_context):
         """
-        Direct exposure prediction + lag-aware demand features.
+        Direct TCN exposure prediction.
 
-        Demand head receives:
-            same-week predicted exposure_log_hat
-            lag1 exposure feature
-            lag2 exposure feature
-            lag4 exposure feature
+        Demand head sees predicted exposure hats only:
+            total_dph_hat, buy_box_dph_hat, in_stock_dph_hat
 
         No true future DPH is used.
+        No recursive lag rollout is used.
         """
         if not self.use_stock_decoder:
             return future_context, None
 
         exposure_log_hat = self.stock_decoder(h_t, future_context)  # [B, H, 3]
-
-        lag1_feat, lag2_feat, lag4_feat = self._make_lag_exposure_features(
-            exposure_log_hat,
-            future_context,
-        )
-
         future_context_aug = torch.cat(
-            [
-                future_context,
-                exposure_log_hat,
-                lag1_feat,
-                lag2_feat,
-                lag4_feat,
-            ],
+            [future_context, exposure_log_hat],
             dim=-1,
         )
-
         return future_context_aug, exposure_log_hat
 
     def forward(self, x, future_context, nZ=8):
@@ -3268,85 +3220,163 @@ def diagnose_ar_exposure_rollout(result):
 
 
 
-def diagnose_lag_aware_demand_features(result, n_batches=1):
+def diagnose_tcn_decoder_context_columns(result):
     """
-    Check lag-aware direct demand feature construction.
+    Check important context columns for TCN exposure decoder.
     """
     context_cols = result.get("context_cols", [])
     model = result.get("model", None)
-    forecast_df = result.get("forecast_df", None)
 
-    proxy_cols = [
-        "hist_total_dph_last_log",
-        "hist_total_dph_mean4_log",
-        "hist_total_dph_mean13_log",
-        "hist_buy_box_dph_last_log",
-        "hist_buy_box_dph_mean4_log",
-        "hist_buy_box_dph_mean13_log",
-        "hist_instock_dph_last_log",
-        "hist_instock_dph_mean4_log",
-        "hist_instock_dph_mean13_log",
+    seasonal_cols = [
+        "order_month",
+        "month_sin",
+        "month_cos",
+        "season_winter",
+        "season_spring",
+        "season_summer",
+        "season_fall",
+    ]
+
+    dph_proxy_cols = [
+        c for c in context_cols
+        if c.startswith("hist_total_dph")
+        or c.startswith("hist_buy_box_dph")
+        or c.startswith("hist_instock_dph")
+    ]
+
+    holiday_cols = [c for c in context_cols if c.startswith("holiday_indicator_")]
+    distance_cols = [c for c in context_cols if c.startswith("distance_")]
+    proximity_cols = [c for c in context_cols if c.endswith("_proximity")]
+
+    product_related = [
+        c for c in context_cols
+        if any(k in c.lower() for k in [
+            "gl", "category", "product", "band", "review", "rating", "rank"
+        ])
     ]
 
     print("\\n" + "=" * 80)
-    print("LAG-AWARE DIRECT DEMAND FEATURE CHECK")
+    print("TCN EXPOSURE DECODER CONTEXT CHECK")
     print("=" * 80)
 
-    print("\\nHistorical proxy columns:")
-    print({c: (c in context_cols) for c in proxy_cols})
+    if model is not None and hasattr(model, "stock_decoder"):
+        print("Stock decoder class:", type(model.stock_decoder).__name__)
 
-    if model is not None:
-        print("\\nStock decoder class:")
-        print(type(model.stock_decoder).__name__ if hasattr(model, "stock_decoder") else "No stock_decoder")
+    print("\\nSeasonal cols:")
+    print({c: (c in context_cols) for c in seasonal_cols})
 
-    if forecast_df is not None:
-        needed = [
-            "pred_total_dph_hat",
-            "pred_buy_box_dph_hat",
-            "pred_instock_dph_hat",
-            "true_future_total_dph",
-            "true_future_buy_box_dph",
-            "true_future_instock",
-        ]
-        print("\\nForecast columns:")
-        print({c: (c in forecast_df.columns) for c in needed})
+    print("\\nHoliday indicator cols count:", len(holiday_cols))
+    print(holiday_cols[:30])
 
-        cols = [c for c in needed if c in forecast_df.columns]
-        print("\\nExposure prediction summary:")
-        print(forecast_df[cols].describe().round(4))
+    print("\\nDistance cols count:", len(distance_cols))
+    print(distance_cols[:30])
 
-    print("\\nInterpretation:")
-    print("""
-This version is strict leak-free:
-  - same-week future DPH is predicted by decoder
-  - lag1/lag2/lag4 demand features are constructed from:
-      historical true DPH proxies when available
-      previous predicted DPH_hat for future lag positions
-  - no true future DPH is fed as model input
-""")
+    print("\\nProximity cols count:", len(proximity_cols))
+    print(proximity_cols[:30])
 
-    return None
+    print("\\nHistorical DPH proxy cols:")
+    print(dph_proxy_cols)
+
+    print("\\nProduct/static related context cols:")
+    print(product_related)
+
+    return {
+        "seasonal": {c: (c in context_cols) for c in seasonal_cols},
+        "holiday_cols": holiday_cols,
+        "distance_cols": distance_cols,
+        "proximity_cols": proximity_cols,
+        "dph_proxy_cols": dph_proxy_cols,
+        "product_related": product_related,
+    }
 
 
-def explain_lag_aware_direct_setting():
+def diagnose_tcn_decoder_path_smoothness(result):
+    """
+    Check whether the TCN decoder produces smoother future exposure paths.
+    """
+    forecast_df = result.get("forecast_df", None)
+    if forecast_df is None:
+        print("No forecast_df found.")
+        return None
+
+    df = forecast_df.copy()
+
+    pairs = [
+        ("total_dph", "pred_total_dph_hat"),
+        ("buy_box_dph", "pred_buy_box_dph_hat"),
+        ("in_stock_dph", "pred_instock_dph_hat"),
+    ]
+
+    rows = []
+    if "asin" not in df.columns or "horizon" not in df.columns:
+        print("forecast_df needs asin and horizon columns.")
+        return None
+
+    for name, pred_col in pairs:
+        vals = []
+        rel_vals = []
+        for asin, g in df.sort_values(["asin", "horizon"]).groupby("asin"):
+            p = pd.to_numeric(g[pred_col], errors="coerce").fillna(0).clip(lower=0).values
+            if len(p) > 1:
+                diff = np.abs(np.diff(p))
+                vals.append(diff.mean())
+                rel_vals.append(diff.mean() / (np.mean(p) + 1e-8))
+
+        rows.append({
+            "target": name,
+            "avg_abs_week_to_week_change": np.nanmean(vals) if len(vals) else np.nan,
+            "avg_relative_week_to_week_change": np.nanmean(rel_vals) if len(rel_vals) else np.nan,
+            "num_asins": len(vals),
+        })
+
+    out = pd.DataFrame(rows)
+
     print("\\n" + "=" * 80)
-    print("LAG-AWARE DIRECT SETTING")
+    print("TCN DECODER PATH SMOOTHNESS CHECK")
     print("=" * 80)
-    print("""
-This version uses the lag diagnostic result:
+    print(out)
 
-  lag0 is strongest:
-      demand_t depends heavily on contemporaneous DPH_t
+    return out
 
-  lag4 is still strong:
-      historical DPH has persistence / carry-over
 
-So the model gives demand head both:
-  1. predicted same-week future DPH_hat_{T+h}
-  2. lagged DPH features for T+h-1, T+h-2, T+h-4
+def check_candidate_static_cols(data_raw1):
+    """
+    Check which GL/category/top-band/review columns exist in the raw data.
+    """
+    candidates = [
+        "gl_product_group",
+        "gl_product_group_desc",
+        "category_code",
+        "product_type",
+        "product_type_name",
+        "top_band",
+        "glance_view_band",
+        "glance_view_band_cat",
+        "customer_review_count",
+        "review_count",
+        "customer_average_review_rating",
+        "avg_review_rating",
+        "brand",
+        "brand_code",
+        "asin_birthday",
+        "word_count",
+    ]
 
-For early horizons, lagged features come from true historical DPH proxies.
-For later horizons, lagged features come from predicted DPH_hat.
+    found = [c for c in candidates if c in data_raw1.columns]
 
-This is deployable as a strict fixed-origin 20-week forecast.
-""")
+    related = [
+        c for c in data_raw1.columns
+        if any(k in c.lower() for k in ["gl", "category", "product", "band", "review", "rating", "rank"])
+    ]
+
+    print("\\n" + "=" * 80)
+    print("FOUND CANDIDATE STATIC / PRODUCT FEATURES")
+    print("=" * 80)
+    print("Found candidates:")
+    print(found)
+
+    print("\\nColumns containing gl/category/product/band/review/rating/rank:")
+    print(related)
+
+    return found, related
+
