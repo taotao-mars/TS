@@ -450,10 +450,53 @@ def load_real_data(data_raw, dph_cap_q=0.995):
     distance_cols = [c for c in data_raw.columns if c.startswith("distance_")]
     stock_extra_raw_cols = _select_stock_decoder_extra_cols(data_raw)
     pkg_cols = _infer_pkg_dimension_cols(data_raw)
-    # Future-known context features. Exclude in_stock_dph because future traffic is unknown.
-    # Future-known context features. Exclude in_stock_dph because future traffic is unknown.
-    # Include holiday indicators and distance-to-holiday scalar features.
-    context_cols = ["our_price"] + holiday_cols + distance_cols
+
+    # ------------------------------------------------------------
+    # Future-known context features.
+    # We add business seasonality and major shopping-event proximity
+    # BEFORE keep_cols is created, so these columns truly enter future_context.
+    # ------------------------------------------------------------
+    data_raw = data_raw.copy()
+    data_raw["order_week"] = pd.to_datetime(data_raw["order_week"], errors="coerce")
+    data_raw["order_month"] = data_raw["order_week"].dt.month.astype(float)
+    data_raw["month_sin"] = np.sin(2 * np.pi * data_raw["order_month"] / 12.0)
+    data_raw["month_cos"] = np.cos(2 * np.pi * data_raw["order_month"] / 12.0)
+
+    data_raw["season_winter"] = data_raw["order_month"].isin([12, 1, 2]).astype(float)
+    data_raw["season_spring"] = data_raw["order_month"].isin([3, 4, 5]).astype(float)
+    data_raw["season_summer"] = data_raw["order_month"].isin([6, 7, 8]).astype(float)
+    data_raw["season_fall"] = data_raw["order_month"].isin([9, 10, 11]).astype(float)
+
+    seasonal_cols = [
+        "order_month",
+        "month_sin",
+        "month_cos",
+        "season_winter",
+        "season_spring",
+        "season_summer",
+        "season_fall",
+    ]
+
+    # Major event proximity from distance_* columns.
+    # This is robust to slightly different distance column names.
+    event_keywords = [
+        "black", "cyber", "prime", "christmas", "thanksgiving",
+        "newyear", "new_year", "labor", "memorial",
+    ]
+    proximity_cols = []
+    for c in distance_cols:
+        c_lower = c.lower()
+        if any(k in c_lower for k in event_keywords):
+            new_c = f"{c}_proximity"
+            data_raw[new_c] = (
+                1.0 - pd.to_numeric(data_raw[c], errors="coerce").fillna(0.0).abs()
+            ).clip(0.0, 1.0)
+            proximity_cols.append(new_c)
+
+    # Include holiday indicators, raw distance features, explicit season features,
+    # and major-event proximity features.
+    context_cols = ["our_price"] + holiday_cols + distance_cols + seasonal_cols + proximity_cols
+    context_cols = list(dict.fromkeys(context_cols))
 
     base_cols = ["asin", "order_week", "fbi_demand", "scot_oos"]
 
@@ -493,6 +536,9 @@ def load_real_data(data_raw, dph_cap_q=0.995):
         "hist_buy_box_dph_last_log",
         "hist_buy_box_dph_mean4_log",
         "hist_buy_box_dph_mean13_log",
+        "hist_instock_dph_last_log",
+        "hist_instock_dph_mean4_log",
+        "hist_instock_dph_mean13_log",
     ]
     for c in dph_proxy_cols:
         df[c] = 0.0
@@ -684,9 +730,10 @@ def load_real_data(data_raw, dph_cap_q=0.995):
     print("History in_stock_dph: raw historical value, no lag shift")
     print("Future context excludes in_stock_dph")
     print("Future context includes distance_* calendar features")
-    print("Tempered distributional exposure decoder: mu/sigma with tau_mean=0.2 and sigma_max=1.2")
+    print("AR exposure decoder: recursive DPH rollout with last observed DPH lag")
     print("Stock decoder safe mode: excludes future true total_dph and buy_box_dph")
-    print("Safe historical DPH proxies: total_dph/buy_box_dph last/mean4/mean13")
+    print("Safe historical DPH proxies: total/buy_box/in_stock last/mean4/mean13")
+    print("AR decoder initial lag includes hist total/buy_box/in_stock last logs")
     print("History encoder includes DPH funnel features")
     print(f"DPH cap q: {dph_cap_q} | cap value: {dph_cap}")
     print(f"Context dim: {len(context_cols)}")
@@ -757,6 +804,7 @@ class DemandDataset(Dataset):
 
         total_hist = d.get("total_dph_raw", None)
         buy_hist = d.get("buy_box_dph_raw", None)
+        instock_hist = d.get("instock_raw", None)
 
         def fill(col, val):
             if col in idx:
@@ -773,6 +821,12 @@ class DemandDataset(Dataset):
             fill("hist_buy_box_dph_last_log", buy_last)
             fill("hist_buy_box_dph_mean4_log", self._safe_hist_mean(buy_hist, start, history, 4))
             fill("hist_buy_box_dph_mean13_log", self._safe_hist_mean(buy_hist, start, history, 13))
+
+        if instock_hist is not None:
+            instock_last = instock_hist[start+history-1] if history > 0 else 0.0
+            fill("hist_instock_dph_last_log", instock_last)
+            fill("hist_instock_dph_mean4_log", self._safe_hist_mean(instock_hist, start, history, 4))
+            fill("hist_instock_dph_mean13_log", self._safe_hist_mean(instock_hist, start, history, 13))
 
         return fc
 
@@ -917,62 +971,87 @@ class Epinet(nn.Module):
 
 
 
-class DistributionalExposureDecoder(nn.Module):
+class ARExposureDecoder(nn.Module):
     """
-    Distributional exposure decoder.
+    Autoregressive exposure decoder.
 
-    For each future week and each DPH target, predict parameters of:
+    It first uses the last observed historical DPH values as lag state:
+        [log1p(total_dph_T), log1p(buy_box_dph_T), log1p(in_stock_dph_T)]
 
-        log1p(DPH) ~ Normal(mu, sigma)
+    Then it rolls out future DPH path step by step:
+        step h input: h_t + future_context_h + previous predicted DPH log-state + horizon encoding
+        step h output: log1p(total/buy_box/in_stock DPH_hat_h)
 
-    Targets:
-      0. total_dph
-      1. buy_box_dph
-      2. in_stock_dph
-
-    This is designed for heavy-tailed, zero-heavy exposure variables where
-    point forecasts in log space often behave like median forecasts and
-    under-estimate the raw-scale mean.
+    This is still leak-free because after step 1 it uses its own predicted lag,
+    not true future DPH.
     """
-    def __init__(self, d_model, context_dim, horizon=20, hidden=64,
-                 sigma_min=0.05, sigma_max=1.2, tau_mean=0.2):
+    def __init__(self, d_model, context_dim, horizon=20, hidden=64):
         super().__init__()
         self.horizon = horizon
-        self.sigma_min = sigma_min
-        self.sigma_max = sigma_max
-        self.tau_mean = tau_mean
-
         self.net = nn.Sequential(
-            nn.Linear(d_model + context_dim + 2, hidden),
+            nn.Linear(d_model + context_dim + 3 + 2, hidden),
             nn.ReLU(),
             nn.Dropout(0.10),
             nn.Linear(hidden, hidden),
             nn.ReLU(),
-            nn.Linear(hidden, 6),  # 3 mus + 3 raw sigmas
+            nn.Linear(hidden, 3),
         )
+
+    def _initial_prev_log_state(self, future_context):
+        """
+        Extract initial previous DPH log-state from last observed historical proxies.
+
+        Expected proxy order at the end of future_context:
+            -9 hist_total_dph_last_log
+            -8 hist_total_dph_mean4_log
+            -7 hist_total_dph_mean13_log
+            -6 hist_buy_box_dph_last_log
+            -5 hist_buy_box_dph_mean4_log
+            -4 hist_buy_box_dph_mean13_log
+            -3 hist_instock_dph_last_log
+            -2 hist_instock_dph_mean4_log
+            -1 hist_instock_dph_mean13_log
+        """
+        B, H, C = future_context.shape
+        if C >= 9:
+            total_last = future_context[:, 0, -9]
+            buy_last = future_context[:, 0, -6]
+            instock_last = future_context[:, 0, -3]
+            prev = torch.stack([total_last, buy_last, instock_last], dim=-1)
+        else:
+            prev = torch.zeros(B, 3, device=future_context.device, dtype=future_context.dtype)
+        return prev
 
     def forward(self, h_t, future_context):
         B, H, C = future_context.shape
-        h_rep = h_t.unsqueeze(1).expand(B, H, h_t.shape[-1])
 
-        horizon_idx = torch.arange(H, device=future_context.device).float()
-        horizon_idx = horizon_idx.view(1, H, 1).expand(B, H, 1) / max(H, 1)
+        prev_log = self._initial_prev_log_state(future_context)
+        outs = []
 
-        horizon_sin = torch.sin(2 * np.pi * horizon_idx)
-        horizon_cos = torch.cos(2 * np.pi * horizon_idx)
+        for step in range(H):
+            ctx_h = future_context[:, step, :]
 
-        inp = torch.cat([h_rep, future_context, horizon_sin, horizon_cos], dim=-1)
+            horizon_val = torch.full(
+                (B, 1),
+                float(step) / max(H, 1),
+                device=future_context.device,
+                dtype=future_context.dtype,
+            )
+            horizon_sin = torch.sin(2 * np.pi * horizon_val)
+            horizon_cos = torch.cos(2 * np.pi * horizon_val)
 
-        out = self.net(inp)
+            inp = torch.cat([h_t, ctx_h, prev_log, horizon_sin, horizon_cos], dim=-1)
 
-        # mu is log1p(DPH) location. Keep nonnegative because DPH >= 0 and log1p(DPH) >= 0.
-        mu = F.softplus(out[..., :3])
+            out_log = self.net(inp)
+            out_log = F.softplus(out_log)  # log1p exposure hats, nonnegative
 
-        # sigma is log-scale uncertainty.
-        sigma = F.softplus(out[..., 3:]) + self.sigma_min
-        sigma = sigma.clamp(max=self.sigma_max)
+            outs.append(out_log.unsqueeze(1))
 
-        return mu, sigma
+            # Strict recursive rollout: next step only sees predicted lag.
+            prev_log = out_log
+
+        exposure_log_hat = torch.cat(outs, dim=1)  # [B, H, 3]
+        return exposure_log_hat
 
 
 
@@ -989,11 +1068,8 @@ class TCN_ENN(nn.Module):
         self.encoder = TCNSparseAttnEncoder(input_dim, d_model, horizon)
 
         if use_stock_decoder:
-            self.stock_decoder = DistributionalExposureDecoder(d_model, context_dim, horizon)
-            # Add distributional exposure features:
-            #   lognormal mean features for 3 DPH targets
-            #   sigma features for 3 DPH targets
-            z_context_dim = context_dim + 6
+            self.stock_decoder = ARExposureDecoder(d_model, context_dim, horizon)
+            z_context_dim = context_dim + 3  # add predicted log1p(total/buy_box/in_stock DPH hats)
         else:
             self.stock_decoder = None
             z_context_dim = context_dim
@@ -1003,48 +1079,22 @@ class TCN_ENN(nn.Module):
 
     def _augment_context_with_stock_hat(self, h_t, future_context):
         """
-        Predict distributional future exposure features and append them to future_context.
+        Predict future exposure hats and append them to future_context.
 
-        Decoder returns:
-            mu, sigma for log1p(total_dph), log1p(buy_box_dph), log1p(in_stock_dph)
+        Demand head sees predicted exposure hats only:
+            total_dph_hat, buy_box_dph_hat, in_stock_dph_hat
 
-        Demand head receives:
-            lognormal mean log-feature = log1p(E[DPH])
-            sigma
-
-        It never receives true future DPH values.
+        It never sees true future DPH values.
         """
         if not self.use_stock_decoder:
             return future_context, None
 
-        mu, sigma = self.stock_decoder(h_t, future_context)  # both [B, H, 3]
-
-        # Tempered lognormal mean feature:
-        #   tau=0   -> median-like feature exp(mu)-1
-        #   tau=1   -> full lognormal mean exp(mu + 0.5 sigma^2)-1
-        #   tau=0.2 -> conservative right-tail correction
-        tau = getattr(self.stock_decoder, "tau_mean", 0.2)
-        log_mean_feature = mu + tau * 0.5 * (sigma ** 2)
-
-        # Keep the feature scale stable.
-        log_mean_feature = log_mean_feature.clamp(min=0.0, max=16.0)
-
-        exposure_features = torch.cat(
-            [log_mean_feature, sigma],
-            dim=-1,
-        )  # [B, H, 6]
-
+        exposure_log_hat = self.stock_decoder(h_t, future_context)  # [B, H, 3]
         future_context_aug = torch.cat(
-            [future_context, exposure_features],
+            [future_context, exposure_log_hat],
             dim=-1,
         )
-
-        # Return compact tensor for loss/diagnostic:
-        # exposure_dist_hat[..., 0:3] = mu
-        # exposure_dist_hat[..., 3:6] = sigma
-        exposure_dist_hat = torch.cat([mu, sigma], dim=-1)
-
-        return future_context_aug, exposure_dist_hat
+        return future_context_aug, exposure_log_hat
 
     def forward(self, x, future_context, nZ=8):
         mu_base, alpha_base, h_t = self.encoder(x)
@@ -1126,27 +1176,22 @@ def pinball(y, pred, q):
     return torch.mean(torch.max(q*d, (q-1)*d))
 
 
-
-
-def stock_decoder_loss(exposure_dist_hat, future_instock_true,
+def stock_decoder_loss(exposure_log_hat, future_instock_true,
                        future_total_dph_true=None,
                        future_buy_box_dph_true=None,
-                       mean_weight=0.00,
-                       sigma_reg_weight=0.01,
-                       sigma_anchor=None):
+                       mean_weight=0.30):
     """
-    Tempered distributional exposure decoder loss.
+    Multi-output exposure decoder loss.
 
-    exposure_dist_hat[..., 0:3] = mu for log1p(total/buy_box/in_stock DPH)
-    exposure_dist_hat[..., 3:6] = sigma for log1p(total/buy_box/in_stock DPH)
+    The decoder predicts:
+      exposure_log_hat[..., 0] = log1p(total_dph_hat)
+      exposure_log_hat[..., 1] = log1p(buy_box_dph_hat)
+      exposure_log_hat[..., 2] = log1p(in_stock_dph_hat)
 
-    Assumption:
-        log1p(DPH) ~ Normal(mu, sigma)
-
-    We add a small sigma regularization because full lognormal mean is
-    extremely sensitive to sigma.
+    True future DPH values are used only as auxiliary supervision.
+    Demand prediction uses predicted hats only.
     """
-    if exposure_dist_hat is None:
+    if exposure_log_hat is None:
         return torch.tensor(0.0, device=future_instock_true.device)
 
     if future_total_dph_true is None:
@@ -1155,42 +1200,25 @@ def stock_decoder_loss(exposure_dist_hat, future_instock_true,
     if future_buy_box_dph_true is None:
         future_buy_box_dph_true = torch.zeros_like(future_instock_true)
 
-    mu = exposure_dist_hat[..., :3]
-    sigma = exposure_dist_hat[..., 3:].clamp(min=1e-4, max=5.0)
-
     true_stack = torch.stack([
         future_total_dph_true.clamp(min=0.0),
         future_buy_box_dph_true.clamp(min=0.0),
         future_instock_true.clamp(min=0.0),
     ], dim=-1)
 
-    y_log = torch.log1p(true_stack)
+    target_log = torch.log1p(true_stack)
 
-    # Gaussian negative log-likelihood up to constant.
-    nll = 0.5 * (((y_log - mu) / sigma) ** 2 + 2.0 * torch.log(sigma))
-    nll_loss = nll.mean()
+    point_loss = F.huber_loss(exposure_log_hat, target_log, delta=1.0)
 
-    # Penalize overly large sigma to avoid exploding lognormal means.
-    sigma_reg = sigma_reg_weight * (sigma ** 2).mean()
+    pred_level = torch.expm1(exposure_log_hat).clamp(min=0.0)
+    true_level = true_stack
 
-    loss = nll_loss + sigma_reg
+    mean_pred = torch.log1p(pred_level.mean(dim=(0, 1)))
+    mean_true = torch.log1p(true_level.mean(dim=(0, 1)))
 
-    # Optional anchor if later needed.
-    if sigma_anchor is not None:
-        loss = loss + sigma_reg_weight * ((sigma - sigma_anchor) ** 2).mean()
+    mean_loss = torch.mean(torch.abs(mean_pred - mean_true))
 
-    # Optional mean calibration on tempered/full implied raw-scale means.
-    if mean_weight is not None and mean_weight > 0:
-        pred_mean_level = torch.expm1(mu + 0.2 * 0.5 * sigma ** 2).clamp(min=0.0)
-        true_level = true_stack
-
-        mean_pred = torch.log1p(pred_mean_level.mean(dim=(0, 1)))
-        mean_true = torch.log1p(true_level.mean(dim=(0, 1)))
-        mean_loss = torch.mean(torch.abs(mean_pred - mean_true))
-
-        loss = loss + mean_weight * mean_loss
-
-    return loss
+    return point_loss + mean_weight * mean_loss
 
 
 
@@ -1425,7 +1453,7 @@ def train(
     patience=5,        # early stop
     lambda_z_reg=1.0,  # z regularization
     lambda_stock=0.05, # auxiliary exposure decoder loss weight
-    lambda_stock_mean_weight=0.00, # optional mean calibration inside distributional exposure decoder loss
+    lambda_stock_mean_weight=0.30, # mean calibration inside exposure decoder loss
 ):
     opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
     sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
@@ -1568,43 +1596,18 @@ def generate_forecast_df(model, va_ld, M=50):
                         "true_future_instock": b["future_instock"][i,h].item()
                             if "future_instock" in b else np.nan,
 
-                        # Distributional decoder outputs.
-                        "pred_total_mu": stock_log_hat[i,h,0].item()
+                        "pred_total_dph_hat": torch.expm1(stock_log_hat[i,h,0]).item()
                             if stock_log_hat is not None else np.nan,
-                        "pred_buy_box_mu": stock_log_hat[i,h,1].item()
+                        "pred_buy_box_dph_hat": torch.expm1(stock_log_hat[i,h,1]).item()
                             if stock_log_hat is not None else np.nan,
-                        "pred_instock_mu": stock_log_hat[i,h,2].item()
-                            if stock_log_hat is not None else np.nan,
-
-                        "pred_total_sigma": stock_log_hat[i,h,3].item()
-                            if stock_log_hat is not None else np.nan,
-                        "pred_buy_box_sigma": stock_log_hat[i,h,4].item()
-                            if stock_log_hat is not None else np.nan,
-                        "pred_instock_sigma": stock_log_hat[i,h,5].item()
+                        "pred_instock_dph_hat": torch.expm1(stock_log_hat[i,h,2]).item()
                             if stock_log_hat is not None else np.nan,
 
-                        # Median-like point estimate: exp(mu)-1.
-                        "pred_total_dph_median_hat": torch.expm1(stock_log_hat[i,h,0]).item()
+                        "pred_total_dph_log_hat": stock_log_hat[i,h,0].item()
                             if stock_log_hat is not None else np.nan,
-                        "pred_buy_box_dph_median_hat": torch.expm1(stock_log_hat[i,h,1]).item()
+                        "pred_buy_box_dph_log_hat": stock_log_hat[i,h,1].item()
                             if stock_log_hat is not None else np.nan,
-                        "pred_instock_dph_median_hat": torch.expm1(stock_log_hat[i,h,2]).item()
-                            if stock_log_hat is not None else np.nan,
-
-                        # Tempered mean estimate used by demand head: exp(mu + tau * 0.5 sigma^2)-1.
-                        "pred_total_dph_hat": torch.expm1(stock_log_hat[i,h,0] + 0.2 * 0.5 * stock_log_hat[i,h,3] ** 2).item()
-                            if stock_log_hat is not None else np.nan,
-                        "pred_buy_box_dph_hat": torch.expm1(stock_log_hat[i,h,1] + 0.2 * 0.5 * stock_log_hat[i,h,4] ** 2).item()
-                            if stock_log_hat is not None else np.nan,
-                        "pred_instock_dph_hat": torch.expm1(stock_log_hat[i,h,2] + 0.2 * 0.5 * stock_log_hat[i,h,5] ** 2).item()
-                            if stock_log_hat is not None else np.nan,
-
-                        # Full lognormal mean for diagnostics only.
-                        "pred_total_dph_fullmean_hat": torch.expm1(stock_log_hat[i,h,0] + 0.5 * stock_log_hat[i,h,3] ** 2).item()
-                            if stock_log_hat is not None else np.nan,
-                        "pred_buy_box_dph_fullmean_hat": torch.expm1(stock_log_hat[i,h,1] + 0.5 * stock_log_hat[i,h,4] ** 2).item()
-                            if stock_log_hat is not None else np.nan,
-                        "pred_instock_dph_fullmean_hat": torch.expm1(stock_log_hat[i,h,2] + 0.5 * stock_log_hat[i,h,5] ** 2).item()
+                        "pred_instock_log_hat": stock_log_hat[i,h,2].item()
                             if stock_log_hat is not None else np.nan,
                         "scot_oos": b["oos"][i,h].item(),
                         "oos": b["oos"][i,h].item(),
@@ -1720,7 +1723,7 @@ def run_nb_high_sparse(
     patience=5,
     lambda_z_reg=1.0,
     lambda_stock=0.05,
-    lambda_stock_mean_weight=0.00,
+    lambda_stock_mean_weight=0.30,
     dph_cap_q=0.995,
     remove_extreme=True,
     extreme_q=0.99,
@@ -1878,7 +1881,7 @@ def run_nb_high_sparse_with_wape(
     patience=5,
     lambda_z_reg=1.0,
     lambda_stock=0.05,
-    lambda_stock_mean_weight=0.00,
+    lambda_stock_mean_weight=0.30,
     dph_cap_q=0.995,
     remove_extreme=True,
     extreme_q=0.99,
@@ -2265,7 +2268,7 @@ def run_nb_high_sparse_from_sample_scot_intersection(
     patience=5,
     lambda_z_reg=1.0,
     lambda_stock=0.05,
-    lambda_stock_mean_weight=0.00,
+    lambda_stock_mean_weight=0.30,
     dph_cap_q=0.995,
     remove_extreme=True,
     extreme_q=0.99,
@@ -2423,7 +2426,7 @@ def run_nb_all_sample_scot_intersection(
     patience=5,
     lambda_z_reg=1.0,
     lambda_stock=0.05,
-    lambda_stock_mean_weight=0.00,
+    lambda_stock_mean_weight=0.30,
     dph_cap_q=0.995,
     remove_extreme=True,
     extreme_q=0.99,
@@ -2856,212 +2859,74 @@ def check_context_feature_columns(data_raw1):
 
 def diagnose_stock_decoder(result):
     """
-    Diagnose tempered distributional exposure decoder.
-
-    Reports:
-      - median-like estimate exp(mu)-1
-      - tempered mean estimate exp(mu + 0.2 * 0.5 sigma^2)-1
-      - full lognormal mean estimate exp(mu + 0.5 sigma^2)-1
-      - sigma scale
-      - horizon / season / event diagnostics when possible
+    Diagnose integrated multi-output exposure decoder.
     """
     forecast_df = result.get("forecast_df", None)
     if forecast_df is None:
         print("No forecast_df found.")
         return {}
 
-    df = forecast_df.copy()
-
-    if "order_week" in df.columns:
-        df["order_week"] = pd.to_datetime(df["order_week"])
-        df["month"] = df["order_week"].dt.month
-
-        def _season(m):
-            if m in [12, 1, 2]:
-                return "winter"
-            if m in [3, 4, 5]:
-                return "spring"
-            if m in [6, 7, 8]:
-                return "summer"
-            return "fall"
-
-        df["season"] = df["month"].apply(_season)
-        df["event_window"] = "regular"
-        df.loc[df["month"].isin([11, 12]), "event_window"] = "holiday_shopping"
-        df.loc[df["month"].isin([7, 10]), "event_window"] = "prime_like_window"
-    else:
-        df["season"] = "unknown"
-        df["event_window"] = "unknown"
-
-    targets = [
-        (
-            "total_dph",
-            "true_future_total_dph",
-            "pred_total_dph_hat",
-            "pred_total_dph_median_hat",
-            "pred_total_dph_fullmean_hat",
-            "pred_total_sigma",
-        ),
-        (
-            "buy_box_dph",
-            "true_future_buy_box_dph",
-            "pred_buy_box_dph_hat",
-            "pred_buy_box_dph_median_hat",
-            "pred_buy_box_dph_fullmean_hat",
-            "pred_buy_box_sigma",
-        ),
-        (
-            "in_stock_dph",
-            "true_future_instock",
-            "pred_instock_dph_hat",
-            "pred_instock_dph_median_hat",
-            "pred_instock_dph_fullmean_hat",
-            "pred_instock_sigma",
-        ),
+    pairs = [
+        ("total_dph", "true_future_total_dph", "pred_total_dph_hat"),
+        ("buy_box_dph", "true_future_buy_box_dph", "pred_buy_box_dph_hat"),
+        ("in_stock_dph", "true_future_instock", "pred_instock_dph_hat"),
     ]
 
-    def _summarize(g, group_name=None, group_value=None):
-        rows = []
-        for name, true_col, temp_col, median_col, full_col, sigma_col in targets:
-            if true_col not in g.columns or temp_col not in g.columns:
-                continue
-
-            y = pd.to_numeric(g[true_col], errors="coerce").fillna(0).clip(lower=0).values
-            p_temp = pd.to_numeric(g[temp_col], errors="coerce").fillna(0).clip(lower=0).values
-            p_med = pd.to_numeric(g[median_col], errors="coerce").fillna(0).clip(lower=0).values \
-                if median_col in g.columns else np.full_like(p_temp, np.nan)
-            p_full = pd.to_numeric(g[full_col], errors="coerce").fillna(0).clip(lower=0).values \
-                if full_col in g.columns else np.full_like(p_temp, np.nan)
-            sig = pd.to_numeric(g[sigma_col], errors="coerce").fillna(np.nan).values \
-                if sigma_col in g.columns else np.full_like(p_temp, np.nan)
-
-            denom = np.abs(y).sum()
-            true_mean = y.mean() if len(y) else np.nan
-
-            row = {
-                "target": name,
-                "rows": len(g),
-                "true_mean": true_mean,
-                "pred_tempered_mean": p_temp.mean() if len(p_temp) else np.nan,
-                "pred_median_mean": np.nanmean(p_med) if len(p_med) else np.nan,
-                "pred_full_mean": np.nanmean(p_full) if len(p_full) else np.nan,
-                "tempered_ratio": p_temp.mean() / (true_mean + 1e-8) if len(y) else np.nan,
-                "median_ratio": np.nanmean(p_med) / (true_mean + 1e-8) if len(y) else np.nan,
-                "full_ratio": np.nanmean(p_full) / (true_mean + 1e-8) if len(y) else np.nan,
-                "WAPE_tempered": np.abs(y - p_temp).sum() / denom if denom > 0 else np.nan,
-                "WAPE_median": np.abs(y - p_med).sum() / denom if denom > 0 and not np.isnan(p_med).all() else np.nan,
-                "WAPE_full": np.abs(y - p_full).sum() / denom if denom > 0 and not np.isnan(p_full).all() else np.nan,
-                "corr_tempered": np.corrcoef(y, p_temp)[0, 1] if len(y) and np.std(y) > 0 and np.std(p_temp) > 0 else np.nan,
-                "corr_median": np.corrcoef(y, p_med)[0, 1] if len(y) and np.std(y) > 0 and np.std(p_med) > 0 else np.nan,
-                "corr_full": np.corrcoef(y, p_full)[0, 1] if len(y) and np.std(y) > 0 and np.std(p_full) > 0 else np.nan,
-                "log_MAE_mu": np.mean(np.abs(np.log1p(y) - np.log1p(p_med))) if not np.isnan(p_med).all() else np.nan,
-                "sigma_mean": np.nanmean(sig),
-                "sigma_p90": np.nanpercentile(sig, 90) if np.isfinite(sig).any() else np.nan,
-                "true_zero_rate": (y <= 0).mean() if len(y) else np.nan,
-                "pred_zero_rate": (p_temp <= 0).mean() if len(p_temp) else np.nan,
-            }
-            if group_name is not None:
-                row[group_name] = group_value
-            rows.append(row)
-        return rows
-
-    overall = pd.DataFrame(_summarize(df))
-
+    overall_rows = []
     by_horizon_rows = []
-    if "horizon" in df.columns:
-        for h, g in df.groupby("horizon"):
-            by_horizon_rows.extend(_summarize(g, "horizon", h))
+
+    for name, true_col, pred_col in pairs:
+        if true_col not in forecast_df.columns or pred_col not in forecast_df.columns:
+            continue
+
+        y = pd.to_numeric(forecast_df[true_col], errors="coerce").fillna(0).clip(lower=0).values
+        p = pd.to_numeric(forecast_df[pred_col], errors="coerce").fillna(0).clip(lower=0).values
+
+        denom = np.abs(y).sum()
+        overall_rows.append({
+            "target": name,
+            "rows": len(forecast_df),
+            "true_mean": y.mean(),
+            "pred_mean": p.mean(),
+            "WAPE": np.abs(y - p).sum() / denom if denom > 0 else np.nan,
+            "log_MAE": np.mean(np.abs(np.log1p(y) - np.log1p(p))),
+            "corr": np.corrcoef(y, p)[0, 1] if np.std(y) > 0 and np.std(p) > 0 else np.nan,
+            "true_zero_rate": (y <= 0).mean(),
+            "pred_zero_rate": (p <= 0).mean(),
+        })
+
+        if "horizon" in forecast_df.columns:
+            for h, g in forecast_df.groupby("horizon"):
+                yh = pd.to_numeric(g[true_col], errors="coerce").fillna(0).clip(lower=0).values
+                ph = pd.to_numeric(g[pred_col], errors="coerce").fillna(0).clip(lower=0).values
+                dh = np.abs(yh).sum()
+                by_horizon_rows.append({
+                    "target": name,
+                    "horizon": h,
+                    "rows": len(g),
+                    "true_mean": yh.mean(),
+                    "pred_mean": ph.mean(),
+                    "WAPE": np.abs(yh - ph).sum() / dh if dh > 0 else np.nan,
+                    "log_MAE": np.mean(np.abs(np.log1p(yh) - np.log1p(ph))),
+                    "corr": np.corrcoef(yh, ph)[0, 1] if np.std(yh) > 0 and np.std(ph) > 0 else np.nan,
+                })
+
+    overall = pd.DataFrame(overall_rows)
     by_horizon = pd.DataFrame(by_horizon_rows)
 
-    by_season_rows = []
-    if "season" in df.columns:
-        for s, g in df.groupby("season"):
-            by_season_rows.extend(_summarize(g, "season", s))
-    by_season = pd.DataFrame(by_season_rows)
-
-    by_event_rows = []
-    if "event_window" in df.columns:
-        for e, g in df.groupby("event_window"):
-            by_event_rows.extend(_summarize(g, "event_window", e))
-    by_event = pd.DataFrame(by_event_rows)
-
     print("\n" + "=" * 80)
-    print("TEMPERED DISTRIBUTIONAL EXPOSURE DECODER DIAGNOSTIC")
+    print("INTEGRATED MULTI-OUTPUT EXPOSURE DECODER DIAGNOSTIC")
     print("=" * 80)
-
-    print("\nOverall:")
     print(overall)
 
     if len(by_horizon) > 0:
         print("\nBy horizon:")
         print(by_horizon)
 
-    if len(by_season) > 0:
-        print("\nBy season:")
-        print(by_season)
-
-    if len(by_event) > 0:
-        print("\nBy event window:")
-        print(by_event)
-
     return {
         "overall": overall,
         "by_horizon": by_horizon,
-        "by_season": by_season,
-        "by_event": by_event,
     }
-
-
-def diagnose_distributional_exposure_columns(result):
-    """
-    Check whether tempered distributional decoder outputs are present in forecast_df.
-    """
-    forecast_df = result.get("forecast_df", None)
-    if forecast_df is None:
-        print("No forecast_df found.")
-        return None
-
-    needed = [
-        "pred_total_mu", "pred_total_sigma",
-        "pred_buy_box_mu", "pred_buy_box_sigma",
-        "pred_instock_mu", "pred_instock_sigma",
-        "pred_total_dph_median_hat", "pred_total_dph_hat", "pred_total_dph_fullmean_hat",
-        "pred_buy_box_dph_median_hat", "pred_buy_box_dph_hat", "pred_buy_box_dph_fullmean_hat",
-        "pred_instock_dph_median_hat", "pred_instock_dph_hat", "pred_instock_dph_fullmean_hat",
-    ]
-
-    print("\n" + "=" * 80)
-    print("TEMPERED DISTRIBUTIONAL EXPOSURE OUTPUT COLUMN CHECK")
-    print("=" * 80)
-    print({c: (c in forecast_df.columns) for c in needed})
-
-    return {c: (c in forecast_df.columns) for c in needed}
-
-
-def diagnose_distributional_exposure_columns(result):
-    """
-    Check whether distributional decoder outputs are present in forecast_df.
-    """
-    forecast_df = result.get("forecast_df", None)
-    if forecast_df is None:
-        print("No forecast_df found.")
-        return None
-
-    needed = [
-        "pred_total_mu", "pred_total_sigma",
-        "pred_buy_box_mu", "pred_buy_box_sigma",
-        "pred_instock_mu", "pred_instock_sigma",
-        "pred_total_dph_median_hat", "pred_total_dph_hat",
-        "pred_buy_box_dph_median_hat", "pred_buy_box_dph_hat",
-        "pred_instock_dph_median_hat", "pred_instock_dph_hat",
-    ]
-
-    print("\n" + "=" * 80)
-    print("DISTRIBUTIONAL EXPOSURE OUTPUT COLUMN CHECK")
-    print("=" * 80)
-    print({c: (c in forecast_df.columns) for c in needed})
-
-    return {c: (c in forecast_df.columns) for c in needed}
 
 
 def check_stock_decoder_extra_feature_columns(data_raw1):
@@ -3154,7 +3019,7 @@ def check_safe_historical_dph_proxy_context(result, n_batches=1):
 
 
 
-# Main usage for tempered distributional exposure-decoder version:
+# Main usage for multi-output exposure-decoder version:
 #
 # result_all_intersection = run_nb_all_sample_scot_intersection(
 #     data_raw1=data_raw1,
@@ -3175,7 +3040,7 @@ def check_safe_historical_dph_proxy_context(result, n_batches=1):
 #     patience=5,
 #     lambda_z_reg=1.0,
 #     lambda_stock=0.1,
-#     lambda_stock_mean_weight=0.00,
+#     lambda_stock_mean_weight=0.30,
 #     dph_cap_q=0.995,
 #     remove_extreme=True,
 #     extreme_q=0.99,
@@ -3222,4 +3087,118 @@ def diagnose_dph_cap_effect(data_raw1, q=0.995):
     print("=" * 80)
     print(out)
     return out
+
+
+
+
+def diagnose_ar_exposure_context_columns(result):
+    """
+    Verify that AR exposure decoder has season/event/proxy columns.
+    """
+    context_cols = result.get("context_cols", [])
+    basic = [
+        "order_month",
+        "month_sin",
+        "month_cos",
+        "season_winter",
+        "season_spring",
+        "season_summer",
+        "season_fall",
+    ]
+    dph_proxy_cols = [
+        c for c in context_cols
+        if c.startswith("hist_total_dph")
+        or c.startswith("hist_buy_box_dph")
+        or c.startswith("hist_instock_dph")
+    ]
+    prox_cols = [c for c in context_cols if c.endswith("_proximity")]
+
+    print("\n" + "=" * 80)
+    print("AR EXPOSURE CONTEXT COLUMN CHECK")
+    print("=" * 80)
+    print("Basic seasonal cols:")
+    print({c: (c in context_cols) for c in basic})
+    print("\nMajor event proximity cols:")
+    print(prox_cols)
+    print("\nHistorical DPH proxy cols:")
+    print(dph_proxy_cols)
+
+    return {
+        "basic": {c: (c in context_cols) for c in basic},
+        "proximity_cols": prox_cols,
+        "dph_proxy_cols": dph_proxy_cols,
+    }
+
+
+def diagnose_ar_exposure_rollout(result):
+    """
+    Extra diagnostics for AR rollout:
+      - pred/true ratio by horizon
+      - whether error grows over horizon
+      - whether predicted DPH trajectory has persistence
+    """
+    forecast_df = result.get("forecast_df", None)
+    if forecast_df is None:
+        print("No forecast_df found.")
+        return {}
+
+    df = forecast_df.copy()
+
+    pairs = [
+        ("total_dph", "true_future_total_dph", "pred_total_dph_hat"),
+        ("buy_box_dph", "true_future_buy_box_dph", "pred_buy_box_dph_hat"),
+        ("in_stock_dph", "true_future_instock", "pred_instock_dph_hat"),
+    ]
+
+    rows = []
+    for name, true_col, pred_col in pairs:
+        if true_col not in df.columns or pred_col not in df.columns or "horizon" not in df.columns:
+            continue
+        for h, g in df.groupby("horizon"):
+            y = pd.to_numeric(g[true_col], errors="coerce").fillna(0).clip(lower=0).values
+            p = pd.to_numeric(g[pred_col], errors="coerce").fillna(0).clip(lower=0).values
+            denom = np.abs(y).sum()
+            rows.append({
+                "target": name,
+                "horizon": h,
+                "true_mean": y.mean(),
+                "pred_mean": p.mean(),
+                "pred_true_ratio": p.mean() / (y.mean() + 1e-8),
+                "WAPE": np.abs(y - p).sum() / denom if denom > 0 else np.nan,
+                "corr": np.corrcoef(y, p)[0, 1] if np.std(y) > 0 and np.std(p) > 0 else np.nan,
+            })
+
+    by_h = pd.DataFrame(rows)
+
+    print("\n" + "=" * 80)
+    print("AR EXPOSURE ROLLOUT DIAGNOSTIC BY HORIZON")
+    print("=" * 80)
+    print(by_h)
+
+    # Trajectory persistence: correlation between predicted h and h+1 within each ASIN.
+    persist_rows = []
+    if "asin" in df.columns and "horizon" in df.columns:
+        for name, true_col, pred_col in pairs:
+            if pred_col not in df.columns:
+                continue
+            vals = []
+            for asin, g in df.sort_values(["asin", "horizon"]).groupby("asin"):
+                p = pd.to_numeric(g[pred_col], errors="coerce").fillna(0).values
+                if len(p) > 1 and np.std(p[:-1]) > 0 and np.std(p[1:]) > 0:
+                    vals.append(np.corrcoef(p[:-1], p[1:])[0, 1])
+            persist_rows.append({
+                "target": name,
+                "avg_within_asin_pred_lag1_corr": np.nanmean(vals) if len(vals) else np.nan,
+                "num_asins_used": len(vals),
+            })
+
+    persist_df = pd.DataFrame(persist_rows)
+
+    print("\nPredicted trajectory persistence:")
+    print(persist_df)
+
+    return {
+        "by_horizon": by_h,
+        "persistence": persist_df,
+    }
 
