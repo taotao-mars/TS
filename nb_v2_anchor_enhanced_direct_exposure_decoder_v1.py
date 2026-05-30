@@ -1801,6 +1801,8 @@ def run_nb_high_sparse(
         "mag_gap": mag_gap_df,
         "tr_ld": tr_ld,
         "va_ld": va_ld,
+        "context_cols": context_cols,
+        "context_dim": context_dim,
     }
 
 
@@ -2393,6 +2395,8 @@ def run_nb_high_sparse_from_sample_scot_intersection(
         "mag_gap": mag_gap_df,
         "tr_ld": tr_ld,
         "va_ld": va_ld,
+        "context_cols": context_cols,
+        "context_dim": context_dim,
         "data_small": data_small,
         "data_high": data_high,
         "asin_stats": asin_stats,
@@ -3345,7 +3349,6 @@ def check_candidate_static_cols(data_raw1):
     """
     candidates = [
         "gl_product_group",
-        "gl_product_group_desc",
         "category_code",
         "product_type",
         "product_type_name",
@@ -3380,3 +3383,94 @@ def check_candidate_static_cols(data_raw1):
 
     return found, related
 
+
+
+
+def diagnose_context_from_loader(result):
+    """
+    If result['context_cols'] is missing, infer context dimension from va_ld and warn.
+    """
+    context_cols = result.get("context_cols", None)
+    context_dim = result.get("context_dim", None)
+    va_ld = result.get("va_ld", None)
+
+    print("\n" + "=" * 80)
+    print("RESULT CONTEXT STORAGE CHECK")
+    print("=" * 80)
+
+    if context_cols is None:
+        print("WARNING: result['context_cols'] is missing.")
+        print("This means previous context diagnostics will show empty lists even if model used the features.")
+    else:
+        print("context_cols length:", len(context_cols))
+        print("first 40 context cols:", context_cols[:40])
+
+    if context_dim is not None:
+        print("context_dim from result:", context_dim)
+
+    if va_ld is not None:
+        for b in va_ld:
+            print("future_context tensor shape:", tuple(b["future_context"].shape))
+            print("future_context dim from loader:", b["future_context"].shape[-1])
+            break
+
+    return {
+        "context_cols": context_cols,
+        "context_dim": context_dim,
+    }
+
+
+def recommend_static_feature_columns(data_raw1):
+    """
+    Recommend GL/top-band/review columns based on available data.
+    """
+    related = [
+        c for c in data_raw1.columns
+        if any(k in c.lower() for k in [
+            "gl", "category", "product", "band", "review", "rating", "rank"
+        ])
+    ]
+
+    priority = [
+        "gl_product_group",
+        "category_code",
+        "glance_view_band_cat",
+        "customer_review_count",
+        "customer_active_review_count",
+        "cust_avg_active_review_rating",
+        "customer_average_review_rating",
+        "ind_top10_review_brand",
+        "price_bands",
+        "hb_rank",
+    ]
+
+    found_priority = [c for c in priority if c in data_raw1.columns]
+
+    print("\n" + "=" * 80)
+    print("STATIC FEATURE RECOMMENDATION")
+    print("=" * 80)
+    print("Priority columns found:")
+    print(found_priority)
+
+    print("\nAll related columns:")
+    print(related)
+
+    print("\nRecommendation:")
+    print("""
+Use first:
+  - gl_product_group
+  - category_code
+  - glance_view_band_cat
+  - log1p(customer_review_count)
+  - log1p(customer_active_review_count)
+  - cust_avg_active_review_rating
+  - price_bands
+  - hb_rank
+
+Among these, the most important for your current decoder are:
+  1. gl_product_group: product family / seasonality regime
+  2. glance_view_band_cat: traffic/top-band proxy
+  3. customer_review_count / customer_active_review_count: popularity/maturity proxy
+""")
+
+    return found_priority, related
