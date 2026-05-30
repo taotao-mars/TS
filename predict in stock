@@ -1,6 +1,6 @@
 
 # ============================================================
-# Clean Exposure-Only Forecasting Script | Direct + Aux Exposure/Demand Occ + Horizon Block Heads
+# Clean Exposure-Only Forecasting Script
 # Target:
 #   Predict future total_dph / buy_box_dph / in_stock_dph
 #
@@ -483,32 +483,9 @@ class HorizonTCNBlock(nn.Module):
 
 
 class ExposureTCNDecoder(nn.Module):
-    """
-    Direct exposure decoder with:
-      1. auxiliary exposure occurrence head
-      2. auxiliary demand occurrence head
-      3. horizon block-specific heads
-
-    Main output:
-      level_head directly predicts log1p(total/buy_box/in_stock DPH).
-
-    Auxiliary outputs:
-      exposure_occ_head predicts P(DPH > 0)
-      demand_occ_head predicts P(demand > 0)
-
-    Horizon blocks:
-      short: h=1-5
-      mid:   h=6-12
-      long:  h=13-20
-
-    Future true demand is used only as auxiliary label during training.
-    It is never used as model input.
-    """
     def __init__(self, d_model, context_dim, horizon=20, hidden=96, dropout=0.10):
         super().__init__()
         self.horizon = horizon
-        self.hidden = hidden
-
         self.input_proj = nn.Sequential(
             nn.Linear(d_model + context_dim + 2, hidden),
             nn.ReLU(),
@@ -521,41 +498,14 @@ class ExposureTCNDecoder(nn.Module):
             HorizonTCNBlock(hidden, dilation=4, dropout=dropout),
         ])
 
-        self.shared = nn.Sequential(
+        self.out = nn.Sequential(
             nn.Linear(hidden, hidden),
             nn.ReLU(),
             nn.Dropout(dropout * 0.5),
+            nn.Linear(hidden, 3),
         )
 
-        # Block-specific direct level heads.
-        self.level_head_short = nn.Linear(hidden, 3)
-        self.level_head_mid = nn.Linear(hidden, 3)
-        self.level_head_long = nn.Linear(hidden, 3)
-
-        # Block-specific auxiliary exposure occurrence heads.
-        self.exp_occ_head_short = nn.Linear(hidden, 3)
-        self.exp_occ_head_mid = nn.Linear(hidden, 3)
-        self.exp_occ_head_long = nn.Linear(hidden, 3)
-
-        # Block-specific auxiliary demand occurrence heads.
-        # Single output per horizon: P(future_demand > 0)
-        self.dem_occ_head_short = nn.Linear(hidden, 1)
-        self.dem_occ_head_mid = nn.Linear(hidden, 1)
-        self.dem_occ_head_long = nn.Linear(hidden, 1)
-
-    def _block_masks(self, H, device):
-        """
-        short: h=1-5
-        mid:   h=6-12
-        long:  h=13-20
-        """
-        idx = torch.arange(H, device=device)
-        short = idx <= 4
-        mid = (idx >= 5) & (idx <= 11)
-        long = idx >= 12
-        return short, mid, long
-
-    def forward(self, h_t, future_context, return_components=False):
+    def forward(self, h_t, future_context):
         B, H, C = future_context.shape
 
         h_rep = h_t.unsqueeze(1).expand(B, H, h_t.shape[-1])
@@ -573,57 +523,9 @@ class ExposureTCNDecoder(nn.Module):
         for block in self.tcn:
             z = block(z)
 
-        z = self.shared(z)
-
-        # Compute all block heads.
-        level_short = self.level_head_short(z)
-        level_mid = self.level_head_mid(z)
-        level_long = self.level_head_long(z)
-
-        exp_occ_short = self.exp_occ_head_short(z)
-        exp_occ_mid = self.exp_occ_head_mid(z)
-        exp_occ_long = self.exp_occ_head_long(z)
-
-        dem_occ_short = self.dem_occ_head_short(z)
-        dem_occ_mid = self.dem_occ_head_mid(z)
-        dem_occ_long = self.dem_occ_head_long(z)
-
-        short_mask, mid_mask, long_mask = self._block_masks(H, z.device)
-
-        level_raw = torch.zeros(B, H, 3, device=z.device, dtype=z.dtype)
-        exp_occ_logit = torch.zeros(B, H, 3, device=z.device, dtype=z.dtype)
-        dem_occ_logit = torch.zeros(B, H, 1, device=z.device, dtype=z.dtype)
-
-        level_raw[:, short_mask, :] = level_short[:, short_mask, :]
-        level_raw[:, mid_mask, :] = level_mid[:, mid_mask, :]
-        level_raw[:, long_mask, :] = level_long[:, long_mask, :]
-
-        exp_occ_logit[:, short_mask, :] = exp_occ_short[:, short_mask, :]
-        exp_occ_logit[:, mid_mask, :] = exp_occ_mid[:, mid_mask, :]
-        exp_occ_logit[:, long_mask, :] = exp_occ_long[:, long_mask, :]
-
-        dem_occ_logit[:, short_mask, :] = dem_occ_short[:, short_mask, :]
-        dem_occ_logit[:, mid_mask, :] = dem_occ_mid[:, mid_mask, :]
-        dem_occ_logit[:, long_mask, :] = dem_occ_long[:, long_mask, :]
-
-        # Direct final exposure prediction.
-        level_log_hat = F.softplus(level_raw)
-        pred_level = torch.expm1(level_log_hat).clamp(min=0.0)
-
-        prob_exp_active = torch.sigmoid(exp_occ_logit)
-        prob_demand_active = torch.sigmoid(dem_occ_logit).squeeze(-1)
-
-        if return_components:
-            return {
-                "pred_level": pred_level,
-                "level_log_hat": level_log_hat,
-                "exp_occ_logit": exp_occ_logit,
-                "prob_exp_active": prob_exp_active,
-                "dem_occ_logit": dem_occ_logit.squeeze(-1),
-                "prob_demand_active": prob_demand_active,
-            }
-
-        return level_log_hat
+        # Predict log1p levels.
+        out = F.softplus(self.out(z))
+        return out
 
 
 class ExposureForecastModel(nn.Module):
@@ -637,9 +539,10 @@ class ExposureForecastModel(nn.Module):
             hidden=max(96, d_model * 2),
         )
 
-    def forward(self, x, future_context, return_components=False):
+    def forward(self, x, future_context):
         h_t = self.encoder(x)
-        return self.decoder(h_t, future_context, return_components=return_components)
+        log_hat = self.decoder(h_t, future_context)
+        return log_hat
 
 
 # ============================================================
@@ -647,31 +550,15 @@ class ExposureForecastModel(nn.Module):
 # ============================================================
 
 def exposure_loss(
-    model_out,
+    log_hat,
     true_total,
     true_buy,
     true_instock,
-    true_demand=None,
     w_total=0.30,
     w_buy=0.60,
     w_instock=1.00,
     mean_weight=0.20,
-    exp_occ_weight=0.30,
-    demand_occ_weight=0.08,
-    block_calib_weight=0.10,
 ):
-    """
-    Direct level loss + auxiliary exposure occurrence + auxiliary demand occurrence.
-
-    Important:
-      Future true demand is used only as an auxiliary label.
-      It is not used as input.
-
-    Main prediction remains direct level:
-      pred_total_dph
-      pred_buy_box_dph
-      pred_instock_dph
-    """
     true = torch.stack(
         [
             true_total.clamp(min=0),
@@ -680,81 +567,25 @@ def exposure_loss(
         ],
         dim=-1,
     )
-
     target_log = torch.log1p(true)
-    exp_active = (true > 0).float()
-
-    pred_level = model_out["pred_level"]
-    level_log_hat = model_out["level_log_hat"]
-    exp_occ_logit = model_out["exp_occ_logit"]
 
     weights = torch.tensor(
         [w_total, w_buy, w_instock],
-        dtype=level_log_hat.dtype,
-        device=level_log_hat.device,
+        dtype=log_hat.dtype,
+        device=log_hat.device,
     ).view(1, 1, 3)
 
-    # Main direct level loss.
-    level_err = F.huber_loss(
-        level_log_hat,
-        target_log,
-        delta=1.0,
-        reduction="none",
-    )
-    level_loss = (level_err * weights).mean()
+    point = F.huber_loss(log_hat, target_log, delta=1.0, reduction="none")
+    point = (point * weights).mean()
 
-    # Auxiliary exposure occurrence loss.
-    exp_occ_err = F.binary_cross_entropy_with_logits(
-        exp_occ_logit,
-        exp_active,
-        reduction="none",
-    )
-    exp_occ_loss = (exp_occ_err * weights).mean()
+    pred_level = torch.expm1(log_hat).clamp(min=0)
 
-    # Auxiliary demand occurrence loss.
-    dem_occ_loss = torch.tensor(0.0, device=level_log_hat.device)
-    if true_demand is not None and "dem_occ_logit" in model_out:
-        dem_active = (true_demand.clamp(min=0) > 0).float()
-        dem_occ_loss = F.binary_cross_entropy_with_logits(
-            model_out["dem_occ_logit"],
-            dem_active,
-            reduction="mean",
-        )
-
-    # Overall mean calibration.
     mean_pred = torch.log1p(pred_level.mean(dim=(0, 1)))
     mean_true = torch.log1p(true.mean(dim=(0, 1)))
     mean_loss = torch.mean(torch.abs(mean_pred - mean_true) * weights.view(3))
 
-    # Block-wise calibration.
-    B, H, _ = true.shape
-    idx = torch.arange(H, device=true.device)
-    masks = [
-        idx <= 4,
-        (idx >= 5) & (idx <= 11),
-        idx >= 12,
-    ]
+    return point + mean_weight * mean_loss
 
-    block_losses = []
-    for m in masks:
-        if m.sum() == 0:
-            continue
-        pred_m = torch.log1p(pred_level[:, m, :].mean(dim=(0, 1)))
-        true_m = torch.log1p(true[:, m, :].mean(dim=(0, 1)))
-        block_losses.append(torch.mean(torch.abs(pred_m - true_m) * weights.view(3)))
-
-    if len(block_losses) > 0:
-        block_calib_loss = torch.stack(block_losses).mean()
-    else:
-        block_calib_loss = torch.tensor(0.0, device=true.device)
-
-    return (
-        level_loss
-        + exp_occ_weight * exp_occ_loss
-        + demand_occ_weight * dem_occ_loss
-        + mean_weight * mean_loss
-        + block_calib_weight * block_calib_loss
-    )
 
 def train_exposure_model(
     model,
@@ -780,14 +611,13 @@ def train_exposure_model(
         tr_sum, tr_n = 0.0, 0
 
         for b in tr_ld:
-            model_out = model(b["x"], b["future_context"], return_components=True)
+            log_hat = model(b["x"], b["future_context"])
 
             loss = exposure_loss(
-                model_out,
+                log_hat,
                 b["future_total_dph"],
                 b["future_buy_box_dph"],
                 b["future_instock_dph"],
-                true_demand=b.get("future_demand", None),
                 w_total=w_total,
                 w_buy=w_buy,
                 w_instock=w_instock,
@@ -809,9 +639,9 @@ def train_exposure_model(
 
         with torch.no_grad():
             for b in va_ld:
-                model_out = model(b["x"], b["future_context"], return_components=True)
+                log_hat = model(b["x"], b["future_context"])
                 loss = exposure_loss(
-                    model_out,
+                    log_hat,
                     b["future_total_dph"],
                     b["future_buy_box_dph"],
                     b["future_instock_dph"],
@@ -855,10 +685,8 @@ def predict_exposure(model, va_ld):
 
     with torch.no_grad():
         for b in va_ld:
-            model_out = model(b["x"], b["future_context"], return_components=True)
-            pred = model_out["pred_level"].clamp(min=0).cpu().numpy()
-            prob_exp_active = model_out["prob_exp_active"].cpu().numpy()
-            prob_demand_active = model_out["prob_demand_active"].cpu().numpy()
+            log_hat = model(b["x"], b["future_context"])
+            pred = torch.expm1(log_hat).clamp(min=0).cpu().numpy()
 
             B, H = b["future_instock_dph"].shape
 
@@ -872,18 +700,14 @@ def predict_exposure(model, va_ld):
 
                             "true_total_dph": b["future_total_dph"][i, h].item(),
                             "pred_total_dph": pred[i, h, 0],
-                            "prob_total_active": prob_exp_active[i, h, 0],
 
                             "true_buy_box_dph": b["future_buy_box_dph"][i, h].item(),
                             "pred_buy_box_dph": pred[i, h, 1],
-                            "prob_buy_box_active": prob_exp_active[i, h, 1],
 
                             "true_instock_dph": b["future_instock_dph"][i, h].item(),
                             "pred_instock_dph": pred[i, h, 2],
-                            "prob_instock_active": prob_exp_active[i, h, 2],
 
                             "true_demand": b["future_demand"][i, h].item(),
-                            "prob_demand_active": prob_demand_active[i, h],
                         }
                     )
 
@@ -1156,16 +980,12 @@ def run_exposure_only(
     pred_df = add_naive_baselines_from_loader(pred_df, va_ld, context_cols)
     diagnostics = print_exposure_diagnostics(pred_df)
     exposure_quality = diagnose_exposure_prediction_quality(pred_df)
-    block_head_diag = diagnose_block_head_direction(pred_df)
-    aux_demand_occ_diag = diagnose_aux_demand_occ_head(pred_df)
 
     return {
         "model": model,
         "forecast_df": pred_df,
         "diagnostics": diagnostics,
         "exposure_quality": exposure_quality,
-        "block_head_diag": block_head_diag,
-        "aux_demand_occ_diag": aux_demand_occ_diag,
         "tr_ld": tr_ld,
         "va_ld": va_ld,
         "context_cols": context_cols,
@@ -1452,61 +1272,775 @@ Prefer:
 
 
 
-def diagnose_aux_occ_head_by_horizon(pred_df):
-    """
-    Check whether auxiliary occurrence head is useful by horizon.
+# ============================================================
+# 9. Horizon-dependent blending / shrinkage
+# ============================================================
 
-    Important:
-      This head is not multiplied into final prediction.
-      We only use it as auxiliary signal and optional future confidence feature.
+def apply_horizon_blending(
+    pred_df,
+    anchor="last",
+    short_alpha=1.00,
+    mid_alpha=0.70,
+    long_alpha=0.40,
+    short_end=5,
+    mid_end=12,
+    low_exposure_shrink=False,
+    low_anchor_col="pred_instock_dph_last",
+    low_hist_threshold=1e-8,
+    low_shrink=0.50,
+):
     """
-    targets = [
-        ("total_dph", "true_total_dph", "prob_total_active"),
-        ("buy_box_dph", "true_buy_box_dph", "prob_buy_box_active"),
-        ("in_stock_dph", "true_instock_dph", "prob_instock_active"),
+    Blend model exposure_hat with a naive anchor using horizon-dependent trust.
+
+    Motivation:
+      Model is strong at short horizon, but long-horizon active AUC drops.
+      Therefore:
+        short horizon: trust model more
+        long horizon: shrink toward a stable anchor
+
+    Output columns:
+      blended_total_dph
+      blended_buy_box_dph
+      blended_instock_dph
+      alpha_h
+      horizon_block
+    """
+    df = pred_df.copy()
+
+    required = [
+        "pred_total_dph",
+        "pred_buy_box_dph",
+        "pred_instock_dph",
+        f"pred_total_dph_{anchor}",
+        f"pred_buy_box_dph_{anchor}",
+        f"pred_instock_dph_{anchor}",
+    ]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(
+            f"Missing columns for blending: {missing}. "
+            "Run add_naive_baselines_from_loader first."
+        )
+
+    def alpha_func(h):
+        if h <= short_end:
+            return short_alpha
+        elif h <= mid_end:
+            return mid_alpha
+        else:
+            return long_alpha
+
+    def block_func(h):
+        if h <= short_end:
+            return f"short_1_{short_end}"
+        elif h <= mid_end:
+            return f"mid_{short_end+1}_{mid_end}"
+        else:
+            return f"long_{mid_end+1}_20"
+
+    df["alpha_h"] = df["horizon"].apply(alpha_func).astype(float)
+    df["horizon_block"] = df["horizon"].apply(block_func)
+
+    mapping = [
+        ("total", "pred_total_dph", "blended_total_dph"),
+        ("buy_box", "pred_buy_box_dph", "blended_buy_box_dph"),
+        ("instock", "pred_instock_dph", "blended_instock_dph"),
+    ]
+
+    for target, pred_col, out_col in mapping:
+        anchor_col = f"pred_{target}_dph_{anchor}"
+        df[out_col] = (
+            df["alpha_h"] * df[pred_col].astype(float)
+            + (1.0 - df["alpha_h"]) * df[anchor_col].astype(float)
+        )
+
+    if low_exposure_shrink:
+        if low_anchor_col not in df.columns:
+            raise ValueError(f"low_anchor_col {low_anchor_col} not found.")
+
+        low_mask = df[low_anchor_col].fillna(0.0).astype(float) <= low_hist_threshold
+        df.loc[low_mask, "blended_instock_dph"] *= low_shrink
+
+    return df
+
+
+def diagnose_single_prediction_set(df, pred_prefix="pred", name="model"):
+    """
+    Compact metrics for one prediction set.
+
+    pred_prefix:
+      "pred"  -> pred_total_dph, pred_buy_box_dph, pred_instock_dph
+      "blend" -> blend_total_dph, blend_buy_box_dph, blend_instock_dph
+    """
+    specs = [
+        ("total_dph", "true_total_dph", f"{pred_prefix}_total_dph"),
+        ("buy_box_dph", "true_buy_box_dph", f"{pred_prefix}_buy_box_dph"),
+        ("in_stock_dph", "true_instock_dph", f"{pred_prefix}_instock_dph"),
     ]
 
     rows = []
-    for h, g in pred_df.groupby("horizon"):
-        for name, true_col, prob_col in targets:
-            if prob_col not in g.columns:
-                continue
-            y = (g[true_col].values > 0).astype(int)
-            p = g[prob_col].values
-            rows.append({
-                "horizon": h,
-                "target": name,
-                "true_active_rate": y.mean(),
-                "pred_prob_mean": np.mean(p),
-                "prob_AUC": _auc(y, p),
-                "prob_p10": np.quantile(p, 0.10),
-                "prob_p50": np.quantile(p, 0.50),
-                "prob_p90": np.quantile(p, 0.90),
-            })
+    for target, true_col, pred_col in specs:
+        y = df[true_col].values
+        p = df[pred_col].values
 
-    out = pd.DataFrame(rows)
+        rows.append({
+            "method": name,
+            "target": target,
+            "true_mean": np.mean(y),
+            "pred_mean": np.mean(p),
+            "ratio": np.mean(p) / (np.mean(y) + 1e-8),
+            "WAPE": _wape(y, p),
+            "Pearson": _corr(y, p),
+            "Spearman": _safe_spearman(y, p),
+            "active_AUC": _auc((y > 0).astype(int), p),
+        })
+
+    return pd.DataFrame(rows)
+
+
+def evaluate_blended_exposure(
+    pred_df,
+    anchor="last",
+    short_alpha=1.00,
+    mid_alpha=0.70,
+    long_alpha=0.40,
+    low_exposure_shrink=False,
+    low_shrink=0.50,
+):
+    """
+    Apply blending and evaluate model vs blended predictions.
+    """
+    blend_df = apply_horizon_blending(
+        pred_df=pred_df,
+        anchor=anchor,
+        short_alpha=short_alpha,
+        mid_alpha=mid_alpha,
+        long_alpha=long_alpha,
+        low_exposure_shrink=low_exposure_shrink,
+        low_shrink=low_shrink,
+    )
+
+    tmp = blend_df.copy()
+    tmp["pred_total_dph"] = tmp["blended_total_dph"]
+    tmp["pred_buy_box_dph"] = tmp["blended_buy_box_dph"]
+    tmp["pred_instock_dph"] = tmp["blended_instock_dph"]
 
     print("\n" + "=" * 100)
-    print("AUX OCC HEAD BY HORIZON")
+    print("BLENDED EXPOSURE FULL DIAGNOSTIC")
     print("=" * 100)
-    if len(out) == 0:
-        print("No prob_*_active columns found.")
-    else:
-        print(out.round(5).to_string(index=False))
+    blended_quality = diagnose_exposure_prediction_quality(tmp)
+
+    print("\n" + "=" * 100)
+    print("MODEL VS BLENDED QUICK COMPARISON")
+    print("=" * 100)
+
+    base = diagnose_single_prediction_set(pred_df, pred_prefix="pred", name="model")
+
+    b2 = blend_df.rename(columns={
+        "blended_total_dph": "blend_total_dph",
+        "blended_buy_box_dph": "blend_buy_box_dph",
+        "blended_instock_dph": "blend_instock_dph",
+    })
+    blended = diagnose_single_prediction_set(b2, pred_prefix="blend", name="blended")
+
+    comp = pd.concat([base, blended], ignore_index=True)
+    print(comp.round(5).to_string(index=False))
+
+    print("\nFocus on in_stock_dph:")
+    print(comp[comp["target"] == "in_stock_dph"].round(5).to_string(index=False))
+
+    return {
+        "blend_df": blend_df,
+        "quality": blended_quality,
+        "comparison": comp,
+    }
+
+
+def grid_search_horizon_blending(
+    pred_df,
+    anchors=("last", "mean13"),
+    short_alphas=(1.0,),
+    mid_alphas=(0.5, 0.7, 0.9),
+    long_alphas=(0.2, 0.4, 0.6, 0.8),
+    low_exposure_shrink_options=(False, True),
+    low_shrink_options=(0.3, 0.5, 0.7),
+    sort_by="in_stock_WAPE",
+):
+    """
+    Small grid search for horizon-dependent blending.
+
+    Metrics returned:
+      in_stock WAPE / Pearson / Spearman / AUC
+      low exposure group ratio / WAPE
+      p90 ASIN WAPE
+      ASIN-sum Spearman
+    """
+    rows = []
+
+    for anchor in anchors:
+        for sa in short_alphas:
+            for ma in mid_alphas:
+                for la in long_alphas:
+                    for use_low in low_exposure_shrink_options:
+                        shrink_values = low_shrink_options if use_low else (1.0,)
+
+                        for shrink in shrink_values:
+                            try:
+                                bdf = apply_horizon_blending(
+                                    pred_df=pred_df,
+                                    anchor=anchor,
+                                    short_alpha=sa,
+                                    mid_alpha=ma,
+                                    long_alpha=la,
+                                    low_exposure_shrink=use_low,
+                                    low_shrink=shrink,
+                                )
+                            except Exception as e:
+                                rows.append({
+                                    "anchor": anchor,
+                                    "short_alpha": sa,
+                                    "mid_alpha": ma,
+                                    "long_alpha": la,
+                                    "low_exposure_shrink": use_low,
+                                    "low_shrink": shrink,
+                                    "error": str(e),
+                                })
+                                continue
+
+                            y = bdf["true_instock_dph"].values
+                            p = bdf["blended_instock_dph"].values
+
+                            asin_sum = (
+                                bdf.groupby("asin")
+                                .agg(
+                                    true_sum=("true_instock_dph", "sum"),
+                                    pred_sum=("blended_instock_dph", "sum"),
+                                )
+                                .reset_index()
+                            )
+
+                            per_asin = []
+                            for asin, g in bdf.groupby("asin"):
+                                yy = g["true_instock_dph"].values
+                                pp = g["blended_instock_dph"].values
+                                per_asin.append(_wape(yy, pp))
+                            per_asin = np.asarray(per_asin, dtype=float)
+
+                            asin_group = asin_sum.copy()
+                            asin_group["exposure_group"] = pd.qcut(
+                                asin_group["true_sum"].rank(method="first"),
+                                q=3,
+                                labels=["low_true_exposure", "mid_true_exposure", "high_true_exposure"],
+                            )
+                            gdf = bdf.merge(
+                                asin_group[["asin", "exposure_group"]],
+                                on="asin",
+                                how="left",
+                            )
+                            low = gdf[gdf["exposure_group"] == "low_true_exposure"]
+                            ly = low["true_instock_dph"].values
+                            lp = low["blended_instock_dph"].values
+
+                            rows.append({
+                                "anchor": anchor,
+                                "short_alpha": sa,
+                                "mid_alpha": ma,
+                                "long_alpha": la,
+                                "low_exposure_shrink": use_low,
+                                "low_shrink": shrink,
+                                "in_stock_ratio": np.mean(p) / (np.mean(y) + 1e-8),
+                                "in_stock_WAPE": _wape(y, p),
+                                "in_stock_Pearson": _corr(y, p),
+                                "in_stock_Spearman": _safe_spearman(y, p),
+                                "in_stock_active_AUC": _auc((y > 0).astype(int), p),
+                                "asin_sum_Spearman": _safe_spearman(asin_sum["true_sum"], asin_sum["pred_sum"]),
+                                "p75_asin_WAPE": np.quantile(per_asin, 0.75),
+                                "p90_asin_WAPE": np.quantile(per_asin, 0.90),
+                                "low_group_ratio": np.mean(lp) / (np.mean(ly) + 1e-8),
+                                "low_group_WAPE": _wape(ly, lp),
+                                "error": "",
+                            })
+
+    out = pd.DataFrame(rows)
+    if sort_by in out.columns:
+        out = out.sort_values(sort_by, ascending=True)
+
+    print("\n" + "=" * 100)
+    print("HORIZON BLENDING GRID SEARCH")
+    print("=" * 100)
+
+    show_cols = [
+        "anchor", "short_alpha", "mid_alpha", "long_alpha",
+        "low_exposure_shrink", "low_shrink",
+        "in_stock_ratio", "in_stock_WAPE", "in_stock_Pearson", "in_stock_Spearman",
+        "in_stock_active_AUC", "asin_sum_Spearman",
+        "p75_asin_WAPE", "p90_asin_WAPE",
+        "low_group_ratio", "low_group_WAPE",
+    ]
+    show_cols = [c for c in show_cols if c in out.columns]
+
+    print(out[show_cols].head(30).round(5).to_string(index=False))
 
     return out
 
 
-def diagnose_horizon_block_summary(pred_df):
+def make_external_hat_df_from_blend(
+    blend_df,
+    use_blended=True,
+    include_prob_cols=True,
+):
     """
-    Summarize exposure quality by horizon block:
-      short: h=1-5
-      mid:   h=6-12
-      long:  h=13-20
+    Create exposure_hat_df to feed into demand model.
 
-    This is the key diagnostic for checking if block-specific heads help.
+    If use_blended=True:
+      pred_total_dph = blended_total_dph
+      pred_buy_box_dph = blended_buy_box_dph
+      pred_instock_dph = blended_instock_dph
     """
-    df = pred_df.copy()
+    df = blend_df.copy()
+
+    if use_blended:
+        required = ["blended_total_dph", "blended_buy_box_dph", "blended_instock_dph"]
+        missing = [c for c in required if c not in df.columns]
+        if missing:
+            raise ValueError(f"Missing blended columns: {missing}")
+
+        df["pred_total_dph"] = df["blended_total_dph"]
+        df["pred_buy_box_dph"] = df["blended_buy_box_dph"]
+        df["pred_instock_dph"] = df["blended_instock_dph"]
+
+    cols = [
+        "asin",
+        "order_week",
+        "pred_total_dph",
+        "pred_buy_box_dph",
+        "pred_instock_dph",
+    ]
+
+    if include_prob_cols:
+        for c in [
+            "prob_total_active",
+            "prob_buy_box_active",
+            "prob_instock_active",
+            "prob_demand_active",
+            "alpha_h",
+            "horizon_block",
+        ]:
+            if c in df.columns:
+                cols.append(c)
+
+    return df[cols].copy()
+
+
+
+
+# ============================================================
+# 10. Learnable Anchor / Source Attention Blender
+# ============================================================
+
+class AnchorAttentionDataset(Dataset):
+    """
+    Dataset for post-hoc learnable source attention.
+
+    It does NOT retrain the exposure TCN.
+    It learns how to combine:
+        model_hat
+        naive_last
+        naive_mean4
+        naive_mean13
+
+    For each target:
+        total_dph
+        buy_box_dph
+        in_stock_dph
+
+    Final:
+        final_hat = sum_k softmax(weight_k) * candidate_k
+
+    This is a learnable version of horizon-dependent blending.
+    """
+    def __init__(self, pred_df, target="in_stock_dph"):
+        self.df = pred_df.copy().reset_index(drop=True)
+        self.target = target
+
+        if target == "in_stock_dph":
+            self.true_col = "true_instock_dph"
+            self.cand_cols = [
+                "pred_instock_dph",
+                "pred_instock_dph_last",
+                "pred_instock_dph_mean4",
+                "pred_instock_dph_mean13",
+            ]
+            self.prob_cols = [c for c in ["prob_instock_active", "prob_demand_active"] if c in self.df.columns]
+        elif target == "buy_box_dph":
+            self.true_col = "true_buy_box_dph"
+            self.cand_cols = [
+                "pred_buy_box_dph",
+                "pred_buy_box_dph_last",
+                "pred_buy_box_dph_mean4",
+                "pred_buy_box_dph_mean13",
+            ]
+            self.prob_cols = [c for c in ["prob_buy_box_active", "prob_demand_active"] if c in self.df.columns]
+        elif target == "total_dph":
+            self.true_col = "true_total_dph"
+            self.cand_cols = [
+                "pred_total_dph",
+                "pred_total_dph_last",
+                "pred_total_dph_mean4",
+                "pred_total_dph_mean13",
+            ]
+            self.prob_cols = [c for c in ["prob_total_active", "prob_demand_active"] if c in self.df.columns]
+        else:
+            raise ValueError("target must be in_stock_dph, buy_box_dph, or total_dph")
+
+        missing = [c for c in [self.true_col] + self.cand_cols if c not in self.df.columns]
+        if missing:
+            raise ValueError(f"Missing columns for AnchorAttentionDataset: {missing}")
+
+        self._build_features()
+
+    def _build_features(self):
+        df = self.df
+
+        h = df["horizon"].astype(float).values
+        h_norm = h / max(float(df["horizon"].max()), 1.0)
+
+        # Candidate values in log space.
+        cand = df[self.cand_cols].fillna(0.0).clip(lower=0.0).values.astype(np.float32)
+        cand_log = np.log1p(cand)
+
+        # Relative candidate diagnostics.
+        cand_mean = cand_log.mean(axis=1, keepdims=True)
+        cand_std = cand_log.std(axis=1, keepdims=True) + 1e-6
+        cand_z = (cand_log - cand_mean) / cand_std
+
+        # Horizon / block features.
+        h_feat = np.stack([
+            h_norm,
+            np.sin(2 * np.pi * h_norm),
+            np.cos(2 * np.pi * h_norm),
+            (h <= 5).astype(float),
+            ((h >= 6) & (h <= 12)).astype(float),
+            (h >= 13).astype(float),
+        ], axis=1).astype(np.float32)
+
+        # Optional probability features.
+        if len(self.prob_cols) > 0:
+            prob = df[self.prob_cols].fillna(0.0).values.astype(np.float32)
+        else:
+            prob = np.zeros((len(df), 0), dtype=np.float32)
+
+        # Combine features.
+        X = np.concatenate([h_feat, cand_log, cand_z, prob], axis=1).astype(np.float32)
+
+        # Standardize non-binary-ish features globally for stable training.
+        self.x_mean = X.mean(axis=0, keepdims=True)
+        self.x_std = X.std(axis=0, keepdims=True) + 1e-6
+        Xn = (X - self.x_mean) / self.x_std
+
+        self.X = Xn.astype(np.float32)
+        self.candidates = cand.astype(np.float32)
+        self.y = df[self.true_col].fillna(0.0).clip(lower=0.0).values.astype(np.float32)
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        return {
+            "x": torch.tensor(self.X[idx], dtype=torch.float32),
+            "candidates": torch.tensor(self.candidates[idx], dtype=torch.float32),
+            "y": torch.tensor(self.y[idx], dtype=torch.float32),
+        }
+
+
+class AnchorAttentionBlender(nn.Module):
+    """
+    Small MLP producing attention weights over candidates:
+        [model_hat, naive_last, naive_mean4, naive_mean13]
+    """
+    def __init__(self, input_dim, hidden=64, n_candidates=4, dropout=0.10):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, hidden),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, n_candidates),
+        )
+
+    def forward(self, x, candidates, temperature=1.0):
+        logits = self.net(x) / max(temperature, 1e-6)
+        weights = torch.softmax(logits, dim=-1)
+        pred = torch.sum(weights * candidates, dim=-1)
+        return pred, weights
+
+
+def _attention_blender_loss(pred, y, weights=None, candidates=None, entropy_weight=0.001):
+    """
+    Loss for source attention blender.
+
+    Uses log-level Huber so both large and small ASINs matter.
+    Adds tiny entropy regularization to avoid collapsed weights too early.
+    """
+    pred_log = torch.log1p(pred.clamp(min=0.0))
+    y_log = torch.log1p(y.clamp(min=0.0))
+
+    main = F.huber_loss(pred_log, y_log, delta=1.0, reduction="mean")
+
+    ent = torch.tensor(0.0, device=pred.device)
+    if weights is not None and entropy_weight > 0:
+        ent = -torch.mean(torch.sum(weights * torch.log(weights + 1e-8), dim=-1))
+        # Subtract entropy means encourage some exploration / non-collapse.
+        main = main - entropy_weight * ent
+
+    return main
+
+
+def train_anchor_attention_blender_for_target(
+    pred_df,
+    target="in_stock_dph",
+    epochs=80,
+    batch_size=1024,
+    lr=1e-3,
+    patience=10,
+    hidden=64,
+    dropout=0.10,
+    seed=42,
+):
+    """
+    Train a post-hoc learnable attention blender for one target.
+
+    Split:
+      train rows: horizons 1-16 approximately and random 80%
+      val rows: random 20%
+    This is only for quick validation. For production, train this on training windows
+    and apply to validation/test windows.
+    """
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+
+    ds = AnchorAttentionDataset(pred_df, target=target)
+
+    n = len(ds)
+    idx = np.arange(n)
+    rng = np.random.default_rng(seed)
+    rng.shuffle(idx)
+
+    n_val = max(int(0.2 * n), 1)
+    val_idx = idx[:n_val]
+    train_idx = idx[n_val:]
+
+    train_subset = torch.utils.data.Subset(ds, train_idx.tolist())
+    val_subset = torch.utils.data.Subset(ds, val_idx.tolist())
+
+    tr_ld = DataLoader(train_subset, batch_size=batch_size, shuffle=True)
+    va_ld = DataLoader(val_subset, batch_size=batch_size, shuffle=False)
+
+    model = AnchorAttentionBlender(
+        input_dim=ds.X.shape[1],
+        hidden=hidden,
+        n_candidates=4,
+        dropout=dropout,
+    )
+
+    opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
+
+    best_val = float("inf")
+    best_sd = None
+    no_improve = 0
+
+    for epoch in range(epochs):
+        model.train()
+        tr_sum, tr_n = 0.0, 0
+
+        for b in tr_ld:
+            pred, w = model(b["x"], b["candidates"])
+            loss = _attention_blender_loss(pred, b["y"], weights=w)
+
+            opt.zero_grad()
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step()
+
+            tr_sum += loss.item() * b["x"].shape[0]
+            tr_n += b["x"].shape[0]
+
+        model.eval()
+        va_sum, va_n = 0.0, 0
+        with torch.no_grad():
+            for b in va_ld:
+                pred, w = model(b["x"], b["candidates"])
+                loss = _attention_blender_loss(pred, b["y"], weights=w)
+                va_sum += loss.item() * b["x"].shape[0]
+                va_n += b["x"].shape[0]
+
+        tr_loss = tr_sum / max(tr_n, 1)
+        va_loss = va_sum / max(va_n, 1)
+
+        if (epoch + 1) % 10 == 0 or epoch == 0:
+            print(f"[{target}] Epoch {epoch+1:03d} | train={tr_loss:.5f} | val={va_loss:.5f}")
+
+        if va_loss < best_val - 1e-6:
+            best_val = va_loss
+            best_sd = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            no_improve = 0
+        else:
+            no_improve += 1
+
+        if no_improve >= patience:
+            print(f"[{target}] Early stop at epoch {epoch+1}. Best val={best_val:.5f}")
+            break
+
+    if best_sd is not None:
+        model.load_state_dict(best_sd)
+
+    return {
+        "model": model,
+        "dataset": ds,
+        "target": target,
+        "best_val": best_val,
+    }
+
+
+def apply_anchor_attention_blender_for_target(pred_df, blender_result):
+    """
+    Apply trained anchor attention blender to one target.
+    """
+    target = blender_result["target"]
+    model = blender_result["model"]
+    ds_train = blender_result["dataset"]
+
+    # Rebuild dataset for this pred_df.
+    ds = AnchorAttentionDataset(pred_df, target=target)
+
+    # Use train standardization to avoid leakage/drift.
+    X = np.concatenate([
+        np.stack([
+            pred_df["horizon"].astype(float).values / max(float(pred_df["horizon"].max()), 1.0),
+            np.sin(2 * np.pi * pred_df["horizon"].astype(float).values / max(float(pred_df["horizon"].max()), 1.0)),
+            np.cos(2 * np.pi * pred_df["horizon"].astype(float).values / max(float(pred_df["horizon"].max()), 1.0)),
+            (pred_df["horizon"].values <= 5).astype(float),
+            ((pred_df["horizon"].values >= 6) & (pred_df["horizon"].values <= 12)).astype(float),
+            (pred_df["horizon"].values >= 13).astype(float),
+        ], axis=1).astype(np.float32),
+        np.log1p(pred_df[ds.cand_cols].fillna(0.0).clip(lower=0.0).values.astype(np.float32)),
+        (np.log1p(pred_df[ds.cand_cols].fillna(0.0).clip(lower=0.0).values.astype(np.float32)) -
+         np.log1p(pred_df[ds.cand_cols].fillna(0.0).clip(lower=0.0).values.astype(np.float32)).mean(axis=1, keepdims=True)) /
+        (np.log1p(pred_df[ds.cand_cols].fillna(0.0).clip(lower=0.0).values.astype(np.float32)).std(axis=1, keepdims=True) + 1e-6),
+        pred_df[ds.prob_cols].fillna(0.0).values.astype(np.float32) if len(ds.prob_cols) > 0 else np.zeros((len(pred_df), 0), dtype=np.float32),
+    ], axis=1).astype(np.float32)
+
+    Xn = (X - ds_train.x_mean) / ds_train.x_std
+    candidates = pred_df[ds.cand_cols].fillna(0.0).clip(lower=0.0).values.astype(np.float32)
+
+    model.eval()
+    with torch.no_grad():
+        x_t = torch.tensor(Xn, dtype=torch.float32)
+        c_t = torch.tensor(candidates, dtype=torch.float32)
+        pred, weights = model(x_t, c_t)
+
+    out = pred_df.copy()
+
+    if target == "in_stock_dph":
+        out["attn_instock_dph"] = pred.numpy()
+        prefix = "attn_instock"
+    elif target == "buy_box_dph":
+        out["attn_buy_box_dph"] = pred.numpy()
+        prefix = "attn_buy_box"
+    else:
+        out["attn_total_dph"] = pred.numpy()
+        prefix = "attn_total"
+
+    w = weights.numpy()
+    out[f"{prefix}_w_model"] = w[:, 0]
+    out[f"{prefix}_w_last"] = w[:, 1]
+    out[f"{prefix}_w_mean4"] = w[:, 2]
+    out[f"{prefix}_w_mean13"] = w[:, 3]
+
+    return out
+
+
+def train_and_apply_anchor_attention_blender(
+    pred_df,
+    targets=("total_dph", "buy_box_dph", "in_stock_dph"),
+    epochs=80,
+    batch_size=1024,
+    lr=1e-3,
+    patience=10,
+    hidden=64,
+    dropout=0.10,
+    seed=42,
+):
+    """
+    Train source-attention blender for all exposure targets and apply.
+
+    Output columns:
+      attn_total_dph
+      attn_buy_box_dph
+      attn_instock_dph
+
+    Weight columns:
+      attn_*_w_model / last / mean4 / mean13
+    """
+    out_df = pred_df.copy()
+    results = {}
+
+    for target in targets:
+        print("\n" + "=" * 100)
+        print(f"TRAIN ANCHOR ATTENTION BLENDER: {target}")
+        print("=" * 100)
+
+        res = train_anchor_attention_blender_for_target(
+            pred_df=pred_df,
+            target=target,
+            epochs=epochs,
+            batch_size=batch_size,
+            lr=lr,
+            patience=patience,
+            hidden=hidden,
+            dropout=dropout,
+            seed=seed,
+        )
+        results[target] = res
+
+        out_df = apply_anchor_attention_blender_for_target(out_df, res)
+
+    return {
+        "attn_df": out_df,
+        "blenders": results,
+    }
+
+
+def evaluate_anchor_attention_blender(attn_df):
+    """
+    Evaluate anchor attention predictions.
+
+    It converts attention predictions into pred_* columns and uses existing diagnostics.
+    """
+    tmp = attn_df.copy()
+
+    required = ["attn_total_dph", "attn_buy_box_dph", "attn_instock_dph"]
+    missing = [c for c in required if c not in tmp.columns]
+    if missing:
+        raise ValueError(f"Missing attention prediction columns: {missing}")
+
+    tmp["pred_total_dph"] = tmp["attn_total_dph"]
+    tmp["pred_buy_box_dph"] = tmp["attn_buy_box_dph"]
+    tmp["pred_instock_dph"] = tmp["attn_instock_dph"]
+
+    print("\n" + "=" * 100)
+    print("ANCHOR ATTENTION BLENDER FULL DIAGNOSTIC")
+    print("=" * 100)
+
+    quality = diagnose_exposure_prediction_quality(tmp)
+
+    print("\n" + "=" * 100)
+    print("ANCHOR ATTENTION WEIGHTS BY HORIZON BLOCK")
+    print("=" * 100)
+
+    df = attn_df.copy()
     df["horizon_block"] = pd.cut(
         df["horizon"],
         bins=[0, 5, 12, 20],
@@ -1514,114 +2048,96 @@ def diagnose_horizon_block_summary(pred_df):
         include_lowest=True,
     )
 
-    targets = [
-        ("total_dph", "true_total_dph", "pred_total_dph"),
-        ("buy_box_dph", "true_buy_box_dph", "pred_buy_box_dph"),
-        ("in_stock_dph", "true_instock_dph", "pred_instock_dph"),
-    ]
-
     rows = []
     for block, g in df.groupby("horizon_block", observed=True):
-        for name, true_col, pred_col in targets:
-            y = g[true_col].values
-            p = g[pred_col].values
-            rows.append({
-                "block": block,
-                "target": name,
-                "true_mean": np.mean(y),
-                "pred_mean": np.mean(p),
-                "ratio": np.mean(p) / (np.mean(y) + 1e-8),
-                "WAPE": _wape(y, p),
-                "Pearson": _corr(y, p),
-                "Spearman": _safe_spearman(y, p),
-                "active_AUC": _auc((y > 0).astype(int), p),
-            })
+        for prefix, target in [
+            ("attn_total", "total_dph"),
+            ("attn_buy_box", "buy_box_dph"),
+            ("attn_instock", "in_stock_dph"),
+        ]:
+            needed = [f"{prefix}_w_model", f"{prefix}_w_last", f"{prefix}_w_mean4", f"{prefix}_w_mean13"]
+            if all(c in g.columns for c in needed):
+                rows.append({
+                    "block": block,
+                    "target": target,
+                    "w_model": g[f"{prefix}_w_model"].mean(),
+                    "w_last": g[f"{prefix}_w_last"].mean(),
+                    "w_mean4": g[f"{prefix}_w_mean4"].mean(),
+                    "w_mean13": g[f"{prefix}_w_mean13"].mean(),
+                })
 
-    out = pd.DataFrame(rows)
+    weight_df = pd.DataFrame(rows)
+    print(weight_df.round(4).to_string(index=False))
 
-    print("\n" + "=" * 100)
-    print("HORIZON BLOCK SUMMARY")
-    print("=" * 100)
-    print(out.round(5).to_string(index=False))
-
-    print("\nFocus: if long_13_20 improves WAPE/corr without hurting short_1_5 too much, block heads are useful.")
-
-    return out
-
-
-def diagnose_block_head_direction(pred_df):
-    """
-    Compact judgement for whether block-specific heads help in_stock_dph.
-    """
-    block_summary = diagnose_horizon_block_summary(pred_df)
-    aux_occ = diagnose_aux_occ_head_by_horizon(pred_df)
-
-    focus = block_summary[block_summary["target"] == "in_stock_dph"].copy()
-
-    print("\n" + "=" * 100)
-    print("BLOCK HEAD QUICK JUDGMENT: IN_STOCK_DPH")
-    print("=" * 100)
-    print(focus.round(5).to_string(index=False))
+    print("\nFocus: long_13_20 should usually reduce w_model and increase stable anchors if attention is working.")
 
     return {
-        "block_summary": block_summary,
-        "aux_occ_by_horizon": aux_occ,
+        "quality": quality,
+        "weight_by_block": weight_df,
     }
 
 
-
-
-def diagnose_aux_demand_occ_head(pred_df):
+def make_external_hat_df_from_anchor_attention(attn_df, include_prob_cols=True):
     """
-    Check auxiliary demand occurrence head.
-
-    This is only an auxiliary training target for exposure representation.
-    It should not be interpreted as the final demand forecast.
+    Create exposure_hat_df for demand model from anchor attention outputs.
     """
-    if "prob_demand_active" not in pred_df.columns:
-        print("No prob_demand_active found.")
-        return None
+    required = ["attn_total_dph", "attn_buy_box_dph", "attn_instock_dph"]
+    missing = [c for c in required if c not in attn_df.columns]
+    if missing:
+        raise ValueError(f"Missing attention prediction columns: {missing}")
 
-    df = pred_df.copy()
-    df["true_demand_active"] = (df["true_demand"] > 0).astype(int)
+    df = attn_df.copy()
 
-    rows = []
+    df["pred_total_dph"] = df["attn_total_dph"]
+    df["pred_buy_box_dph"] = df["attn_buy_box_dph"]
+    df["pred_instock_dph"] = df["attn_instock_dph"]
 
-    y = df["true_demand_active"].values
-    p = df["prob_demand_active"].values
+    cols = [
+        "asin",
+        "order_week",
+        "pred_total_dph",
+        "pred_buy_box_dph",
+        "pred_instock_dph",
+    ]
 
-    rows.append({
-        "scope": "overall",
-        "true_active_rate": y.mean(),
-        "pred_prob_mean": p.mean(),
-        "AUC": _auc(y, p),
-        "prob_p10": np.quantile(p, 0.10),
-        "prob_p50": np.quantile(p, 0.50),
-        "prob_p90": np.quantile(p, 0.90),
-    })
+    if include_prob_cols:
+        for c in [
+            "prob_total_active",
+            "prob_buy_box_active",
+            "prob_instock_active",
+            "prob_demand_active",
+        ]:
+            if c in df.columns:
+                cols.append(c)
 
-    for h, g in df.groupby("horizon"):
-        y = g["true_demand_active"].values
-        p = g["prob_demand_active"].values
-        rows.append({
-            "scope": f"h{int(h)}",
-            "true_active_rate": y.mean(),
-            "pred_prob_mean": p.mean(),
-            "AUC": _auc(y, p),
-            "prob_p10": np.quantile(p, 0.10),
-            "prob_p50": np.quantile(p, 0.50),
-            "prob_p90": np.quantile(p, 0.90),
-        })
+        # Include attention weights as confidence/explainability features if needed.
+        for c in df.columns:
+            if c.startswith("attn_") and "_w_" in c:
+                cols.append(c)
 
-    out = pd.DataFrame(rows)
+    return df[cols].copy()
 
-    print("\n" + "=" * 100)
-    print("AUX DEMAND OCC HEAD DIAGNOSTIC")
-    print("=" * 100)
-    print(out.round(5).to_string(index=False))
 
-    return out
-
+# ============================================================
+# Example usage:
+# ============================================================
+#
+# pred_df = result_exp["forecast_df"]
+#
+# attn_res = train_and_apply_anchor_attention_blender(
+#     pred_df,
+#     targets=("total_dph", "buy_box_dph", "in_stock_dph"),
+#     epochs=80,
+#     batch_size=1024,
+#     lr=1e-3,
+#     patience=10,
+# )
+#
+# attn_df = attn_res["attn_df"]
+# attn_eval = evaluate_anchor_attention_blender(attn_df)
+#
+# exposure_hat_for_demand = make_external_hat_df_from_anchor_attention(attn_df)
+#
 
 # ============================================================
 # Usage
