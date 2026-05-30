@@ -1,0 +1,283 @@
+import numpy as np
+import pandas as pd
+
+def diagnose_dph_demand_lag_effect(
+    df,
+    asin_col="asin",
+    date_col="order_week",
+    demand_col="fbi_demand",
+    dph_cols=("total_dph", "buy_box_dph", "in_stock_dph"),
+    max_lag=12,
+):
+    """
+    检测 DPH 对 demand 的滞后关系。
+
+    检查：
+        demand_t vs DPH_t
+        demand_t vs DPH_{t-1}
+        demand_t vs DPH_{t-2}
+        ...
+        demand_t vs DPH_{t-max_lag}
+
+    如果 lag k 的关系很强，说明 demand_t 可能受 k 周前 DPH 影响。
+    """
+
+    data = df.copy()
+
+    # -----------------------------
+    # 0. Basic cleaning
+    # -----------------------------
+    required_cols = [asin_col, date_col, demand_col] + list(dph_cols)
+    missing = [c for c in required_cols if c not in data.columns]
+    if missing:
+        raise ValueError(f"Missing required columns: {missing}")
+
+    data[date_col] = pd.to_datetime(data[date_col], errors="coerce")
+
+    for c in [demand_col] + list(dph_cols):
+        data[c] = pd.to_numeric(data[c], errors="coerce").fillna(0.0).clip(lower=0.0)
+
+    data = data.sort_values([asin_col, date_col]).reset_index(drop=True)
+
+    print("\n" + "=" * 100)
+    print("DPH → DEMAND LAG EFFECT DIAGNOSTIC")
+    print("=" * 100)
+    print("Data shape:", data.shape)
+    print("ASIN count:", data[asin_col].nunique())
+    print("Max lag:", max_lag)
+    print("Demand column:", demand_col)
+    print("DPH columns:", dph_cols)
+
+    # -----------------------------
+    # 1. Create lag features
+    # -----------------------------
+    for dph_col in dph_cols:
+        for lag in range(0, max_lag + 1):
+            lag_col = f"{dph_col}_lag{lag}"
+            if lag == 0:
+                data[lag_col] = data[dph_col]
+            else:
+                data[lag_col] = data.groupby(asin_col)[dph_col].shift(lag)
+
+    # Drop rows where lag features are unavailable
+    lag_feature_cols = [
+        f"{dph_col}_lag{lag}"
+        for dph_col in dph_cols
+        for lag in range(0, max_lag + 1)
+    ]
+
+    lag_df = data.dropna(subset=lag_feature_cols + [demand_col]).copy()
+
+    print("\nRows after lag construction:", lag_df.shape[0])
+
+    # -----------------------------
+    # 2. Correlation by lag
+    # -----------------------------
+    print("\n" + "=" * 100)
+    print("1. CORRELATION BY LAG")
+    print("=" * 100)
+
+    corr_rows = []
+
+    for dph_col in dph_cols:
+        for lag in range(0, max_lag + 1):
+            x_col = f"{dph_col}_lag{lag}"
+
+            x = lag_df[x_col].values
+            y = lag_df[demand_col].values
+
+            if np.std(x) == 0 or np.std(y) == 0:
+                pearson_raw = np.nan
+                spearman_raw = np.nan
+                pearson_log = np.nan
+            else:
+                pearson_raw = pd.Series(x).corr(pd.Series(y), method="pearson")
+                spearman_raw = pd.Series(x).corr(pd.Series(y), method="spearman")
+                pearson_log = pd.Series(np.log1p(x)).corr(
+                    pd.Series(np.log1p(y)),
+                    method="pearson"
+                )
+
+            corr_rows.append({
+                "dph_col": dph_col,
+                "lag": lag,
+                "pearson_raw": pearson_raw,
+                "spearman_raw": spearman_raw,
+                "pearson_log1p": pearson_log,
+            })
+
+    corr_df = pd.DataFrame(corr_rows)
+    print(corr_df.round(4).to_string(index=False))
+
+    # -----------------------------
+    # 3. Best lag by metric
+    # -----------------------------
+    print("\n" + "=" * 100)
+    print("2. BEST LAG BY METRIC")
+    print("=" * 100)
+
+    best_rows = []
+
+    for dph_col in dph_cols:
+        sub = corr_df[corr_df["dph_col"] == dph_col].copy()
+
+        for metric in ["pearson_raw", "spearman_raw", "pearson_log1p"]:
+            best_idx = sub[metric].abs().idxmax()
+            best_rows.append({
+                "dph_col": dph_col,
+                "metric": metric,
+                "best_lag": int(sub.loc[best_idx, "lag"]),
+                "best_value": sub.loc[best_idx, metric],
+                "lag0_value": sub.loc[sub["lag"] == 0, metric].iloc[0],
+                "lag1_value": sub.loc[sub["lag"] == 1, metric].iloc[0] if max_lag >= 1 else np.nan,
+                "lag2_value": sub.loc[sub["lag"] == 2, metric].iloc[0] if max_lag >= 2 else np.nan,
+            })
+
+    best_df = pd.DataFrame(best_rows)
+    print(best_df.round(4).to_string(index=False))
+
+    # -----------------------------
+    # 4. Zero / positive interaction by lag
+    # -----------------------------
+    print("\n" + "=" * 100)
+    print("3. ZERO INTERACTION BY LAG")
+    print("=" * 100)
+
+    zero_rows = []
+
+    for dph_col in dph_cols:
+        for lag in range(0, max_lag + 1):
+            x_col = f"{dph_col}_lag{lag}"
+
+            dph_zero = lag_df[x_col] <= 0
+            dph_pos = lag_df[x_col] > 0
+            demand_pos = lag_df[demand_col] > 0
+
+            zero_rows.append({
+                "dph_col": dph_col,
+                "lag": lag,
+                "P_dph_zero": dph_zero.mean(),
+                "P_demand_pos_given_dph_zero": demand_pos[dph_zero].mean() if dph_zero.sum() > 0 else np.nan,
+                "P_demand_pos_given_dph_pos": demand_pos[dph_pos].mean() if dph_pos.sum() > 0 else np.nan,
+                "mean_demand_given_dph_zero": lag_df.loc[dph_zero, demand_col].mean() if dph_zero.sum() > 0 else np.nan,
+                "mean_demand_given_dph_pos": lag_df.loc[dph_pos, demand_col].mean() if dph_pos.sum() > 0 else np.nan,
+            })
+
+    zero_df = pd.DataFrame(zero_rows)
+    print(zero_df.round(4).to_string(index=False))
+
+    # -----------------------------
+    # 5. Demand by lagged DPH decile
+    # -----------------------------
+    print("\n" + "=" * 100)
+    print("4. DEMAND BY LAGGED DPH DECILE")
+    print("=" * 100)
+
+    decile_tables = {}
+
+    for dph_col in dph_cols:
+        decile_tables[dph_col] = {}
+
+        # 只打印 lag 0, 1, 2, 4, 8, max_lag，避免太长
+        lags_to_print = sorted(set([0, 1, 2, 4, 8, max_lag]))
+        lags_to_print = [lag for lag in lags_to_print if lag <= max_lag]
+
+        for lag in lags_to_print:
+            x_col = f"{dph_col}_lag{lag}"
+
+            tmp = lag_df[[x_col, demand_col]].copy()
+            rank_col = tmp[x_col].rank(method="first")
+
+            try:
+                tmp["bucket"] = pd.qcut(
+                    rank_col,
+                    q=10,
+                    labels=[f"Q{i}" for i in range(1, 11)],
+                    duplicates="drop"
+                )
+            except Exception as e:
+                print(f"qcut failed for {dph_col} lag {lag}: {e}")
+                continue
+
+            out = (
+                tmp.groupby("bucket", observed=True)
+                .agg(
+                    n=(demand_col, "size"),
+                    dph_mean=(x_col, "mean"),
+                    dph_median=(x_col, "median"),
+                    demand_mean=(demand_col, "mean"),
+                    demand_median=(demand_col, "median"),
+                    demand_positive_rate=(demand_col, lambda x: (x > 0).mean()),
+                    demand_p90=(demand_col, lambda x: x.quantile(0.90)),
+                    demand_p95=(demand_col, lambda x: x.quantile(0.95)),
+                )
+                .reset_index()
+            )
+
+            decile_tables[dph_col][lag] = out
+
+            print(f"\nDemand by {dph_col}_lag{lag} decile:")
+            print(out.round(4).to_string(index=False))
+
+    # -----------------------------
+    # 6. Practical interpretation
+    # -----------------------------
+    print("\n" + "=" * 100)
+    print("5. PRACTICAL INTERPRETATION")
+    print("=" * 100)
+
+    for dph_col in dph_cols:
+        sub = corr_df[corr_df["dph_col"] == dph_col].copy()
+
+        lag0_s = sub.loc[sub["lag"] == 0, "spearman_raw"].iloc[0]
+        best_idx = sub["spearman_raw"].abs().idxmax()
+        best_lag = int(sub.loc[best_idx, "lag"])
+        best_s = sub.loc[best_idx, "spearman_raw"]
+
+        print(f"\n{dph_col}:")
+        print(f"  lag0 Spearman = {lag0_s:.4f}")
+        print(f"  best Spearman lag = {best_lag}, value = {best_s:.4f}")
+
+        if best_lag == 0:
+            print("  -> 同周 DPH 和 demand 关系最强。")
+            print("     说明未来 demand 仍然高度依赖未来同周 DPH，所以 exposure decoder 仍然必要。")
+        elif best_lag <= 2:
+            print("  -> 短滞后 1-2 周很强。")
+            print("     说明最近真实 DPH 可以显著帮助短期 demand forecast。")
+        else:
+            print("  -> 较长滞后也很强。")
+            print("     说明你可以在前几个 horizon 更多依赖历史真实 DPH，减少对未来 DPH 预测的压力。")
+
+        # 判断 lag 是否衰减快
+        lag_values = sub.sort_values("lag")["spearman_raw"].values
+        if len(lag_values) >= 5:
+            decay_ratio_4 = lag_values[4] / (lag_values[0] + 1e-8)
+            print(f"  lag4 / lag0 Spearman ratio = {decay_ratio_4:.4f}")
+
+            if decay_ratio_4 > 0.7:
+                print("  -> 滞后影响衰减慢，DPH 有较强 persistence / carry-over。")
+            else:
+                print("  -> 滞后影响衰减较快，未来同周 DPH 预测仍然是核心。")
+
+    print("\n" + "=" * 100)
+    print("DONE LAG DIAGNOSTIC")
+    print("=" * 100)
+
+    return {
+        "lag_df": lag_df,
+        "corr_by_lag": corr_df,
+        "best_lag": best_df,
+        "zero_interaction_by_lag": zero_df,
+        "decile_tables": decile_tables,
+    }
+
+
+# 一炮运行
+lag_result = diagnose_dph_demand_lag_effect(
+    data_raw1,
+    asin_col="asin",
+    date_col="order_week",
+    demand_col="fbi_demand",
+    dph_cols=("total_dph", "buy_box_dph", "in_stock_dph"),
+    max_lag=12,
+)
