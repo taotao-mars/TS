@@ -213,66 +213,37 @@ def _apply_dph_cap(df, cap):
 
 def _select_stock_decoder_extra_cols(data_raw):
     """
-    Select additional features to help the stock decoder predict future in_stock_dph_hat.
+    Explicitly select static / product / popularity features for the TCN exposure decoder.
 
-    These are NOT true future in_stock_dph. They are product / popularity / price / promo
-    / package features that can help predict future exposure.
+    These features help decoder distinguish ASIN-level exposure regimes:
+      - product family / category
+      - traffic band / top-band proxy
+      - review count / popularity / maturity
+      - price band / HB rank
 
-    We keep a conservative list to avoid leakage-prone realized future outcomes.
+    We intentionally exclude gl_product_group_desc because it is raw text.
     """
     candidate_cols = [
-        # Product/category/static identity proxies
+        # Product/category identity proxies.
         "gl_product_group",
         "category_code",
-        "brand_class",
-        "sort_type",
-        "variation",
-        "ind_new_asin",
-        "ind_amxl_hb",
-        "hbt",
-        "ind_target_audience",
-        "ind_top10_brand",
+
+        # Top-band / traffic-tier / product quality proxies.
+        "glance_view_band_cat",
+        "price_bands",
+        "hb_rank",
         "ind_top10_review_brand",
 
-        # Review / popularity proxies.
-        # NOTE: total_dph and buy_box_dph are intentionally excluded here
-        # because future realized traffic / buy-box signals may cause leakage.
-        "cust_avg_active_review_rating",
+        # Review / popularity / maturity proxies.
+        "customer_review_count",
         "customer_active_review_count",
         "customer_average_review_rating",
-        "customer_review_count",
-        "glance_view_band_cat",
-        "hb_rank",
-        "hb_score",
-        "facebook_fan_count",
-        "instagram_fan_count",
-        "twitter_follower_count",
-        "youtube_subscriber_count",
+        "cust_avg_active_review_rating",
 
-        # Price / promotion
-        "list_price",
-        "price_bands",
-        "ind_promotion",
-        "promotion_amount",
-        "promotion_ratio",
-        "promotion_pricing_amount",
-        "promotion_type",
-        "pricing_type",
-        "asin_promo_start_week",
-        "asin_promo_end_week",
-        "asin_promo_wordcount",
-
-        # Package / AMXL size
-        "pkg_height",
-        "pkg_length",
-        "pkg_width",
-        "pkg_weight",
-
-        # Calendar-ish columns
-        "order_month",
-        "order_year",
-        "week_index",
-        "ind_prime_week",
+        # Optional useful AMXL/product flags if available.
+        "ind_amxl_hb",
+        "ind_new_asin",
+        "ind_target_audience",
     ]
 
     # Avoid realized target / future outcome columns.
@@ -281,8 +252,11 @@ def _select_stock_decoder_extra_cols(data_raw):
         "order_units",
         "scot_oos",
         "in_stock_dph",
+        "total_dph",
+        "buy_box_dph",
         "asin",
         "order_week",
+        "gl_product_group_desc",
     }
 
     cols = [
@@ -295,44 +269,104 @@ def _select_stock_decoder_extra_cols(data_raw):
 
 def _encode_stock_decoder_extra_features(df, extra_cols):
     """
-    Convert extra stock-decoder features to numeric features.
+    Convert explicit static/product features to numeric decoder context features.
 
-    Object/categorical columns are ordinal-encoded by pandas.factorize.
-    This keeps the implementation lightweight and avoids requiring sklearn encoders.
+    Categorical-like fields:
+      add frequency encoding + normalized code encoding.
+
+    Numeric heavy-tail fields:
+      log1p + standardize.
+
+    Rating fields:
+      standardize directly.
+
+    The output columns are named:
+      stock_static__<col>__...
     """
     out_cols = []
 
-    for c in extra_cols:
-        new_c = f"stock_extra__{c}"
+    categorical_like = {
+        "gl_product_group",
+        "category_code",
+        "glance_view_band_cat",
+        "price_bands",
+        "ind_top10_review_brand",
+        "ind_amxl_hb",
+        "ind_new_asin",
+        "ind_target_audience",
+    }
 
+    log_numeric_like = {
+        "customer_review_count",
+        "customer_active_review_count",
+        "hb_rank",
+    }
+
+    rating_like = {
+        "customer_average_review_rating",
+        "cust_avg_active_review_rating",
+    }
+
+    for c in extra_cols:
         if c not in df.columns:
             continue
 
-        if pd.api.types.is_numeric_dtype(df[c]):
-            val = pd.to_numeric(_get_1d_col(df, c), errors="coerce").fillna(0.0)
+        s = _get_1d_col(df, c)
 
-            # Conservative transforms by feature type.
-            cl = c.lower()
-            if (
-                "count" in cl or "dph" in cl or "price" in cl
-                or "amount" in cl or "rank" in cl or "score" in cl
-                or "height" in cl or "length" in cl or "width" in cl
-                or "weight" in cl or "wordcount" in cl
-            ):
-                val = np.log1p(val.clip(lower=0))
+        if c in categorical_like:
+            raw = s.astype(str).fillna("MISSING")
 
-            # Scale robustly to avoid huge values.
-            std = float(val.std()) if float(val.std()) > 1e-8 else 1.0
+            codes, uniques = pd.factorize(raw)
+            denom = max(len(uniques) - 1, 1)
+
+            code_col = f"stock_static__{c}__code"
+            freq_col = f"stock_static__{c}__freq"
+
+            df[code_col] = codes.astype(float) / denom
+
+            freq = raw.value_counts(normalize=True)
+            df[freq_col] = raw.map(freq).fillna(0.0).astype(float)
+
+            out_cols.extend([code_col, freq_col])
+
+        elif c in log_numeric_like:
+            val = pd.to_numeric(s, errors="coerce").fillna(0.0).clip(lower=0.0)
+            val = np.log1p(val)
+
             mean = float(val.mean())
+            std = float(val.std()) if float(val.std()) > 1e-8 else 1.0
+
+            new_c = f"stock_static__{c}__log_std"
             df[new_c] = ((val - mean) / std).clip(-5, 5)
+            out_cols.append(new_c)
+
+        elif c in rating_like:
+            val = pd.to_numeric(s, errors="coerce").fillna(0.0)
+
+            mean = float(val.mean())
+            std = float(val.std()) if float(val.std()) > 1e-8 else 1.0
+
+            new_c = f"stock_static__{c}__std"
+            df[new_c] = ((val - mean) / std).clip(-5, 5)
+            out_cols.append(new_c)
 
         else:
-            codes, uniques = pd.factorize(_get_1d_col(df, c).astype(str).fillna("MISSING"))
-            # normalize category code to roughly [0,1]
-            denom = max(len(uniques) - 1, 1)
-            df[new_c] = codes.astype(float) / denom
+            # Safe fallback.
+            if pd.api.types.is_numeric_dtype(s):
+                val = pd.to_numeric(s, errors="coerce").fillna(0.0)
+                mean = float(val.mean())
+                std = float(val.std()) if float(val.std()) > 1e-8 else 1.0
 
-        out_cols.append(new_c)
+                new_c = f"stock_static__{c}__std"
+                df[new_c] = ((val - mean) / std).clip(-5, 5)
+                out_cols.append(new_c)
+            else:
+                raw = s.astype(str).fillna("MISSING")
+                freq = raw.value_counts(normalize=True)
+
+                new_c = f"stock_static__{c}__freq"
+                df[new_c] = raw.map(freq).fillna(0.0).astype(float)
+                out_cols.append(new_c)
 
     return df, out_cols
 
@@ -3474,3 +3508,80 @@ Among these, the most important for your current decoder are:
 """)
 
     return found_priority, related
+
+
+
+def diagnose_static_features_in_decoder(result, data_raw1=None):
+    """
+    Verify that explicit static/product features are truly inside decoder future_context.
+    """
+    context_cols = result.get("context_cols", None)
+    va_ld = result.get("va_ld", None)
+
+    print("\n" + "=" * 90)
+    print("STATIC FEATURES INSIDE DECODER CHECK")
+    print("=" * 90)
+
+    if context_cols is None:
+        print("WARNING: result['context_cols'] is missing. Re-run the main function from this v4 file.")
+        return None
+
+    static_cols = [c for c in context_cols if c.startswith("stock_static__")]
+    print("Number of stock_static__ context cols:", len(static_cols))
+    print(static_cols)
+
+    print("\nHoliday / distance / DPH-proxy context counts:")
+    print("holiday_indicator_*:", len([c for c in context_cols if c.startswith("holiday_indicator_")]))
+    print("distance_*:", len([c for c in context_cols if c.startswith("distance_")]))
+    print("hist_* DPH proxies:", len([c for c in context_cols if c.startswith("hist_")]))
+
+    if va_ld is not None:
+        for b in va_ld:
+            fc = b["future_context"]
+            print("\nfuture_context shape:", tuple(fc.shape))
+            print("future_context dim:", fc.shape[-1])
+            break
+
+    if data_raw1 is not None:
+        raw_candidates = _select_stock_decoder_extra_cols(data_raw1)
+        print("\nRaw static candidates found in data_raw1:")
+        print(raw_candidates)
+
+    if len(static_cols) == 0:
+        print("\nISSUE: static columns are still not in context. You need to re-run training from this v4 file, not only the diagnostic cell.")
+    else:
+        print("\nOK: static product features are being fed into the TCN exposure decoder.")
+
+    return static_cols
+
+
+def explain_tcn_static_decoder_setting():
+    print("\n" + "=" * 90)
+    print("TCN + STATIC PRODUCT FEATURES SETTING")
+    print("=" * 90)
+    print("""
+This version is strict leak-free.
+
+Decoder inputs include:
+  1. future-known calendar / holiday / distance context
+  2. historical DPH anchors: last / mean4 / mean13
+  3. explicit static product features:
+       gl_product_group
+       category_code
+       glance_view_band_cat
+       price_bands
+       hb_rank
+       review counts
+       review ratings
+       AMXL flags if available
+
+Decoder outputs point predictions:
+  log1p(total_dph_hat)
+  log1p(buy_box_dph_hat)
+  log1p(in_stock_dph_hat)
+
+No gl_product_group_desc.
+No future true DPH.
+No AR rollout.
+No ratio output.
+""")
