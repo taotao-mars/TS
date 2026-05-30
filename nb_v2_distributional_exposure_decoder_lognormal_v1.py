@@ -684,7 +684,7 @@ def load_real_data(data_raw, dph_cap_q=0.995):
     print("History in_stock_dph: raw historical value, no lag shift")
     print("Future context excludes in_stock_dph")
     print("Future context includes distance_* calendar features")
-    print("Distributional exposure decoder: predicts log-normal mu/sigma for total/buy_box/in_stock DPH")
+    print("Tempered distributional exposure decoder: mu/sigma with tau_mean=0.2 and sigma_max=1.2")
     print("Stock decoder safe mode: excludes future true total_dph and buy_box_dph")
     print("Safe historical DPH proxies: total_dph/buy_box_dph last/mean4/mean13")
     print("History encoder includes DPH funnel features")
@@ -935,11 +935,12 @@ class DistributionalExposureDecoder(nn.Module):
     under-estimate the raw-scale mean.
     """
     def __init__(self, d_model, context_dim, horizon=20, hidden=64,
-                 sigma_min=0.05, sigma_max=3.0):
+                 sigma_min=0.05, sigma_max=1.2, tau_mean=0.2):
         super().__init__()
         self.horizon = horizon
         self.sigma_min = sigma_min
         self.sigma_max = sigma_max
+        self.tau_mean = tau_mean
 
         self.net = nn.Sequential(
             nn.Linear(d_model + context_dim + 2, hidden),
@@ -1018,9 +1019,12 @@ class TCN_ENN(nn.Module):
 
         mu, sigma = self.stock_decoder(h_t, future_context)  # both [B, H, 3]
 
-        # Implied lognormal raw-scale mean:
-        # E[DPH] = exp(mu + 0.5 sigma^2) - 1
-        log_mean_feature = mu + 0.5 * (sigma ** 2)
+        # Tempered lognormal mean feature:
+        #   tau=0   -> median-like feature exp(mu)-1
+        #   tau=1   -> full lognormal mean exp(mu + 0.5 sigma^2)-1
+        #   tau=0.2 -> conservative right-tail correction
+        tau = getattr(self.stock_decoder, "tau_mean", 0.2)
+        log_mean_feature = mu + tau * 0.5 * (sigma ** 2)
 
         # Keep the feature scale stable.
         log_mean_feature = log_mean_feature.clamp(min=0.0, max=16.0)
@@ -1123,12 +1127,15 @@ def pinball(y, pred, q):
 
 
 
+
 def stock_decoder_loss(exposure_dist_hat, future_instock_true,
                        future_total_dph_true=None,
                        future_buy_box_dph_true=None,
-                       mean_weight=0.00):
+                       mean_weight=0.00,
+                       sigma_reg_weight=0.01,
+                       sigma_anchor=None):
     """
-    Distributional exposure decoder loss.
+    Tempered distributional exposure decoder loss.
 
     exposure_dist_hat[..., 0:3] = mu for log1p(total/buy_box/in_stock DPH)
     exposure_dist_hat[..., 3:6] = sigma for log1p(total/buy_box/in_stock DPH)
@@ -1136,11 +1143,8 @@ def stock_decoder_loss(exposure_dist_hat, future_instock_true,
     Assumption:
         log1p(DPH) ~ Normal(mu, sigma)
 
-    True future DPH values are used only as auxiliary supervision.
-    Demand prediction uses predicted distributional features only.
-
-    mean_weight is optional. Default 0 because log-normal implied mean already
-    handles heavy-tail mean correction.
+    We add a small sigma regularization because full lognormal mean is
+    extremely sensitive to sigma.
     """
     if exposure_dist_hat is None:
         return torch.tensor(0.0, device=future_instock_true.device)
@@ -1166,17 +1170,27 @@ def stock_decoder_loss(exposure_dist_hat, future_instock_true,
     nll = 0.5 * (((y_log - mu) / sigma) ** 2 + 2.0 * torch.log(sigma))
     nll_loss = nll.mean()
 
-    # Optional mean calibration on implied lognormal raw-scale means.
+    # Penalize overly large sigma to avoid exploding lognormal means.
+    sigma_reg = sigma_reg_weight * (sigma ** 2).mean()
+
+    loss = nll_loss + sigma_reg
+
+    # Optional anchor if later needed.
+    if sigma_anchor is not None:
+        loss = loss + sigma_reg_weight * ((sigma - sigma_anchor) ** 2).mean()
+
+    # Optional mean calibration on tempered/full implied raw-scale means.
     if mean_weight is not None and mean_weight > 0:
-        pred_mean_level = torch.expm1(mu + 0.5 * sigma ** 2).clamp(min=0.0)
+        pred_mean_level = torch.expm1(mu + 0.2 * 0.5 * sigma ** 2).clamp(min=0.0)
         true_level = true_stack
 
         mean_pred = torch.log1p(pred_mean_level.mean(dim=(0, 1)))
         mean_true = torch.log1p(true_level.mean(dim=(0, 1)))
         mean_loss = torch.mean(torch.abs(mean_pred - mean_true))
-        return nll_loss + mean_weight * mean_loss
 
-    return nll_loss
+        loss = loss + mean_weight * mean_loss
+
+    return loss
 
 
 
@@ -1577,12 +1591,20 @@ def generate_forecast_df(model, va_ld, M=50):
                         "pred_instock_dph_median_hat": torch.expm1(stock_log_hat[i,h,2]).item()
                             if stock_log_hat is not None else np.nan,
 
-                        # Log-normal mean estimate: exp(mu + 0.5 sigma^2)-1.
-                        "pred_total_dph_hat": torch.expm1(stock_log_hat[i,h,0] + 0.5 * stock_log_hat[i,h,3] ** 2).item()
+                        # Tempered mean estimate used by demand head: exp(mu + tau * 0.5 sigma^2)-1.
+                        "pred_total_dph_hat": torch.expm1(stock_log_hat[i,h,0] + 0.2 * 0.5 * stock_log_hat[i,h,3] ** 2).item()
                             if stock_log_hat is not None else np.nan,
-                        "pred_buy_box_dph_hat": torch.expm1(stock_log_hat[i,h,1] + 0.5 * stock_log_hat[i,h,4] ** 2).item()
+                        "pred_buy_box_dph_hat": torch.expm1(stock_log_hat[i,h,1] + 0.2 * 0.5 * stock_log_hat[i,h,4] ** 2).item()
                             if stock_log_hat is not None else np.nan,
-                        "pred_instock_dph_hat": torch.expm1(stock_log_hat[i,h,2] + 0.5 * stock_log_hat[i,h,5] ** 2).item()
+                        "pred_instock_dph_hat": torch.expm1(stock_log_hat[i,h,2] + 0.2 * 0.5 * stock_log_hat[i,h,5] ** 2).item()
+                            if stock_log_hat is not None else np.nan,
+
+                        # Full lognormal mean for diagnostics only.
+                        "pred_total_dph_fullmean_hat": torch.expm1(stock_log_hat[i,h,0] + 0.5 * stock_log_hat[i,h,3] ** 2).item()
+                            if stock_log_hat is not None else np.nan,
+                        "pred_buy_box_dph_fullmean_hat": torch.expm1(stock_log_hat[i,h,1] + 0.5 * stock_log_hat[i,h,4] ** 2).item()
+                            if stock_log_hat is not None else np.nan,
+                        "pred_instock_dph_fullmean_hat": torch.expm1(stock_log_hat[i,h,2] + 0.5 * stock_log_hat[i,h,5] ** 2).item()
                             if stock_log_hat is not None else np.nan,
                         "scot_oos": b["oos"][i,h].item(),
                         "oos": b["oos"][i,h].item(),
@@ -2834,11 +2856,12 @@ def check_context_feature_columns(data_raw1):
 
 def diagnose_stock_decoder(result):
     """
-    Diagnose distributional exposure decoder.
+    Diagnose tempered distributional exposure decoder.
 
     Reports:
       - median-like estimate exp(mu)-1
-      - lognormal mean estimate exp(mu + 0.5 sigma^2)-1
+      - tempered mean estimate exp(mu + 0.2 * 0.5 sigma^2)-1
+      - full lognormal mean estimate exp(mu + 0.5 sigma^2)-1
       - sigma scale
       - horizon / season / event diagnostics when possible
     """
@@ -2871,42 +2894,71 @@ def diagnose_stock_decoder(result):
         df["event_window"] = "unknown"
 
     targets = [
-        ("total_dph", "true_future_total_dph", "pred_total_dph_hat", "pred_total_dph_median_hat", "pred_total_sigma"),
-        ("buy_box_dph", "true_future_buy_box_dph", "pred_buy_box_dph_hat", "pred_buy_box_dph_median_hat", "pred_buy_box_sigma"),
-        ("in_stock_dph", "true_future_instock", "pred_instock_dph_hat", "pred_instock_dph_median_hat", "pred_instock_sigma"),
+        (
+            "total_dph",
+            "true_future_total_dph",
+            "pred_total_dph_hat",
+            "pred_total_dph_median_hat",
+            "pred_total_dph_fullmean_hat",
+            "pred_total_sigma",
+        ),
+        (
+            "buy_box_dph",
+            "true_future_buy_box_dph",
+            "pred_buy_box_dph_hat",
+            "pred_buy_box_dph_median_hat",
+            "pred_buy_box_dph_fullmean_hat",
+            "pred_buy_box_sigma",
+        ),
+        (
+            "in_stock_dph",
+            "true_future_instock",
+            "pred_instock_dph_hat",
+            "pred_instock_dph_median_hat",
+            "pred_instock_dph_fullmean_hat",
+            "pred_instock_sigma",
+        ),
     ]
 
     def _summarize(g, group_name=None, group_value=None):
         rows = []
-        for name, true_col, mean_col, median_col, sigma_col in targets:
-            if true_col not in g.columns or mean_col not in g.columns:
+        for name, true_col, temp_col, median_col, full_col, sigma_col in targets:
+            if true_col not in g.columns or temp_col not in g.columns:
                 continue
 
             y = pd.to_numeric(g[true_col], errors="coerce").fillna(0).clip(lower=0).values
-            p_mean = pd.to_numeric(g[mean_col], errors="coerce").fillna(0).clip(lower=0).values
+            p_temp = pd.to_numeric(g[temp_col], errors="coerce").fillna(0).clip(lower=0).values
             p_med = pd.to_numeric(g[median_col], errors="coerce").fillna(0).clip(lower=0).values \
-                if median_col in g.columns else np.full_like(p_mean, np.nan)
+                if median_col in g.columns else np.full_like(p_temp, np.nan)
+            p_full = pd.to_numeric(g[full_col], errors="coerce").fillna(0).clip(lower=0).values \
+                if full_col in g.columns else np.full_like(p_temp, np.nan)
             sig = pd.to_numeric(g[sigma_col], errors="coerce").fillna(np.nan).values \
-                if sigma_col in g.columns else np.full_like(p_mean, np.nan)
+                if sigma_col in g.columns else np.full_like(p_temp, np.nan)
 
             denom = np.abs(y).sum()
+            true_mean = y.mean() if len(y) else np.nan
+
             row = {
                 "target": name,
                 "rows": len(g),
-                "true_mean": y.mean() if len(y) else np.nan,
-                "pred_lognormal_mean": p_mean.mean() if len(p_mean) else np.nan,
+                "true_mean": true_mean,
+                "pred_tempered_mean": p_temp.mean() if len(p_temp) else np.nan,
                 "pred_median_mean": np.nanmean(p_med) if len(p_med) else np.nan,
-                "mean_pred_true_ratio": p_mean.mean() / (y.mean() + 1e-8) if len(y) else np.nan,
-                "median_pred_true_ratio": np.nanmean(p_med) / (y.mean() + 1e-8) if len(y) else np.nan,
-                "WAPE_lognormal_mean": np.abs(y - p_mean).sum() / denom if denom > 0 else np.nan,
+                "pred_full_mean": np.nanmean(p_full) if len(p_full) else np.nan,
+                "tempered_ratio": p_temp.mean() / (true_mean + 1e-8) if len(y) else np.nan,
+                "median_ratio": np.nanmean(p_med) / (true_mean + 1e-8) if len(y) else np.nan,
+                "full_ratio": np.nanmean(p_full) / (true_mean + 1e-8) if len(y) else np.nan,
+                "WAPE_tempered": np.abs(y - p_temp).sum() / denom if denom > 0 else np.nan,
                 "WAPE_median": np.abs(y - p_med).sum() / denom if denom > 0 and not np.isnan(p_med).all() else np.nan,
-                "log_MAE_mu": np.mean(np.abs(np.log1p(y) - np.log1p(p_med))) if not np.isnan(p_med).all() else np.nan,
-                "corr_lognormal_mean": np.corrcoef(y, p_mean)[0, 1] if len(y) and np.std(y) > 0 and np.std(p_mean) > 0 else np.nan,
+                "WAPE_full": np.abs(y - p_full).sum() / denom if denom > 0 and not np.isnan(p_full).all() else np.nan,
+                "corr_tempered": np.corrcoef(y, p_temp)[0, 1] if len(y) and np.std(y) > 0 and np.std(p_temp) > 0 else np.nan,
                 "corr_median": np.corrcoef(y, p_med)[0, 1] if len(y) and np.std(y) > 0 and np.std(p_med) > 0 else np.nan,
+                "corr_full": np.corrcoef(y, p_full)[0, 1] if len(y) and np.std(y) > 0 and np.std(p_full) > 0 else np.nan,
+                "log_MAE_mu": np.mean(np.abs(np.log1p(y) - np.log1p(p_med))) if not np.isnan(p_med).all() else np.nan,
                 "sigma_mean": np.nanmean(sig),
                 "sigma_p90": np.nanpercentile(sig, 90) if np.isfinite(sig).any() else np.nan,
                 "true_zero_rate": (y <= 0).mean() if len(y) else np.nan,
-                "pred_zero_rate": (p_mean <= 0).mean() if len(p_mean) else np.nan,
+                "pred_zero_rate": (p_temp <= 0).mean() if len(p_temp) else np.nan,
             }
             if group_name is not None:
                 row[group_name] = group_value
@@ -2934,7 +2986,7 @@ def diagnose_stock_decoder(result):
     by_event = pd.DataFrame(by_event_rows)
 
     print("\n" + "=" * 80)
-    print("DISTRIBUTIONAL EXPOSURE DECODER DIAGNOSTIC")
+    print("TEMPERED DISTRIBUTIONAL EXPOSURE DECODER DIAGNOSTIC")
     print("=" * 80)
 
     print("\nOverall:")
@@ -2958,6 +3010,32 @@ def diagnose_stock_decoder(result):
         "by_season": by_season,
         "by_event": by_event,
     }
+
+
+def diagnose_distributional_exposure_columns(result):
+    """
+    Check whether tempered distributional decoder outputs are present in forecast_df.
+    """
+    forecast_df = result.get("forecast_df", None)
+    if forecast_df is None:
+        print("No forecast_df found.")
+        return None
+
+    needed = [
+        "pred_total_mu", "pred_total_sigma",
+        "pred_buy_box_mu", "pred_buy_box_sigma",
+        "pred_instock_mu", "pred_instock_sigma",
+        "pred_total_dph_median_hat", "pred_total_dph_hat", "pred_total_dph_fullmean_hat",
+        "pred_buy_box_dph_median_hat", "pred_buy_box_dph_hat", "pred_buy_box_dph_fullmean_hat",
+        "pred_instock_dph_median_hat", "pred_instock_dph_hat", "pred_instock_dph_fullmean_hat",
+    ]
+
+    print("\n" + "=" * 80)
+    print("TEMPERED DISTRIBUTIONAL EXPOSURE OUTPUT COLUMN CHECK")
+    print("=" * 80)
+    print({c: (c in forecast_df.columns) for c in needed})
+
+    return {c: (c in forecast_df.columns) for c in needed}
 
 
 def diagnose_distributional_exposure_columns(result):
@@ -3076,7 +3154,7 @@ def check_safe_historical_dph_proxy_context(result, n_batches=1):
 
 
 
-# Main usage for distributional exposure-decoder version:
+# Main usage for tempered distributional exposure-decoder version:
 #
 # result_all_intersection = run_nb_all_sample_scot_intersection(
 #     data_raw1=data_raw1,
