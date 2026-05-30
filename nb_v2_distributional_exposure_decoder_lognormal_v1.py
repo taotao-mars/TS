@@ -730,10 +730,10 @@ def load_real_data(data_raw, dph_cap_q=0.995):
     print("History in_stock_dph: raw historical value, no lag shift")
     print("Future context excludes in_stock_dph")
     print("Future context includes distance_* calendar features")
-    print("AR exposure decoder: recursive DPH rollout with last observed DPH lag")
+    print("True-lag exposure decoder: rolling DPH decoder using true previous DPH lag")
     print("Stock decoder safe mode: excludes future true total_dph and buy_box_dph")
     print("Safe historical DPH proxies: total/buy_box/in_stock last/mean4/mean13")
-    print("AR decoder initial lag includes hist total/buy_box/in_stock last logs")
+    print("True-lag decoder: step 1 uses hist last DPH; later steps use true previous future DPH")
     print("History encoder includes DPH funnel features")
     print(f"DPH cap q: {dph_cap_q} | cap value: {dph_cap}")
     print(f"Context dim: {len(context_cols)}")
@@ -971,19 +971,19 @@ class Epinet(nn.Module):
 
 
 
-class ARExposureDecoder(nn.Module):
+
+class TrueLagExposureDecoder(nn.Module):
     """
-    Autoregressive exposure decoder.
+    True-lag rolling exposure decoder.
 
-    It first uses the last observed historical DPH values as lag state:
-        [log1p(total_dph_T), log1p(buy_box_dph_T), log1p(in_stock_dph_T)]
+    Step 1:
+        use last observed historical DPH_T.
 
-    Then it rolls out future DPH path step by step:
-        step h input: h_t + future_context_h + previous predicted DPH log-state + horizon encoding
-        step h output: log1p(total/buy_box/in_stock DPH_hat_h)
+    Step h>1:
+        use TRUE previous future DPH_{T+h-1} as lag input.
 
-    This is still leak-free because after step 1 it uses its own predicted lag,
-    not true future DPH.
+    This is a rolling operational / oracle-lag diagnostic setting.
+    It is NOT a strict direct 20-week forecast.
     """
     def __init__(self, d_model, context_dim, horizon=20, hidden=64):
         super().__init__()
@@ -998,20 +998,6 @@ class ARExposureDecoder(nn.Module):
         )
 
     def _initial_prev_log_state(self, future_context):
-        """
-        Extract initial previous DPH log-state from last observed historical proxies.
-
-        Expected proxy order at the end of future_context:
-            -9 hist_total_dph_last_log
-            -8 hist_total_dph_mean4_log
-            -7 hist_total_dph_mean13_log
-            -6 hist_buy_box_dph_last_log
-            -5 hist_buy_box_dph_mean4_log
-            -4 hist_buy_box_dph_mean13_log
-            -3 hist_instock_dph_last_log
-            -2 hist_instock_dph_mean4_log
-            -1 hist_instock_dph_mean13_log
-        """
         B, H, C = future_context.shape
         if C >= 9:
             total_last = future_context[:, 0, -9]
@@ -1022,7 +1008,15 @@ class ARExposureDecoder(nn.Module):
             prev = torch.zeros(B, 3, device=future_context.device, dtype=future_context.dtype)
         return prev
 
-    def forward(self, h_t, future_context):
+    def forward(self, h_t, future_context, true_future_exposure=None):
+        """
+        true_future_exposure: optional tensor [B, H, 3]
+            columns = total_dph, buy_box_dph, in_stock_dph.
+
+        If provided:
+            step 0 uses historical true DPH_T
+            step h>0 uses true_future_exposure[:, h-1, :]
+        """
         B, H, C = future_context.shape
 
         prev_log = self._initial_prev_log_state(future_context)
@@ -1043,15 +1037,16 @@ class ARExposureDecoder(nn.Module):
             inp = torch.cat([h_t, ctx_h, prev_log, horizon_sin, horizon_cos], dim=-1)
 
             out_log = self.net(inp)
-            out_log = F.softplus(out_log)  # log1p exposure hats, nonnegative
+            out_log = F.softplus(out_log)
 
             outs.append(out_log.unsqueeze(1))
 
-            # Strict recursive rollout: next step only sees predicted lag.
-            prev_log = out_log
+            if true_future_exposure is not None and step < H - 1:
+                prev_log = torch.log1p(true_future_exposure[:, step, :].clamp(min=0.0))
+            else:
+                prev_log = out_log
 
-        exposure_log_hat = torch.cat(outs, dim=1)  # [B, H, 3]
-        return exposure_log_hat
+        return torch.cat(outs, dim=1)
 
 
 
@@ -1068,7 +1063,7 @@ class TCN_ENN(nn.Module):
         self.encoder = TCNSparseAttnEncoder(input_dim, d_model, horizon)
 
         if use_stock_decoder:
-            self.stock_decoder = ARExposureDecoder(d_model, context_dim, horizon)
+            self.stock_decoder = TrueLagExposureDecoder(d_model, context_dim, horizon)
             z_context_dim = context_dim + 3  # add predicted log1p(total/buy_box/in_stock DPH hats)
         else:
             self.stock_decoder = None
@@ -1077,28 +1072,35 @@ class TCN_ENN(nn.Module):
         self.z_generator = ContextZGenerator(d_model, z_context_dim, d_z, horizon)
         self.epinet = Epinet(d_model, d_z, horizon, prior_scale)
 
-    def _augment_context_with_stock_hat(self, h_t, future_context):
+    def _augment_context_with_stock_hat(self, h_t, future_context, true_future_exposure=None):
         """
-        Predict future exposure hats and append them to future_context.
+        True-lag rolling exposure rollout.
 
-        Demand head sees predicted exposure hats only:
-            total_dph_hat, buy_box_dph_hat, in_stock_dph_hat
-
-        It never sees true future DPH values.
+        Demand head receives predicted exposure hats only.
+        Decoder can use true previous DPH as lag if true_future_exposure is provided.
         """
         if not self.use_stock_decoder:
             return future_context, None
 
-        exposure_log_hat = self.stock_decoder(h_t, future_context)  # [B, H, 3]
+        exposure_log_hat = self.stock_decoder(
+            h_t,
+            future_context,
+            true_future_exposure=true_future_exposure,
+        )
+
         future_context_aug = torch.cat(
             [future_context, exposure_log_hat],
             dim=-1,
         )
         return future_context_aug, exposure_log_hat
 
-    def forward(self, x, future_context, nZ=8):
+    def forward(self, x, future_context, nZ=8, true_future_exposure=None):
         mu_base, alpha_base, h_t = self.encoder(x)
-        future_context_aug, stock_log_hat = self._augment_context_with_stock_hat(h_t, future_context)
+        future_context_aug, stock_log_hat = self._augment_context_with_stock_hat(
+            h_t,
+            future_context,
+            true_future_exposure=true_future_exposure,
+        )
 
         phi = h_t.detach()
         z_mean, z_std = self.z_generator(phi, future_context_aug)
@@ -1117,11 +1119,15 @@ class TCN_ENN(nn.Module):
 
         return preds, z_reg, stock_log_hat
 
-    def predict(self, x, future_context, M=50, return_stock=False):
+    def predict(self, x, future_context, M=50, return_stock=False, true_future_exposure=None):
         self.eval()
         with torch.no_grad():
             mu_base, alpha_base, h_t = self.encoder(x)
-            future_context_aug, stock_log_hat = self._augment_context_with_stock_hat(h_t, future_context)
+            future_context_aug, stock_log_hat = self._augment_context_with_stock_hat(
+                h_t,
+                future_context,
+                true_future_exposure=true_future_exposure,
+            )
 
             phi = h_t.detach()
             z_mean, z_std = self.z_generator(phi, future_context_aug)
@@ -1471,7 +1477,18 @@ def train(
             fc = b["future_context"]
             y  = b["y"]
 
-            preds, z_reg, stock_log_hat = model(x, fc, nZ=nZ)
+            true_future_exposure = torch.stack([
+                b["future_total_dph"],
+                b["future_buy_box_dph"],
+                b["future_instock"],
+            ], dim=-1)
+
+            preds, z_reg, stock_log_hat = model(
+                x,
+                fc,
+                nZ=nZ,
+                true_future_exposure=true_future_exposure,
+            )
 
             nll_loss = sum(
                 tail_weighted_negbin_nll(y, mu, alpha, beta_tail=beta_tail)
@@ -1518,7 +1535,17 @@ def train(
         vl = 0.0
         with torch.no_grad():
             for b in va_ld:
-                p50, p70 = model.predict(b["x"], b["future_context"], M=50)
+                true_future_exposure = torch.stack([
+                    b["future_total_dph"],
+                    b["future_buy_box_dph"],
+                    b["future_instock"],
+                ], dim=-1)
+                p50, p70 = model.predict(
+                    b["x"],
+                    b["future_context"],
+                    M=50,
+                    true_future_exposure=true_future_exposure,
+                )
                 vl += (pinball(b["y"],p50,0.5) + pinball(b["y"],p70,0.7)).item()
         vl /= max(1, len(va_ld))
 
@@ -1555,7 +1582,17 @@ def evaluate(model, va_ld, M=100):
     model.eval()
     with torch.no_grad():
         for b in va_ld:
-            p50, p70 = model.predict(b["x"], b["future_context"], M=M)
+            true_future_exposure = torch.stack([
+                b["future_total_dph"],
+                b["future_buy_box_dph"],
+                b["future_instock"],
+            ], dim=-1)
+            p50, p70 = model.predict(
+                b["x"],
+                b["future_context"],
+                M=M,
+                true_future_exposure=true_future_exposure,
+            )
             all_y.append(b["y"].numpy())
             all_p50.append(p50.numpy())
             all_p70.append(p70.numpy())
@@ -1574,7 +1611,18 @@ def generate_forecast_df(model, va_ld, M=50):
     model.eval()
     with torch.no_grad():
         for b in va_ld:
-            p50, p70, stock_log_hat = model.predict(b["x"], b["future_context"], M=M, return_stock=True)
+            true_future_exposure = torch.stack([
+                b["future_total_dph"],
+                b["future_buy_box_dph"],
+                b["future_instock"],
+            ], dim=-1)
+            p50, p70, stock_log_hat = model.predict(
+                b["x"],
+                b["future_context"],
+                M=M,
+                return_stock=True,
+                true_future_exposure=true_future_exposure,
+            )
             hist_mean = (b["x"][:,:,0].exp()-1).mean(dim=1,keepdim=True).clamp(min=0)
             hm50 = hist_mean.expand_as(b["y"])
             hm70 = hm50 * 1.25
@@ -1625,7 +1673,17 @@ def generate_diagnostic_df(model, va_ld, M=100, threshold=0.5):
     model.eval()
     with torch.no_grad():
         for b in va_ld:
-            p50, p70 = model.predict(b["x"], b["future_context"], M=M)
+            true_future_exposure = torch.stack([
+                b["future_total_dph"],
+                b["future_buy_box_dph"],
+                b["future_instock"],
+            ], dim=-1)
+            p50, p70 = model.predict(
+                b["x"],
+                b["future_context"],
+                M=M,
+                true_future_exposure=true_future_exposure,
+            )
             for i in range(b["y"].shape[0]):
                 for h in range(b["y"].shape[1]):
                     y_val   = b["y"][i,h].item()
@@ -3091,7 +3149,7 @@ def diagnose_dph_cap_effect(data_raw1, q=0.995):
 
 
 
-def diagnose_ar_exposure_context_columns(result):
+def diagnose_true_lag_exposure_context_columns(result):
     """
     Verify that AR exposure decoder has season/event/proxy columns.
     """
@@ -3114,7 +3172,7 @@ def diagnose_ar_exposure_context_columns(result):
     prox_cols = [c for c in context_cols if c.endswith("_proximity")]
 
     print("\n" + "=" * 80)
-    print("AR EXPOSURE CONTEXT COLUMN CHECK")
+    print("TRUE-LAG EXPOSURE CONTEXT COLUMN CHECK")
     print("=" * 80)
     print("Basic seasonal cols:")
     print({c: (c in context_cols) for c in basic})
@@ -3130,7 +3188,7 @@ def diagnose_ar_exposure_context_columns(result):
     }
 
 
-def diagnose_ar_exposure_rollout(result):
+def diagnose_true_lag_exposure_rollout(result):
     """
     Extra diagnostics for AR rollout:
       - pred/true ratio by horizon
@@ -3171,7 +3229,7 @@ def diagnose_ar_exposure_rollout(result):
     by_h = pd.DataFrame(rows)
 
     print("\n" + "=" * 80)
-    print("AR EXPOSURE ROLLOUT DIAGNOSTIC BY HORIZON")
+    print("TRUE-LAG EXPOSURE ROLLOUT DIAGNOSTIC BY HORIZON")
     print("=" * 80)
     print(by_h)
 
@@ -3202,3 +3260,29 @@ def diagnose_ar_exposure_rollout(result):
         "persistence": persist_df,
     }
 
+
+
+
+def explain_true_lag_setting():
+    """
+    Explain the evaluation setting for this version.
+    """
+    print("\n" + "=" * 80)
+    print("TRUE-LAG ROLLING SETTING")
+    print("=" * 80)
+    print("""
+This version uses true previous DPH inside exposure decoder rollout:
+
+    T+1 uses true historical DPH_T
+    T+2 uses true future DPH_{T+1}
+    T+3 uses true future DPH_{T+2}
+    ...
+    T+20 uses true future DPH_{T+19}
+
+This is NOT a strict direct 20-week forecast.
+It is a rolling operational / oracle-lag diagnostic setting.
+
+Use it to answer:
+    If recent true exposure signals are available each week,
+    can exposure and demand forecasts improve?
+""")
