@@ -2450,6 +2450,267 @@ def run_best_exposure_anchor_attention(
 # exposure_hat_for_demand = result_best["exposure_hat_for_demand"]
 #
 
+
+
+# ============================================================
+# 12. Concise key-report version
+# ============================================================
+
+def _metric_row_for_prediction(df, pred_col, true_col, name):
+    y = df[true_col].values
+    p = df[pred_col].values
+    return {
+        "method": name,
+        "true_mean": np.mean(y),
+        "pred_mean": np.mean(p),
+        "ratio": np.mean(p) / (np.mean(y) + 1e-8),
+        "WAPE": _wape(y, p),
+        "Pearson": _corr(y, p),
+        "Spearman": _safe_spearman(y, p),
+        "active_AUC": _auc((y > 0).astype(int), p),
+    }
+
+
+def concise_anchor_attention_report(attn_df):
+    """
+    Print only key diagnostics:
+      1. overall in_stock comparison
+      2. short/mid/long block comparison
+      3. active_AUC by horizon
+      4. attention weights by block
+      5. low/mid/high true exposure group
+      6. ASIN-level tail/ranking
+    """
+    df = attn_df.copy()
+
+    print("\n" + "=" * 90)
+    print("KEY REPORT: ANCHOR ATTENTION EXPOSURE HAT")
+    print("=" * 90)
+
+    # 1. Overall in_stock comparison.
+    candidates = [
+        ("raw_model", "pred_instock_dph"),
+        ("anchor_attention", "attn_instock_dph"),
+        ("naive_last", "pred_instock_dph_last"),
+        ("naive_mean4", "pred_instock_dph_mean4"),
+        ("naive_mean13", "pred_instock_dph_mean13"),
+    ]
+
+    overall_rows = []
+    for name, col in candidates:
+        if col in df.columns:
+            overall_rows.append(_metric_row_for_prediction(df, col, "true_instock_dph", name))
+    overall = pd.DataFrame(overall_rows)
+
+    print("\n1) Overall in_stock_dph")
+    print(overall.round(5).to_string(index=False))
+
+    # 2. Block comparison.
+    df["horizon_block"] = pd.cut(
+        df["horizon"],
+        bins=[0, 5, 12, 20],
+        labels=["short_1_5", "mid_6_12", "long_13_20"],
+        include_lowest=True,
+    )
+
+    block_rows = []
+    for name, col in candidates:
+        if col not in df.columns:
+            continue
+        for block, g in df.groupby("horizon_block", observed=True):
+            y = g["true_instock_dph"].values
+            p = g[col].values
+            block_rows.append({
+                "method": name,
+                "block": block,
+                "ratio": np.mean(p) / (np.mean(y) + 1e-8),
+                "WAPE": _wape(y, p),
+                "Pearson": _corr(y, p),
+                "Spearman": _safe_spearman(y, p),
+                "active_AUC": _auc((y > 0).astype(int), p),
+            })
+    block_comp = pd.DataFrame(block_rows)
+
+    print("\n2) In_stock_dph by horizon block")
+    print(block_comp.round(5).to_string(index=False))
+
+    # 3. AUC by horizon.
+    auc_rows = []
+    for h, g in df.groupby("horizon"):
+        y = (g["true_instock_dph"].values > 0).astype(int)
+        row = {"horizon": int(h)}
+        for name, col in [
+            ("raw_AUC", "pred_instock_dph"),
+            ("attn_AUC", "attn_instock_dph"),
+            ("last_AUC", "pred_instock_dph_last"),
+            ("mean13_AUC", "pred_instock_dph_mean13"),
+        ]:
+            if col in g.columns:
+                row[name] = _auc(y, g[col].values)
+        auc_rows.append(row)
+    auc_by_h = pd.DataFrame(auc_rows)
+
+    print("\n3) In_stock active_AUC by horizon")
+    print(auc_by_h.round(5).to_string(index=False))
+
+    # 4. Attention weights.
+    weight_rows = []
+    for block, g in df.groupby("horizon_block", observed=True):
+        needed = [
+            "attn_instock_w_model",
+            "attn_instock_w_last",
+            "attn_instock_w_mean4",
+            "attn_instock_w_mean13",
+        ]
+        if all(c in g.columns for c in needed):
+            weight_rows.append({
+                "block": block,
+                "w_model": g["attn_instock_w_model"].mean(),
+                "w_last": g["attn_instock_w_last"].mean(),
+                "w_mean4": g["attn_instock_w_mean4"].mean(),
+                "w_mean13": g["attn_instock_w_mean13"].mean(),
+            })
+    weights = pd.DataFrame(weight_rows)
+
+    print("\n4) Anchor attention weights for in_stock_dph")
+    if len(weights) > 0:
+        print(weights.round(4).to_string(index=False))
+    else:
+        print("No attention weight columns found.")
+
+    # 5. Group quality.
+    asin_sum = df.groupby("asin").agg(true_sum=("true_instock_dph", "sum")).reset_index()
+    asin_sum["exposure_group"] = pd.qcut(
+        asin_sum["true_sum"].rank(method="first"),
+        q=3,
+        labels=["low_true_exposure", "mid_true_exposure", "high_true_exposure"],
+    )
+
+    gdf = df.merge(asin_sum[["asin", "exposure_group"]], on="asin", how="left")
+
+    group_rows = []
+    for method, col in [
+        ("raw_model", "pred_instock_dph"),
+        ("anchor_attention", "attn_instock_dph"),
+    ]:
+        if col not in gdf.columns:
+            continue
+        for grp, gg in gdf.groupby("exposure_group", observed=True):
+            y = gg["true_instock_dph"].values
+            p = gg[col].values
+            group_rows.append({
+                "method": method,
+                "group": grp,
+                "true_mean": np.mean(y),
+                "pred_mean": np.mean(p),
+                "ratio": np.mean(p) / (np.mean(y) + 1e-8),
+                "WAPE": _wape(y, p),
+                "Spearman": _safe_spearman(y, p),
+                "active_AUC": _auc((y > 0).astype(int), p),
+            })
+    group_quality = pd.DataFrame(group_rows)
+
+    print("\n5) Low/Mid/High true exposure group: in_stock_dph")
+    print(group_quality.round(5).to_string(index=False))
+
+    # 6. ASIN-level summary.
+    asin_rows = []
+    for method, col in [
+        ("raw_model", "pred_instock_dph"),
+        ("anchor_attention", "attn_instock_dph"),
+    ]:
+        if col not in df.columns:
+            continue
+
+        tmp = df.groupby("asin").agg(
+            true_20wk_sum=("true_instock_dph", "sum"),
+            pred_20wk_sum=(col, "sum"),
+        ).reset_index()
+
+        per_asin_wape = []
+        for asin, gg in df.groupby("asin"):
+            per_asin_wape.append(_wape(gg["true_instock_dph"].values, gg[col].values))
+        per_asin_wape = np.asarray(per_asin_wape, dtype=float)
+
+        asin_rows.append({
+            "method": method,
+            "asin_sum_Pearson": _corr(tmp["true_20wk_sum"], tmp["pred_20wk_sum"]),
+            "asin_sum_Spearman": _safe_spearman(tmp["true_20wk_sum"], tmp["pred_20wk_sum"]),
+            "median_asin_WAPE": np.quantile(per_asin_wape, 0.50),
+            "p75_asin_WAPE": np.quantile(per_asin_wape, 0.75),
+            "p90_asin_WAPE": np.quantile(per_asin_wape, 0.90),
+        })
+    asin_summary = pd.DataFrame(asin_rows)
+
+    print("\n6) ASIN-level in_stock quality")
+    print(asin_summary.round(5).to_string(index=False))
+
+    return {
+        "overall": overall,
+        "block_comparison": block_comp,
+        "auc_by_horizon": auc_by_h,
+        "attention_weights": weights,
+        "group_quality": group_quality,
+        "asin_summary": asin_summary,
+    }
+
+
+def run_best_exposure_anchor_attention_quiet(
+    data_raw1,
+    scot_df,
+    n_asins=5000,
+    seed=42,
+    history=52,
+    horizon=20,
+    d_model=64,
+    batch_size=64,
+    exposure_epochs=60,
+    exposure_lr=1e-3,
+    exposure_patience=8,
+    attn_epochs=80,
+    attn_batch_size=1024,
+    attn_lr=1e-3,
+    attn_patience=10,
+    attn_hidden=64,
+    attn_dropout=0.10,
+    remove_extreme=True,
+    extreme_q=0.99,
+):
+    """
+    Same best pipeline, but final report is concise.
+    Lower-level training still prints epochs, but final diagnostics are shortened.
+    """
+    result = run_best_exposure_anchor_attention(
+        data_raw1=data_raw1,
+        scot_df=scot_df,
+        n_asins=n_asins,
+        seed=seed,
+        history=history,
+        horizon=horizon,
+        d_model=d_model,
+        batch_size=batch_size,
+        exposure_epochs=exposure_epochs,
+        exposure_lr=exposure_lr,
+        exposure_patience=exposure_patience,
+        attn_epochs=attn_epochs,
+        attn_batch_size=attn_batch_size,
+        attn_lr=attn_lr,
+        attn_patience=attn_patience,
+        attn_hidden=attn_hidden,
+        attn_dropout=attn_dropout,
+        remove_extreme=remove_extreme,
+        extreme_q=extreme_q,
+    )
+
+    print("\n\n" + "#" * 100)
+    print("# CONCISE KEY REPORT")
+    print("#" * 100)
+
+    key_report = concise_anchor_attention_report(result["attn_df"])
+    result["key_report"] = key_report
+    return result
+
+
 # ============================================================
 # Usage
 # ============================================================
