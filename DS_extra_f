@@ -1,0 +1,391 @@
+import numpy as np
+import pandas as pd
+
+def full_dph_demand_eda(
+    df,
+    demand_col="fbi_demand",
+    dph_cols=("total_dph", "buy_box_dph", "in_stock_dph"),
+    date_col="order_week",
+    group_col=None,
+    cap_quantiles=(0.99, 0.995, 0.999),
+):
+    data = df.copy()
+
+    # -------------------------------
+    # 0. Basic cleaning
+    # -------------------------------
+    for c in list(dph_cols) + [demand_col]:
+        if c not in data.columns:
+            raise ValueError(f"Missing column: {c}")
+        data[c] = pd.to_numeric(data[c], errors="coerce").fillna(0.0)
+        data[c] = data[c].clip(lower=0.0)
+
+    if date_col in data.columns:
+        data[date_col] = pd.to_datetime(data[date_col])
+        data["month"] = data[date_col].dt.month
+        data["weekofyear"] = data[date_col].dt.isocalendar().week.astype(int)
+
+        def get_season(m):
+            if m in [12, 1, 2]:
+                return "winter"
+            elif m in [3, 4, 5]:
+                return "spring"
+            elif m in [6, 7, 8]:
+                return "summer"
+            else:
+                return "fall"
+
+        data["season"] = data["month"].apply(get_season)
+
+        # Simple event window diagnostic
+        data["event_window"] = "regular"
+        data.loc[data["month"].isin([11, 12]), "event_window"] = "holiday_shopping"
+        data.loc[data["month"].isin([7, 10]), "event_window"] = "prime_like_window"
+    else:
+        data["season"] = "unknown"
+        data["event_window"] = "unknown"
+
+    # -------------------------------
+    # 1. Distribution summary
+    # -------------------------------
+    print("\n" + "=" * 100)
+    print("1. BASIC DISTRIBUTION SUMMARY")
+    print("=" * 100)
+
+    dist_rows = []
+
+    for c in list(dph_cols) + [demand_col]:
+        s = data[c]
+
+        dist_rows.append({
+            "col": c,
+            "n": len(s),
+            "mean": s.mean(),
+            "std": s.std(),
+            "min": s.min(),
+            "p25": s.quantile(0.25),
+            "median": s.quantile(0.50),
+            "p75": s.quantile(0.75),
+            "p90": s.quantile(0.90),
+            "p95": s.quantile(0.95),
+            "p99": s.quantile(0.99),
+            "p995": s.quantile(0.995),
+            "p999": s.quantile(0.999),
+            "max": s.max(),
+            "zero_rate": (s == 0).mean(),
+            "positive_rate": (s > 0).mean(),
+            "cv": s.std() / (s.mean() + 1e-8),
+            "skew": s.skew(),
+            "kurtosis": s.kurtosis(),
+        })
+
+    dist_df = pd.DataFrame(dist_rows)
+    print(dist_df.round(4).to_string(index=False))
+
+    # -------------------------------
+    # 2. Log distribution summary
+    # -------------------------------
+    print("\n" + "=" * 100)
+    print("2. LOG1P DISTRIBUTION SUMMARY")
+    print("=" * 100)
+
+    log_rows = []
+
+    for c in list(dph_cols) + [demand_col]:
+        s = np.log1p(data[c])
+
+        log_rows.append({
+            "col": "log1p_" + c,
+            "mean": s.mean(),
+            "std": s.std(),
+            "median": s.median(),
+            "p75": s.quantile(0.75),
+            "p90": s.quantile(0.90),
+            "p95": s.quantile(0.95),
+            "p99": s.quantile(0.99),
+            "max": s.max(),
+            "skew": s.skew(),
+            "kurtosis": s.kurtosis(),
+        })
+
+    log_dist_df = pd.DataFrame(log_rows)
+    print(log_dist_df.round(4).to_string(index=False))
+
+    # -------------------------------
+    # 3. Correlation
+    # -------------------------------
+    print("\n" + "=" * 100)
+    print("3. CORRELATION: RAW / LOG / SPEARMAN")
+    print("=" * 100)
+
+    cols = list(dph_cols) + [demand_col]
+
+    pearson_raw = data[cols].corr(method="pearson")
+    spearman_raw = data[cols].corr(method="spearman")
+    log_df = np.log1p(data[cols])
+    pearson_log = log_df.corr(method="pearson")
+
+    print("\nPearson raw:")
+    print(pearson_raw.round(4).to_string())
+
+    print("\nSpearman raw:")
+    print(spearman_raw.round(4).to_string())
+
+    print("\nPearson log1p:")
+    print(pearson_log.round(4).to_string())
+
+    # -------------------------------
+    # 4. DPH funnel ratios
+    # -------------------------------
+    print("\n" + "=" * 100)
+    print("4. FUNNEL RATIO SUMMARY")
+    print("=" * 100)
+
+    data["buy_box_rate"] = data["buy_box_dph"] / (data["total_dph"] + 1.0)
+    data["in_stock_rate_total"] = data["in_stock_dph"] / (data["total_dph"] + 1.0)
+    data["in_stock_given_buybox"] = data["in_stock_dph"] / (data["buy_box_dph"] + 1.0)
+
+    ratio_cols = ["buy_box_rate", "in_stock_rate_total", "in_stock_given_buybox"]
+
+    ratio_rows = []
+    for c in ratio_cols:
+        s = data[c].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        s = s.clip(lower=0.0, upper=10.0)
+
+        ratio_rows.append({
+            "ratio": c,
+            "mean": s.mean(),
+            "median": s.median(),
+            "p75": s.quantile(0.75),
+            "p90": s.quantile(0.90),
+            "p95": s.quantile(0.95),
+            "p99": s.quantile(0.99),
+            "max": s.max(),
+            "zero_rate": (s == 0).mean(),
+            "corr_with_demand_spearman": s.corr(data[demand_col], method="spearman"),
+            "corr_with_demand_pearson": s.corr(data[demand_col], method="pearson"),
+        })
+
+    ratio_df = pd.DataFrame(ratio_rows)
+    print(ratio_df.round(4).to_string(index=False))
+
+    # -------------------------------
+    # 5. Conditional demand by DPH quantile
+    # -------------------------------
+    print("\n" + "=" * 100)
+    print("5. DEMAND BY DPH QUANTILE BUCKET")
+    print("=" * 100)
+
+    quantile_tables = {}
+
+    for c in dph_cols:
+        tmp = data[[c, demand_col]].copy()
+
+        # qcut can fail with many duplicate values, so rank first.
+        rank_col = tmp[c].rank(method="first")
+        tmp[f"{c}_bucket"] = pd.qcut(
+            rank_col,
+            q=10,
+            labels=[f"Q{i}" for i in range(1, 11)],
+            duplicates="drop"
+        )
+
+        out = (
+            tmp.groupby(f"{c}_bucket")
+            .agg(
+                n=(demand_col, "size"),
+                dph_mean=(c, "mean"),
+                dph_median=(c, "median"),
+                demand_mean=(demand_col, "mean"),
+                demand_median=(demand_col, "median"),
+                demand_positive_rate=(demand_col, lambda x: (x > 0).mean()),
+                demand_p90=(demand_col, lambda x: x.quantile(0.90)),
+                demand_p95=(demand_col, lambda x: x.quantile(0.95)),
+            )
+            .reset_index()
+        )
+
+        quantile_tables[c] = out
+
+        print(f"\nDemand by {c} decile:")
+        print(out.round(4).to_string(index=False))
+
+    # -------------------------------
+    # 6. Zero interaction
+    # -------------------------------
+    print("\n" + "=" * 100)
+    print("6. ZERO INTERACTION: DPH ZERO VS DEMAND ZERO")
+    print("=" * 100)
+
+    zero_rows = []
+
+    for c in dph_cols:
+        dph_zero = data[c] == 0
+        dmd_zero = data[demand_col] == 0
+
+        zero_rows.append({
+            "dph_col": c,
+            "P_dph_zero": dph_zero.mean(),
+            "P_demand_zero": dmd_zero.mean(),
+            "P_demand_zero_given_dph_zero": dmd_zero[dph_zero].mean() if dph_zero.sum() > 0 else np.nan,
+            "P_demand_positive_given_dph_zero": (~dmd_zero[dph_zero]).mean() if dph_zero.sum() > 0 else np.nan,
+            "P_demand_zero_given_dph_positive": dmd_zero[~dph_zero].mean() if (~dph_zero).sum() > 0 else np.nan,
+            "mean_demand_when_dph_zero": data.loc[dph_zero, demand_col].mean() if dph_zero.sum() > 0 else np.nan,
+            "mean_demand_when_dph_positive": data.loc[~dph_zero, demand_col].mean() if (~dph_zero).sum() > 0 else np.nan,
+        })
+
+    zero_df = pd.DataFrame(zero_rows)
+    print(zero_df.round(4).to_string(index=False))
+
+    # -------------------------------
+    # 7. Demand zero vs DPH distribution
+    # -------------------------------
+    print("\n" + "=" * 100)
+    print("7. DPH DISTRIBUTION WHEN DEMAND ZERO VS POSITIVE")
+    print("=" * 100)
+
+    demand_zero_rows = []
+
+    data["demand_status"] = np.where(data[demand_col] > 0, "demand_positive", "demand_zero")
+
+    for status, g in data.groupby("demand_status"):
+        for c in dph_cols:
+            s = g[c]
+            demand_zero_rows.append({
+                "demand_status": status,
+                "dph_col": c,
+                "n": len(g),
+                "mean": s.mean(),
+                "median": s.median(),
+                "p75": s.quantile(0.75),
+                "p90": s.quantile(0.90),
+                "p95": s.quantile(0.95),
+                "p99": s.quantile(0.99),
+                "zero_rate": (s == 0).mean(),
+            })
+
+    demand_zero_dph_df = pd.DataFrame(demand_zero_rows)
+    print(demand_zero_dph_df.round(4).to_string(index=False))
+
+    # -------------------------------
+    # 8. Season / event summary
+    # -------------------------------
+    print("\n" + "=" * 100)
+    print("8. SEASON / EVENT SUMMARY")
+    print("=" * 100)
+
+    season_summary = (
+        data.groupby("season")[cols]
+        .agg(["mean", "median", "count"])
+        .round(4)
+    )
+
+    print("\nBy season:")
+    print(season_summary.to_string())
+
+    event_summary = (
+        data.groupby("event_window")[cols]
+        .agg(["mean", "median", "count"])
+        .round(4)
+    )
+
+    print("\nBy event window:")
+    print(event_summary.to_string())
+
+    # -------------------------------
+    # 9. Group-level summary, if available
+    # -------------------------------
+    group_summary = None
+
+    if group_col is not None and group_col in data.columns:
+        print("\n" + "=" * 100)
+        print(f"9. GROUP SUMMARY: {group_col}")
+        print("=" * 100)
+
+        group_summary = (
+            data.groupby(group_col)[cols]
+            .agg(["mean", "median", "count"])
+            .round(4)
+        )
+
+        print(group_summary.to_string())
+
+    # -------------------------------
+    # 10. Cap recommendation
+    # -------------------------------
+    print("\n" + "=" * 100)
+    print("10. CAP RECOMMENDATION BASED ON TOTAL_DPH")
+    print("=" * 100)
+
+    total = data["total_dph"]
+
+    cap_rows = []
+    for q in cap_quantiles:
+        cap = total.quantile(q)
+
+        row = {
+            "q": q,
+            "total_cap": cap,
+            "share_total_capped": (data["total_dph"] > cap).mean(),
+            "share_buy_box_capped_by_total_cap": (data["buy_box_dph"] > cap).mean(),
+            "share_in_stock_capped_by_total_cap": (data["in_stock_dph"] > cap).mean(),
+            "total_mean_before": data["total_dph"].mean(),
+            "total_mean_after": data["total_dph"].clip(upper=cap).mean(),
+            "buy_box_mean_before": data["buy_box_dph"].mean(),
+            "buy_box_mean_after": data["buy_box_dph"].clip(upper=cap).mean(),
+            "in_stock_mean_before": data["in_stock_dph"].mean(),
+            "in_stock_mean_after": data["in_stock_dph"].clip(upper=cap).mean(),
+        }
+
+        cap_rows.append(row)
+
+    cap_df = pd.DataFrame(cap_rows)
+    print(cap_df.round(4).to_string(index=False))
+
+    # -------------------------------
+    # 11. Suggested interpretation
+    # -------------------------------
+    print("\n" + "=" * 100)
+    print("11. QUICK INTERPRETATION GUIDE")
+    print("=" * 100)
+
+    print("""
+看下面几个重点：
+
+1. 如果 mean >> median，而且 skew/kurtosis 很大：
+   DPH 是 heavy-tail，不适合 raw MSE，应该用 log1p / Huber / cap。
+
+2. 如果 Spearman(DPH, demand) >> Pearson(DPH, demand)：
+   DPH 和 demand 是强单调但非线性关系，适合 nonlinear demand head。
+
+3. 如果 P(demand_positive | dph_zero) 很低：
+   DPH 对 occurrence 很关键，decoder 的 DPH_hat 会影响 active prediction。
+
+4. 如果 demand_zero 时 DPH 仍然很高：
+   说明有 exposure 但没有转化，demand 还需要 price/category/season 等信息。
+
+5. 如果 season/event 下 DPH 和 demand mean 明显不同：
+   seasonality / event distance 应该进入 decoder。
+
+6. 如果 cap 后 mean 下降很多，但 capped share 很小：
+   极少数 outlier 支配 mean，cap 很有必要。
+
+7. 如果 group 间 DPH-demand 关系差异大：
+   decoder/demand head 需要 group/category/static features。
+""")
+
+    return {
+        "distribution": dist_df,
+        "log_distribution": log_dist_df,
+        "pearson_raw": pearson_raw,
+        "spearman_raw": spearman_raw,
+        "pearson_log": pearson_log,
+        "ratio_summary": ratio_df,
+        "quantile_tables": quantile_tables,
+        "zero_interaction": zero_df,
+        "demand_zero_dph": demand_zero_dph_df,
+        "season_summary": season_summary,
+        "event_summary": event_summary,
+        "group_summary": group_summary,
+        "cap_recommendation": cap_df,
+    }
