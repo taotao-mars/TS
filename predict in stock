@@ -828,18 +828,31 @@ def print_exposure_diagnostics(pred_df):
     print("=" * 100)
 
     tables = []
-    model_tbl = model_tbl.copy()
-    model_tbl.insert(0, "method", "model")
-    tables.append(model_tbl)
+    model_tbl2 = model_tbl.copy()
+    model_tbl2.insert(0, "method", "model")
+    tables.append(model_tbl2)
+
+    # Fix:
+    # Do NOT use pred_df.rename directly here because it creates duplicate
+    # pred_total_dph / pred_buy_box_dph / pred_instock_dph columns.
+    # Duplicate column names make pred_df[pred_col] return shape (N,2),
+    # which causes broadcasting error inside WAPE.
+    base_true_cols = [
+        "asin",
+        "order_week",
+        "horizon",
+        "true_total_dph",
+        "true_buy_box_dph",
+        "true_instock_dph",
+    ]
 
     for mode in ["last", "mean4", "mean13"]:
-        tmp = pred_df.rename(
-            columns={
-                f"pred_total_dph_{mode}": "pred_total_dph",
-                f"pred_buy_box_dph_{mode}": "pred_buy_box_dph",
-                f"pred_instock_dph_{mode}": "pred_instock_dph",
-            }
-        )
+        tmp = pred_df[base_true_cols].copy()
+
+        tmp["pred_total_dph"] = pred_df[f"pred_total_dph_{mode}"].values
+        tmp["pred_buy_box_dph"] = pred_df[f"pred_buy_box_dph_{mode}"].values
+        tmp["pred_instock_dph"] = pred_df[f"pred_instock_dph_{mode}"].values
+
         tbl = exposure_metrics(tmp, prefix="pred")
         tbl.insert(0, "method", f"naive_{mode}")
         tables.append(tbl)
@@ -966,11 +979,13 @@ def run_exposure_only(
     pred_df = predict_exposure(model, va_ld)
     pred_df = add_naive_baselines_from_loader(pred_df, va_ld, context_cols)
     diagnostics = print_exposure_diagnostics(pred_df)
+    exposure_quality = diagnose_exposure_prediction_quality(pred_df)
 
     return {
         "model": model,
         "forecast_df": pred_df,
         "diagnostics": diagnostics,
+        "exposure_quality": exposure_quality,
         "tr_ld": tr_ld,
         "va_ld": va_ld,
         "context_cols": context_cols,
@@ -978,6 +993,282 @@ def run_exposure_only(
         "data": data,
     }
 
+
+
+
+# ============================================================
+# 8. Strong exposure quality diagnostics
+# ============================================================
+
+def _safe_spearman(y, p):
+    """
+    Spearman rank correlation without requiring scipy.
+    """
+    y = pd.Series(np.asarray(y, dtype=float)).rank(method="average").values
+    p = pd.Series(np.asarray(p, dtype=float)).rank(method="average").values
+
+    if np.std(y) < 1e-8 or np.std(p) < 1e-8:
+        return np.nan
+
+    return float(np.corrcoef(y, p)[0, 1])
+
+
+def _topk_metrics(y, p, q=0.90):
+    """
+    Top-k precision / recall.
+
+    Example q=0.90:
+      true top 10% exposure rows
+      predicted top 10% exposure rows
+
+    Measures whether model can identify high-exposure ASIN-week rows.
+    """
+    y = np.asarray(y, dtype=float)
+    p = np.asarray(p, dtype=float)
+
+    if len(y) == 0:
+        return np.nan, np.nan
+
+    true_thr = np.quantile(y, q)
+    pred_thr = np.quantile(p, q)
+
+    true_top = y >= true_thr
+    pred_top = p >= pred_thr
+
+    precision = (true_top & pred_top).sum() / (pred_top.sum() + 1e-8)
+    recall = (true_top & pred_top).sum() / (true_top.sum() + 1e-8)
+
+    return float(precision), float(recall)
+
+
+def diagnose_exposure_prediction_quality(pred_df):
+    """
+    Comprehensive diagnostics for exposure-only predictions.
+
+    This is stricter than checking only pred_mean / true_mean.
+
+    It checks:
+      1. overall scale + WAPE + log_MAE + Pearson + Spearman + AUC + top-k
+      2. by-horizon quality
+      3. ASIN-level 20-week heterogeneity quality
+      4. high/mid/low true-exposure group quality
+      5. worst ASINs by in_stock_dph WAPE
+
+    Required columns:
+      asin, horizon
+      true_total_dph, pred_total_dph
+      true_buy_box_dph, pred_buy_box_dph
+      true_instock_dph, pred_instock_dph
+    """
+    targets = [
+        ("total_dph", "true_total_dph", "pred_total_dph"),
+        ("buy_box_dph", "true_buy_box_dph", "pred_buy_box_dph"),
+        ("in_stock_dph", "true_instock_dph", "pred_instock_dph"),
+    ]
+
+    print("\n" + "=" * 100)
+    print("1. OVERALL EXPOSURE QUALITY")
+    print("=" * 100)
+
+    overall_rows = []
+
+    for name, true_col, pred_col in targets:
+        y = pred_df[true_col].values
+        p = pred_df[pred_col].values
+
+        top_precision, top_recall = _topk_metrics(y, p, q=0.90)
+
+        overall_rows.append({
+            "target": name,
+            "true_mean": np.mean(y),
+            "pred_mean": np.mean(p),
+            "pred_true_ratio": np.mean(p) / (np.mean(y) + 1e-8),
+            "WAPE": _wape(y, p),
+            "log_MAE": np.mean(np.abs(np.log1p(y) - np.log1p(p))),
+            "Pearson": _corr(y, p),
+            "Spearman": _safe_spearman(y, p),
+            "active_AUC": _auc((y > 0).astype(int), p),
+            "top10_precision": top_precision,
+            "top10_recall": top_recall,
+            "zero_rate_true": np.mean(y <= 0),
+            "zero_rate_pred": np.mean(p <= 1e-8),
+        })
+
+    overall_df = pd.DataFrame(overall_rows)
+    print(overall_df.round(5).to_string(index=False))
+
+    print("\n" + "=" * 100)
+    print("2. BY-HORIZON QUALITY")
+    print("=" * 100)
+
+    horizon_rows = []
+
+    for h, g in pred_df.groupby("horizon"):
+        for name, true_col, pred_col in targets:
+            y = g[true_col].values
+            p = g[pred_col].values
+
+            horizon_rows.append({
+                "horizon": h,
+                "target": name,
+                "true_mean": np.mean(y),
+                "pred_mean": np.mean(p),
+                "ratio": np.mean(p) / (np.mean(y) + 1e-8),
+                "WAPE": _wape(y, p),
+                "Pearson": _corr(y, p),
+                "Spearman": _safe_spearman(y, p),
+                "active_AUC": _auc((y > 0).astype(int), p),
+            })
+
+    horizon_df = pd.DataFrame(horizon_rows)
+    print(horizon_df.round(5).to_string(index=False))
+
+    print("\n" + "=" * 100)
+    print("3. ASIN-LEVEL HETEROGENEITY QUALITY")
+    print("=" * 100)
+
+    asin_rows = []
+    asin_detail_frames = []
+
+    for name, true_col, pred_col in targets:
+        tmp_rows = []
+
+        for asin, g in pred_df.groupby("asin"):
+            y = g[true_col].values
+            p = g[pred_col].values
+
+            true_sum = y.sum()
+            pred_sum = p.sum()
+
+            tmp_rows.append({
+                "asin": asin,
+                "target": name,
+                "asin_wape": _wape(y, p),
+                "true_20wk_sum": true_sum,
+                "pred_20wk_sum": pred_sum,
+                "sum_error": pred_sum - true_sum,
+                "sum_ratio": pred_sum / (true_sum + 1e-8),
+                "active_weeks_true": int((y > 0).sum()),
+                "active_weeks_pred": int((p > 1e-8).sum()),
+            })
+
+        tmp = pd.DataFrame(tmp_rows)
+        asin_detail_frames.append(tmp)
+
+        asin_rows.append({
+            "target": name,
+            "median_asin_wape": tmp["asin_wape"].median(),
+            "p75_asin_wape": tmp["asin_wape"].quantile(0.75),
+            "p90_asin_wape": tmp["asin_wape"].quantile(0.90),
+            "p95_asin_wape": tmp["asin_wape"].quantile(0.95),
+            "asin_sum_Pearson": _corr(tmp["true_20wk_sum"], tmp["pred_20wk_sum"]),
+            "asin_sum_Spearman": _safe_spearman(tmp["true_20wk_sum"], tmp["pred_20wk_sum"]),
+            "median_sum_ratio": tmp["sum_ratio"].replace([np.inf, -np.inf], np.nan).median(),
+            "p10_sum_ratio": tmp["sum_ratio"].replace([np.inf, -np.inf], np.nan).quantile(0.10),
+            "p90_sum_ratio": tmp["sum_ratio"].replace([np.inf, -np.inf], np.nan).quantile(0.90),
+        })
+
+    asin_df = pd.DataFrame(asin_rows)
+    asin_detail_df = pd.concat(asin_detail_frames, ignore_index=True)
+
+    print(asin_df.round(5).to_string(index=False))
+
+    print("\n" + "=" * 100)
+    print("4. HIGH / MID / LOW TRUE EXPOSURE GROUP QUALITY")
+    print("=" * 100)
+
+    group_rows = []
+
+    for name, true_col, pred_col in targets:
+        asin_sum = (
+            pred_df.groupby("asin")
+            .agg(
+                true_sum=(true_col, "sum"),
+                pred_sum=(pred_col, "sum"),
+            )
+            .reset_index()
+        )
+
+        # qcut can fail if many ties; rank avoids most tie problems.
+        asin_sum["exposure_group"] = pd.qcut(
+            asin_sum["true_sum"].rank(method="first"),
+            q=3,
+            labels=["low_true_exposure", "mid_true_exposure", "high_true_exposure"]
+        )
+
+        gdf = pred_df.merge(
+            asin_sum[["asin", "exposure_group"]],
+            on="asin",
+            how="left"
+        )
+
+        for grp, g in gdf.groupby("exposure_group"):
+            y = g[true_col].values
+            p = g[pred_col].values
+
+            group_rows.append({
+                "target": name,
+                "group": grp,
+                "n_rows": len(g),
+                "true_mean": np.mean(y),
+                "pred_mean": np.mean(p),
+                "ratio": np.mean(p) / (np.mean(y) + 1e-8),
+                "WAPE": _wape(y, p),
+                "Pearson": _corr(y, p),
+                "Spearman": _safe_spearman(y, p),
+                "active_AUC": _auc((y > 0).astype(int), p),
+            })
+
+    group_df = pd.DataFrame(group_rows)
+    print(group_df.round(5).to_string(index=False))
+
+    print("\n" + "=" * 100)
+    print("5. WORST ASINS BY IN_STOCK_DPH WAPE")
+    print("=" * 100)
+
+    worst = (
+        asin_detail_df[asin_detail_df["target"] == "in_stock_dph"]
+        .sort_values("asin_wape", ascending=False)
+        .head(30)
+    )
+
+    print(worst.round(5).to_string(index=False))
+
+    print("\n" + "=" * 100)
+    print("6. QUICK JUDGMENT")
+    print("=" * 100)
+
+    inst_overall = overall_df[overall_df["target"] == "in_stock_dph"].iloc[0]
+    inst_asin = asin_df[asin_df["target"] == "in_stock_dph"].iloc[0]
+
+    print(f"in_stock pred/true mean ratio: {inst_overall['pred_true_ratio']:.4f}")
+    print(f"in_stock WAPE:                 {inst_overall['WAPE']:.4f}")
+    print(f"in_stock Pearson:              {inst_overall['Pearson']:.4f}")
+    print(f"in_stock Spearman:             {inst_overall['Spearman']:.4f}")
+    print(f"in_stock active_AUC:           {inst_overall['active_AUC']:.4f}")
+    print(f"in_stock ASIN-sum Spearman:    {inst_asin['asin_sum_Spearman']:.4f}")
+    print(f"in_stock p90 ASIN WAPE:        {inst_asin['p90_asin_wape']:.4f}")
+
+    print("\nRule of thumb:")
+    print("""
+Good exposure_hat should not only match mean.
+Prefer:
+  - pred_true_ratio close to 1
+  - WAPE lower than naive_mean4 / naive_mean13
+  - Pearson / Spearman clearly positive and stable by horizon
+  - active_AUC high enough to separate active vs inactive exposure weeks
+  - ASIN-level 20-week sum Spearman high, meaning it ranks ASIN exposure baseline correctly
+  - p90/p95 ASIN WAPE not exploding
+""")
+
+    return {
+        "overall": overall_df,
+        "by_horizon": horizon_df,
+        "asin_level": asin_df,
+        "asin_detail": asin_detail_df,
+        "group_level": group_df,
+        "worst_asins": worst,
+    }
 
 # ============================================================
 # Usage
