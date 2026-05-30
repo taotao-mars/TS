@@ -215,23 +215,22 @@ def _select_stock_decoder_extra_cols(data_raw):
     """
     Minimal static / product features for the TCN exposure decoder.
 
-    Use only low-noise ASIN-level regime features:
+    Use only:
       1. gl_product_group
-      2. hb_rank
-      3. ind_top10_review_brand
+      2. ind_top10_brand
 
     We intentionally exclude:
+      - hb_rank
       - gl_product_group_desc: raw text
       - category_code: too granular / high-cardinality
       - glance_view_band_cat: may overlap with DPH / traffic realization
       - review_count: heavy-tail and noisy
       - price_bands: may introduce noise
-      - asin_birthday / word_count: not included in this minimal version
+      - asin_birthday / word_count
     """
     candidate_cols = [
         "gl_product_group",
-        "hb_rank",
-        "ind_top10_review_brand",
+        "ind_top10_brand",
     ]
 
     exclude_cols = {
@@ -244,6 +243,7 @@ def _select_stock_decoder_extra_cols(data_raw):
         "asin",
         "order_week",
         "gl_product_group_desc",
+        "hb_rank",
     }
 
     cols = [
@@ -261,21 +261,14 @@ def _encode_stock_decoder_extra_features(df, extra_cols):
     gl_product_group:
       categorical-like -> code + frequency encoding
 
-    ind_top10_review_brand:
+    ind_top10_brand:
       binary/categorical-like -> code + frequency encoding
-
-    hb_rank:
-      numeric rank -> log1p + standardize
     """
     out_cols = []
 
     categorical_like = {
         "gl_product_group",
-        "ind_top10_review_brand",
-    }
-
-    log_numeric_like = {
-        "hb_rank",
+        "ind_top10_brand",
     }
 
     for c in extra_cols:
@@ -300,34 +293,14 @@ def _encode_stock_decoder_extra_features(df, extra_cols):
 
             out_cols.extend([code_col, freq_col])
 
-        elif c in log_numeric_like:
-            val = pd.to_numeric(s, errors="coerce").fillna(0.0).clip(lower=0.0)
-            val = np.log1p(val)
-
-            mean = float(val.mean())
-            std = float(val.std()) if float(val.std()) > 1e-8 else 1.0
-
-            new_c = f"stock_static__{c}__log_std"
-            df[new_c] = ((val - mean) / std).clip(-5, 5)
-            out_cols.append(new_c)
-
         else:
-            # Safe fallback: do not silently pass raw text.
-            if pd.api.types.is_numeric_dtype(s):
-                val = pd.to_numeric(s, errors="coerce").fillna(0.0)
-                mean = float(val.mean())
-                std = float(val.std()) if float(val.std()) > 1e-8 else 1.0
+            # Safety fallback: do not silently pass raw text.
+            raw = s.astype(str).fillna("MISSING")
+            freq = raw.value_counts(normalize=True)
 
-                new_c = f"stock_static__{c}__std"
-                df[new_c] = ((val - mean) / std).clip(-5, 5)
-                out_cols.append(new_c)
-            else:
-                raw = s.astype(str).fillna("MISSING")
-                freq = raw.value_counts(normalize=True)
-
-                new_c = f"stock_static__{c}__freq"
-                df[new_c] = raw.map(freq).fillna(0.0).astype(float)
-                out_cols.append(new_c)
+            new_c = f"stock_static__{c}__freq"
+            df[new_c] = raw.map(freq).fillna(0.0).astype(float)
+            out_cols.append(new_c)
 
     return df, out_cols
 
@@ -3430,11 +3403,12 @@ def recommend_static_feature_columns(data_raw1):
         "gl_product_group",
         "category_code",
         "glance_view_band_cat",
+        "hb_rank",
         "customer_review_count",
         "customer_active_review_count",
         "cust_avg_active_review_rating",
         "customer_average_review_rating",
-        "ind_top10_review_brand",
+        "ind_top10_brand",
         "price_bands",
         "hb_rank",
     ]
@@ -3528,8 +3502,7 @@ Decoder inputs include:
   2. historical DPH anchors: last / mean4 / mean13
   3. minimal explicit static product features:
        gl_product_group
-       hb_rank
-       ind_top10_review_brand
+       ind_top10_brand
 
 Decoder outputs point predictions:
   log1p(total_dph_hat)
@@ -3565,13 +3538,13 @@ def diagnose_minimal_static_features_in_decoder(result, data_raw1=None):
 
     expected_keywords = [
         "gl_product_group",
-        "hb_rank",
-        "ind_top10_review_brand",
+        "ind_top10_brand",
     ]
 
     unexpected_keywords = [
         "category_code",
         "glance_view_band_cat",
+        "hb_rank",
         "customer_review_count",
         "customer_active_review_count",
         "price_bands",
