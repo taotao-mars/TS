@@ -1,0 +1,410 @@
+import numpy as np
+import pandas as pd
+import torch
+
+
+def _wape(y, p):
+    y = np.asarray(y).reshape(-1)
+    p = np.asarray(p).reshape(-1)
+    return np.sum(np.abs(y - p)) / (np.sum(np.abs(y)) + 1e-8)
+
+
+def _pinball_norm(y, p, q):
+    y = np.asarray(y).reshape(-1)
+    p = np.asarray(p).reshape(-1)
+    diff = y - p
+    loss = np.maximum(q * diff, (q - 1) * diff)
+    return np.sum(loss) / (np.sum(np.abs(y)) + 1e-8)
+
+
+def _corr(y, p):
+    y = np.asarray(y).reshape(-1)
+    p = np.asarray(p).reshape(-1)
+    if np.std(y) < 1e-8 or np.std(p) < 1e-8:
+        return np.nan
+    return np.corrcoef(y, p)[0, 1]
+
+
+def _move_batch_to_device(batch, device):
+    out = {}
+    for k, v in batch.items():
+        out[k] = v.to(device) if torch.is_tensor(v) else v
+    return out
+
+
+def build_static_feature_groups(context_cols):
+    """
+    自动把新加入的 ASIN/static 特征分组。
+    你重点看这些 group 哪个遮掉后结果变好/变差。
+    """
+
+    groups = {}
+
+    groups["gl_category"] = [
+        c for c in context_cols
+        if c.startswith("stock_static__")
+        and (
+            "gl_product_group" in c
+            or "category_code" in c
+        )
+    ]
+
+    groups["top_band"] = [
+        c for c in context_cols
+        if c.startswith("stock_static__")
+        and (
+            "glance_view_band_cat" in c
+            or "price_bands" in c
+            or "hb_rank" in c
+        )
+    ]
+
+    groups["review_count"] = [
+        c for c in context_cols
+        if c.startswith("stock_static__")
+        and (
+            "customer_review_count" in c
+            or "customer_active_review_count" in c
+        )
+    ]
+
+    groups["review_rating"] = [
+        c for c in context_cols
+        if c.startswith("stock_static__")
+        and (
+            "customer_average_review_rating" in c
+            or "cust_avg_active_review_rating" in c
+        )
+    ]
+
+    groups["brand_quality_flag"] = [
+        c for c in context_cols
+        if c.startswith("stock_static__")
+        and "ind_top10_review_brand" in c
+    ]
+
+    groups["amxl_flags"] = [
+        c for c in context_cols
+        if c.startswith("stock_static__")
+        and (
+            "ind_amxl_hb" in c
+            or "ind_new_asin" in c
+            or "ind_target_audience" in c
+        )
+    ]
+
+    groups["all_static"] = [
+        c for c in context_cols
+        if c.startswith("stock_static__")
+    ]
+
+    groups = {k: v for k, v in groups.items() if len(v) > 0}
+
+    return groups
+
+
+def evaluate_model_with_masked_context(
+    model,
+    va_ld,
+    context_cols,
+    mask_cols=None,
+    M=50,
+    mode="mean",
+    max_batches=None,
+):
+    """
+    对 trained model 做 feature occlusion。
+
+    mode:
+        mean: 把选中特征替换成 validation mean，推荐
+        zero: 替换成 0
+        shuffle: 在 batch 内打乱，测试信息破坏程度
+    """
+
+    device = next(model.parameters()).device
+    model.eval()
+
+    context_cols = list(context_cols)
+    col_to_idx = {c: i for i, c in enumerate(context_cols)}
+
+    mask_idxs = []
+    if mask_cols is not None:
+        mask_idxs = [col_to_idx[c] for c in mask_cols if c in col_to_idx]
+
+    # 先算 validation context mean
+    context_sum = None
+    context_n = 0
+
+    for b in va_ld:
+        fc = b["future_context"].detach().cpu().numpy()
+        B, H, C = fc.shape
+        flat = fc.reshape(-1, C)
+        if context_sum is None:
+            context_sum = flat.sum(axis=0)
+        else:
+            context_sum += flat.sum(axis=0)
+        context_n += flat.shape[0]
+
+    context_mean = context_sum / max(context_n, 1)
+
+    ys, p50s, p70s = [], [], []
+
+    true_total, pred_total = [], []
+    true_buy, pred_buy = [], []
+    true_instock, pred_instock = [], []
+
+    with torch.no_grad():
+        for bi, batch in enumerate(va_ld):
+            if max_batches is not None and bi >= max_batches:
+                break
+
+            b = _move_batch_to_device(batch, device)
+
+            x = b["x"]
+            fc = b["future_context"].clone()
+
+            if len(mask_idxs) > 0:
+                if mode == "mean":
+                    mean_vals = torch.tensor(
+                        context_mean[mask_idxs],
+                        dtype=fc.dtype,
+                        device=fc.device
+                    ).view(1, 1, -1)
+                    fc[:, :, mask_idxs] = mean_vals
+
+                elif mode == "zero":
+                    fc[:, :, mask_idxs] = 0.0
+
+                elif mode == "shuffle":
+                    perm = torch.randperm(fc.shape[0], device=fc.device)
+                    fc[:, :, mask_idxs] = fc[perm, :, mask_idxs]
+
+                else:
+                    raise ValueError("mode must be mean, zero, or shuffle")
+
+            p50, p70, stock_log_hat = model.predict(
+                x,
+                fc,
+                M=M,
+                return_stock=True,
+            )
+
+            ys.append(b["y"].detach().cpu().numpy())
+            p50s.append(p50.detach().cpu().numpy())
+            p70s.append(p70.detach().cpu().numpy())
+
+            if stock_log_hat is not None:
+                stock_hat = torch.expm1(stock_log_hat).clamp(min=0).detach().cpu().numpy()
+
+                pred_total.append(stock_hat[:, :, 0])
+                pred_buy.append(stock_hat[:, :, 1])
+                pred_instock.append(stock_hat[:, :, 2])
+
+                true_total.append(b["future_total_dph"].detach().cpu().numpy())
+                true_buy.append(b["future_buy_box_dph"].detach().cpu().numpy())
+                true_instock.append(b["future_instock"].detach().cpu().numpy())
+
+    y = np.concatenate(ys, axis=0)
+    p50 = np.concatenate(p50s, axis=0)
+    p70 = np.concatenate(p70s, axis=0)
+
+    out = {
+        "p50_penalty": _pinball_norm(y, p50, 0.5),
+        "p70_penalty": _pinball_norm(y, p70, 0.7),
+        "p50_wape": _wape(y, p50),
+        "p70_wape": _wape(y, p70),
+    }
+
+    if len(pred_total) > 0:
+        yt = np.concatenate(true_total, axis=0)
+        pt = np.concatenate(pred_total, axis=0)
+
+        yb = np.concatenate(true_buy, axis=0)
+        pb = np.concatenate(pred_buy, axis=0)
+
+        yi = np.concatenate(true_instock, axis=0)
+        pi = np.concatenate(pred_instock, axis=0)
+
+        out.update({
+            "total_dph_wape": _wape(yt, pt),
+            "buy_box_dph_wape": _wape(yb, pb),
+            "in_stock_dph_wape": _wape(yi, pi),
+
+            "total_dph_corr": _corr(yt, pt),
+            "buy_box_dph_corr": _corr(yb, pb),
+            "in_stock_dph_corr": _corr(yi, pi),
+
+            "total_dph_pred_mean": np.mean(pt),
+            "buy_box_dph_pred_mean": np.mean(pb),
+            "in_stock_dph_pred_mean": np.mean(pi),
+
+            "total_dph_true_mean": np.mean(yt),
+            "buy_box_dph_true_mean": np.mean(yb),
+            "in_stock_dph_true_mean": np.mean(yi),
+        })
+
+    return out
+
+
+def diagnose_static_feature_contribution(
+    result,
+    M=50,
+    mode="mean",
+    max_batches=None,
+):
+    """
+    主函数：
+    看新加入的 ASIN/static features 哪些帮助，哪些伤害模型。
+    """
+
+    model = result["model"]
+    va_ld = result["va_ld"]
+
+    context_cols = result.get("context_cols", None)
+
+    if context_cols is None:
+        raise ValueError(
+            "result['context_cols'] is missing. "
+            "请用包含 context_cols return 的版本重新跑 main training。"
+        )
+
+    context_cols = list(context_cols)
+
+    groups = build_static_feature_groups(context_cols)
+
+    print("\n" + "=" * 100)
+    print("STATIC FEATURE GROUPS FOUND IN MODEL CONTEXT")
+    print("=" * 100)
+
+    for g, cols in groups.items():
+        print(f"\n[{g}] n={len(cols)}")
+        print(cols)
+
+    if len(groups) == 0:
+        print("\nNo stock_static__ features found in context_cols.")
+        print("说明 static features 还没有真正进入模型。")
+        return None
+
+    print("\n" + "=" * 100)
+    print("BASELINE EVALUATION")
+    print("=" * 100)
+
+    baseline = evaluate_model_with_masked_context(
+        model=model,
+        va_ld=va_ld,
+        context_cols=context_cols,
+        mask_cols=None,
+        M=M,
+        mode=mode,
+        max_batches=max_batches,
+    )
+
+    print(pd.DataFrame([baseline]).round(5).to_string(index=False))
+
+    rows = []
+
+    for group_name, cols in groups.items():
+        print(f"\nMasking group: {group_name}")
+
+        masked = evaluate_model_with_masked_context(
+            model=model,
+            va_ld=va_ld,
+            context_cols=context_cols,
+            mask_cols=cols,
+            M=M,
+            mode=mode,
+            max_batches=max_batches,
+        )
+
+        row = {
+            "masked_group": group_name,
+            "n_cols": len(cols),
+        }
+
+        for k, v in baseline.items():
+            row[f"base_{k}"] = v
+            row[f"masked_{k}"] = masked.get(k, np.nan)
+            row[f"delta_{k}"] = masked.get(k, np.nan) - v
+
+        rows.append(row)
+
+    imp = pd.DataFrame(rows)
+
+    print("\n" + "=" * 100)
+    print("STATIC FEATURE CONTRIBUTION / OCCLUSION RESULT")
+    print("=" * 100)
+
+    show_cols = [
+        "masked_group",
+        "n_cols",
+
+        "delta_p50_penalty",
+        "delta_p70_penalty",
+        "delta_p50_wape",
+        "delta_p70_wape",
+
+        "delta_total_dph_wape",
+        "delta_buy_box_dph_wape",
+        "delta_in_stock_dph_wape",
+
+        "delta_total_dph_corr",
+        "delta_buy_box_dph_corr",
+        "delta_in_stock_dph_corr",
+    ]
+
+    show_cols = [c for c in show_cols if c in imp.columns]
+
+    print(
+        imp[show_cols]
+        .sort_values("delta_p50_penalty", ascending=False)
+        .round(6)
+        .to_string(index=False)
+    )
+
+    print("\n" + "=" * 100)
+    print("INTERPRETATION")
+    print("=" * 100)
+
+    print("""
+怎么读：
+
+1. delta_p50_penalty > 0:
+   遮掉这个 feature group 后 P50 变差
+   => 这个 group 对 demand 有帮助
+
+2. delta_p50_penalty < 0:
+   遮掉这个 feature group 后 P50 反而变好
+   => 这个 group 可能在伤害模型，或者引入 noise
+
+3. delta_in_stock_dph_wape > 0:
+   遮掉后 in_stock DPH decoder 变差
+   => 这个 group 对 in_stock decoder 有帮助
+
+4. delta_in_stock_dph_corr < 0:
+   遮掉后 corr 下降
+   => 这个 group 帮助模型区分 ASIN 差异
+
+你现在最关心：
+   - gl_category
+   - top_band
+   - review_count
+   - review_rating
+
+如果某组 delta_p50_penalty < 0 且 delta_in_stock_dph_corr >= 0，
+那组就建议删掉。
+""")
+
+    return {
+        "baseline": baseline,
+        "importance": imp,
+        "groups": groups,
+    }
+
+
+# 直接运行
+static_contrib = diagnose_static_feature_contribution(
+    result_all_intersection,
+    M=50,
+    mode="mean",
+    max_batches=None,
+)
