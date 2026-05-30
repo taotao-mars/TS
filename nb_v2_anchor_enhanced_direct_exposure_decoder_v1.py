@@ -698,10 +698,10 @@ def load_real_data(data_raw, dph_cap_q=0.995):
     print("History in_stock_dph: raw historical value, no lag shift")
     print("Future context excludes in_stock_dph")
     print("Future context includes distance_* calendar features")
-    print("TCN exposure decoder: direct 20-week point prediction over future horizon")
+    print("TCN + per-ASIN group attention decoder: history/context/static/anchor tokens")
     print("Stock decoder safe mode: excludes future true total_dph and buy_box_dph")
     print("Safe historical DPH proxies: total/buy_box/in_stock last/mean4/mean13")
-    print("TCN decoder uses hist total/buy_box/in_stock anchors plus season/event/static context")
+    print("Group-attn TCN uses hist DPH anchors + season/event + gl_product_group + ind_top10_brand")
     print("History encoder includes DPH funnel features")
     print(f"DPH cap q: {dph_cap_q} | cap value: {dph_cap}")
     print(f"Context dim: {len(context_cols)}")
@@ -971,28 +971,60 @@ class HorizonTCNBlock(nn.Module):
         return self.norm(residual + z)
 
 
+
 class TCNExposureDecoder(nn.Module):
     """
-    TCN point exposure decoder.
-
-    Directly predicts the full future exposure path:
-        log1p(total_dph_hat)
-        log1p(buy_box_dph_hat)
-        log1p(in_stock_dph_hat)
+    TCN point exposure decoder with lightweight per-ASIN group attention.
 
     No ratio output.
     No future true DPH input.
     No autoregressive rollout.
+
+    Group attention tokens:
+      1. history token: h_t
+      2. future context token: future_context_h + horizon encoding
+      3. static token: gl_product_group + ind_top10_brand encoded features
+      4. anchor token: historical total/buy_box/in_stock DPH anchors
+
+    This is NOT cross-ASIN attention. It is per-ASIN group attention:
+    it lets different information channels interact before the horizon TCN.
     """
     def __init__(self, d_model, context_dim, horizon=20, hidden=96,
-                 n_blocks=3, kernel_size=3, dropout=0.10):
+                 n_blocks=3, kernel_size=3, dropout=0.10,
+                 n_group_heads=4, static_dim=4, anchor_dim=9):
         super().__init__()
         self.horizon = horizon
+        self.context_dim = context_dim
+        self.static_dim = static_dim
+        self.anchor_dim = anchor_dim
+        self.hidden = hidden
 
         self.input_proj = nn.Sequential(
             nn.Linear(d_model + context_dim + 2, hidden),
             nn.ReLU(),
             nn.Dropout(dropout),
+        )
+
+        # Group-token projections.
+        self.hist_token_proj = nn.Linear(d_model, hidden)
+        self.ctx_token_proj = nn.Linear(context_dim + 2, hidden)
+        self.static_token_proj = nn.Linear(static_dim, hidden)
+        self.anchor_token_proj = nn.Linear(anchor_dim, hidden)
+
+        # Multihead attention over group tokens, not over ASINs.
+        # Tokens are: history / context / static / anchor.
+        self.group_attn = nn.MultiheadAttention(
+            embed_dim=hidden,
+            num_heads=n_group_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.group_norm = nn.LayerNorm(hidden)
+        self.group_gate = nn.Sequential(
+            nn.Linear(hidden * 2, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, hidden),
+            nn.Sigmoid(),
         )
 
         dilations = [1, 2, 4][:n_blocks]
@@ -1013,7 +1045,48 @@ class TCNExposureDecoder(nn.Module):
             nn.Linear(hidden, 3),
         )
 
-    def forward(self, h_t, future_context):
+    def _slice_static_and_anchor(self, future_context):
+        """
+        Assumes context order:
+            [future known context] + [stock_static__ cols] + [hist DPH proxy cols]
+
+        In our v7/v8 setting:
+            stock_static__ cols = 4
+              gl_product_group code/freq
+              ind_top10_brand code/freq
+            hist DPH proxy cols = 9
+              total last/mean4/mean13
+              buy_box last/mean4/mean13
+              instock last/mean4/mean13
+
+        If the columns are missing, use zeros safely.
+        """
+        B, H, C = future_context.shape
+        device = future_context.device
+        dtype = future_context.dtype
+
+        if C >= (self.static_dim + self.anchor_dim):
+            static_x = future_context[:, :, -(self.static_dim + self.anchor_dim):-self.anchor_dim]
+            anchor_x = future_context[:, :, -self.anchor_dim:]
+        elif C >= self.anchor_dim:
+            static_x = torch.zeros(B, H, self.static_dim, device=device, dtype=dtype)
+            anchor_x = future_context[:, :, -self.anchor_dim:]
+        else:
+            static_x = torch.zeros(B, H, self.static_dim, device=device, dtype=dtype)
+            anchor_x = torch.zeros(B, H, self.anchor_dim, device=device, dtype=dtype)
+
+        # If more than expected static columns exist, this v8 intentionally uses only the
+        # last 4 static columns before anchors. With the v7/v8 file that is exactly:
+        # gl_product_group code/freq + ind_top10_brand code/freq.
+        if static_x.shape[-1] != self.static_dim:
+            static_x = static_x[..., :self.static_dim]
+            if static_x.shape[-1] < self.static_dim:
+                pad = torch.zeros(B, H, self.static_dim - static_x.shape[-1], device=device, dtype=dtype)
+                static_x = torch.cat([static_x, pad], dim=-1)
+
+        return static_x, anchor_x
+
+    def forward(self, h_t, future_context, return_group_attn=False):
         B, H, C = future_context.shape
 
         h_rep = h_t.unsqueeze(1).expand(B, H, h_t.shape[-1])
@@ -1023,17 +1096,54 @@ class TCNExposureDecoder(nn.Module):
 
         horizon_sin = torch.sin(2 * np.pi * horizon_idx)
         horizon_cos = torch.cos(2 * np.pi * horizon_idx)
+        hpos = torch.cat([horizon_sin, horizon_cos], dim=-1)
 
-        x = torch.cat([h_rep, future_context, horizon_sin, horizon_cos], dim=-1)
+        x = torch.cat([h_rep, future_context, hpos], dim=-1)
 
-        z = self.input_proj(x)
+        # Base horizon representation.
+        z_base = self.input_proj(x)  # [B, H, hidden]
+
+        # Build group tokens for each ASIN-horizon pair.
+        static_x, anchor_x = self._slice_static_and_anchor(future_context)
+
+        hist_tok = self.hist_token_proj(h_t).unsqueeze(1).expand(B, H, self.hidden)
+        ctx_tok = self.ctx_token_proj(torch.cat([future_context, hpos], dim=-1))
+        static_tok = self.static_token_proj(static_x)
+        anchor_tok = self.anchor_token_proj(anchor_x)
+
+        # [B, H, 4, hidden] -> [B*H, 4, hidden]
+        tokens = torch.stack([hist_tok, ctx_tok, static_tok, anchor_tok], dim=2)
+        tokens_flat = tokens.reshape(B * H, 4, self.hidden)
+
+        attn_out, attn_w = self.group_attn(
+            tokens_flat,
+            tokens_flat,
+            tokens_flat,
+            need_weights=True,
+            average_attn_weights=False,
+        )
+
+        # Pool group tokens. Shape [B, H, hidden]
+        group_summary = attn_out.mean(dim=1).reshape(B, H, self.hidden)
+        group_summary = self.group_norm(group_summary)
+
+        # Gated fusion: static/anchor/context group information modulates base TCN input.
+        gate = self.group_gate(torch.cat([z_base, group_summary], dim=-1))
+        z = z_base + gate * group_summary
+
         for block in self.tcn:
             z = block(z)
 
         exposure_log_hat = self.out(z)
         exposure_log_hat = F.softplus(exposure_log_hat)
 
+        if return_group_attn:
+            # attn_w shape: [B*H, heads, 4, 4] -> [B,H,heads,4,4]
+            attn_w = attn_w.reshape(B, H, attn_w.shape[1], 4, 4)
+            return exposure_log_hat, attn_w
+
         return exposure_log_hat
+
 
 
 
@@ -3577,3 +3687,314 @@ def diagnose_minimal_static_features_in_decoder(result, data_raw1=None):
         print(raw_candidates)
 
     return static_cols
+
+
+
+def diagnose_group_attention_decoder(result, data_raw1=None):
+    """
+    Verify group-attention decoder and show whether minimal static columns are in context.
+    """
+    model = result.get("model", None)
+    context_cols = result.get("context_cols", None)
+    va_ld = result.get("va_ld", None)
+
+    print("\n" + "=" * 90)
+    print("GROUP ATTENTION DECODER CHECK")
+    print("=" * 90)
+
+    if model is not None and hasattr(model, "stock_decoder"):
+        print("Stock decoder class:", type(model.stock_decoder).__name__)
+        print("Has group_attn:", hasattr(model.stock_decoder, "group_attn"))
+
+    if context_cols is None:
+        print("WARNING: result['context_cols'] is missing. Re-run training from this v8 file.")
+        return None
+
+    static_cols = [c for c in context_cols if c.startswith("stock_static__")]
+    anchor_cols = [
+        c for c in context_cols
+        if c.startswith("hist_total_dph")
+        or c.startswith("hist_buy_box_dph")
+        or c.startswith("hist_instock_dph")
+    ]
+
+    print("\nStatic cols:")
+    print(static_cols)
+
+    print("\nAnchor cols:")
+    print(anchor_cols)
+
+    print("\nExpected static presence:")
+    print({
+        "gl_product_group": any("gl_product_group" in c for c in static_cols),
+        "ind_top10_brand": any("ind_top10_brand" in c for c in static_cols),
+    })
+
+    if va_ld is not None:
+        for b in va_ld:
+            print("\nfuture_context shape:", tuple(b["future_context"].shape))
+            break
+
+    if data_raw1 is not None:
+        print("\nSelected raw static columns:")
+        print(_select_stock_decoder_extra_cols(data_raw1))
+
+    return {
+        "static_cols": static_cols,
+        "anchor_cols": anchor_cols,
+    }
+
+
+def inspect_group_attention_weights(result, n_batches=1, M_unused=0):
+    """
+    Inspect average group attention weights.
+
+    Token order:
+      0 history
+      1 future_context
+      2 static
+      3 DPH_anchor
+
+    This helps diagnose whether the decoder is actually using static token / anchors.
+    """
+    model = result.get("model", None)
+    va_ld = result.get("va_ld", None)
+
+    if model is None or va_ld is None:
+        print("Need result['model'] and result['va_ld'].")
+        return None
+
+    if not hasattr(model, "stock_decoder") or not hasattr(model.stock_decoder, "group_attn"):
+        print("Model does not have group attention decoder.")
+        return None
+
+    device = next(model.parameters()).device
+    model.eval()
+
+    token_names = ["history", "future_context", "static", "dph_anchor"]
+    all_w = []
+
+    with torch.no_grad():
+        for bi, batch in enumerate(va_ld):
+            x = batch["x"].to(device)
+            fc = batch["future_context"].to(device)
+
+            mu_base, alpha_base, h_t = model.encoder(x)
+
+            _, attn_w = model.stock_decoder(
+                h_t,
+                fc,
+                return_group_attn=True,
+            )
+            # [B,H,heads,4,4]
+            all_w.append(attn_w.detach().cpu().numpy())
+
+            if bi + 1 >= n_batches:
+                break
+
+    W = np.concatenate(all_w, axis=0)
+    avg = W.mean(axis=(0, 1, 2))  # [4,4], query x key
+
+    out = pd.DataFrame(avg, index=[f"query_{n}" for n in token_names],
+                       columns=[f"key_{n}" for n in token_names])
+
+    print("\n" + "=" * 90)
+    print("AVERAGE GROUP ATTENTION WEIGHTS")
+    print("=" * 90)
+    print(out.round(4).to_string())
+
+    print("\nHow to read:")
+    print("""
+Rows are query tokens, columns are key tokens.
+If key_static has meaningful weight, the decoder is using GL / brand information.
+If key_dph_anchor has meaningful weight, the decoder is using historical DPH anchors.
+""")
+
+    return out
+
+
+def _metric_wape_np(y, p):
+    y = np.asarray(y).reshape(-1)
+    p = np.asarray(p).reshape(-1)
+    return float(np.sum(np.abs(y - p)) / (np.sum(np.abs(y)) + 1e-8))
+
+
+def _metric_pinball_np(y, p, q):
+    y = np.asarray(y).reshape(-1)
+    p = np.asarray(p).reshape(-1)
+    diff = y - p
+    loss = np.maximum(q * diff, (q - 1) * diff)
+    return float(np.sum(loss) / (np.sum(np.abs(y)) + 1e-8))
+
+
+def _metric_corr_np(y, p):
+    y = np.asarray(y).reshape(-1)
+    p = np.asarray(p).reshape(-1)
+    if np.std(y) < 1e-8 or np.std(p) < 1e-8:
+        return np.nan
+    return float(np.corrcoef(y, p)[0, 1])
+
+
+def evaluate_group_attn_static_occlusion(result, M=30, mode="mean", max_batches=None):
+    """
+    Test whether minimal static features help or hurt this trained group-attention model.
+
+    We occlude:
+      - gl_product_group encoded columns
+      - ind_top10_brand encoded columns
+      - all static columns
+
+    If masking a group makes metrics worse, that group helps.
+    If masking a group improves metrics, that group hurts / adds noise.
+    """
+    model = result["model"]
+    va_ld = result["va_ld"]
+    context_cols = result.get("context_cols", None)
+
+    if context_cols is None:
+        raise ValueError("result['context_cols'] missing. Re-run training from this v8 file.")
+
+    context_cols = list(context_cols)
+    col_to_idx = {c: i for i, c in enumerate(context_cols)}
+
+    groups = {
+        "gl_product_group": [c for c in context_cols if c.startswith("stock_static__") and "gl_product_group" in c],
+        "ind_top10_brand": [c for c in context_cols if c.startswith("stock_static__") and "ind_top10_brand" in c],
+        "all_static": [c for c in context_cols if c.startswith("stock_static__")],
+    }
+    groups = {k: v for k, v in groups.items() if len(v) > 0}
+
+    device = next(model.parameters()).device
+
+    # context means
+    C = len(context_cols)
+    s = np.zeros(C)
+    n = 0
+    for b in va_ld:
+        fc = b["future_context"].detach().cpu().numpy()
+        s += fc.reshape(-1, C).sum(axis=0)
+        n += fc.shape[0] * fc.shape[1]
+    means = s / max(n, 1)
+
+    def run(mask_cols=None):
+        idxs = []
+        if mask_cols is not None:
+            idxs = [col_to_idx[c] for c in mask_cols if c in col_to_idx]
+
+        ys, p50s, p70s = [], [], []
+        true_total, pred_total = [], []
+        true_buy, pred_buy = [], []
+        true_inst, pred_inst = [], []
+
+        model.eval()
+        with torch.no_grad():
+            for bi, batch in enumerate(va_ld):
+                if max_batches is not None and bi >= max_batches:
+                    break
+
+                x = batch["x"].to(device)
+                fc = batch["future_context"].to(device).clone()
+                y = batch["y"].to(device)
+
+                if len(idxs) > 0:
+                    if mode == "zero":
+                        fc[:, :, idxs] = 0.0
+                    elif mode == "mean":
+                        mv = torch.tensor(means[idxs], dtype=fc.dtype, device=fc.device).view(1, 1, -1)
+                        fc[:, :, idxs] = mv
+                    elif mode == "shuffle":
+                        perm = torch.randperm(fc.shape[0], device=fc.device)
+                        fc[:, :, idxs] = fc[perm, :, idxs]
+                    else:
+                        raise ValueError("mode must be mean, zero, or shuffle")
+
+                p50, p70, stock_log_hat = model.predict(x, fc, M=M, return_stock=True)
+
+                ys.append(y.detach().cpu().numpy())
+                p50s.append(p50.detach().cpu().numpy())
+                p70s.append(p70.detach().cpu().numpy())
+
+                if stock_log_hat is not None:
+                    stock_hat = torch.expm1(stock_log_hat).clamp(min=0).detach().cpu().numpy()
+                    pred_total.append(stock_hat[:, :, 0])
+                    pred_buy.append(stock_hat[:, :, 1])
+                    pred_inst.append(stock_hat[:, :, 2])
+                    true_total.append(batch["future_total_dph"].detach().cpu().numpy())
+                    true_buy.append(batch["future_buy_box_dph"].detach().cpu().numpy())
+                    true_inst.append(batch["future_instock"].detach().cpu().numpy())
+
+        y = np.concatenate(ys, axis=0)
+        p50 = np.concatenate(p50s, axis=0)
+        p70 = np.concatenate(p70s, axis=0)
+
+        out = {
+            "p50_penalty": _metric_pinball_np(y, p50, 0.5),
+            "p70_penalty": _metric_pinball_np(y, p70, 0.7),
+            "p50_wape": _metric_wape_np(y, p50),
+            "p70_wape": _metric_wape_np(y, p70),
+        }
+
+        if len(pred_total) > 0:
+            yt = np.concatenate(true_total, axis=0)
+            pt = np.concatenate(pred_total, axis=0)
+            yb = np.concatenate(true_buy, axis=0)
+            pb = np.concatenate(pred_buy, axis=0)
+            yi = np.concatenate(true_inst, axis=0)
+            pi = np.concatenate(pred_inst, axis=0)
+            out.update({
+                "total_dph_wape": _metric_wape_np(yt, pt),
+                "buy_box_dph_wape": _metric_wape_np(yb, pb),
+                "in_stock_dph_wape": _metric_wape_np(yi, pi),
+                "total_dph_corr": _metric_corr_np(yt, pt),
+                "buy_box_dph_corr": _metric_corr_np(yb, pb),
+                "in_stock_dph_corr": _metric_corr_np(yi, pi),
+            })
+
+        return out
+
+    baseline = run(None)
+    rows = []
+
+    for name, cols in groups.items():
+        masked = run(cols)
+        row = {"masked_group": name, "n_cols": len(cols)}
+        for k, v in baseline.items():
+            row[f"base_{k}"] = v
+            row[f"masked_{k}"] = masked.get(k, np.nan)
+            row[f"delta_{k}"] = masked.get(k, np.nan) - v
+        rows.append(row)
+
+    df = pd.DataFrame(rows)
+
+    show_cols = [
+        "masked_group", "n_cols",
+        "delta_p50_penalty", "delta_p70_penalty",
+        "delta_p50_wape", "delta_p70_wape",
+        "delta_total_dph_wape", "delta_buy_box_dph_wape", "delta_in_stock_dph_wape",
+        "delta_total_dph_corr", "delta_buy_box_dph_corr", "delta_in_stock_dph_corr",
+    ]
+    show_cols = [c for c in show_cols if c in df.columns]
+
+    print("\n" + "=" * 90)
+    print("GROUP-ATTN STATIC OCCLUSION RESULT")
+    print("=" * 90)
+    print(df[show_cols].round(6).to_string(index=False))
+
+    print("\nInterpretation:")
+    print("""
+delta_p50_penalty > 0:
+  masking this feature group makes demand worse -> useful
+
+delta_p50_penalty < 0:
+  masking this feature group improves demand -> feature may hurt / add noise
+
+delta_in_stock_dph_corr < 0:
+  masking this feature reduces corr -> feature helps distinguish ASIN exposure regimes
+""")
+
+    return {
+        "baseline": baseline,
+        "occlusion": df,
+        "groups": groups,
+    }
+
