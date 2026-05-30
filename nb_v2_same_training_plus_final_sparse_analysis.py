@@ -9,6 +9,13 @@ This version runs on the high-sparse group and includes:
 - z regularization
 - encoder diagnostics
 - final WAPE summary
+- history uses raw in_stock_dph; future context excludes in_stock_dph
+- future context includes distance-to-holiday scalar features
+- stock decoder uses extra product/popularity/promo/package features
+- stock decoder extra future context excludes true future total_dph and buy_box_dph
+- safe historical total_dph/buy_box_dph proxy features are repeated across horizon
+- total amount diagnostics: sum(fbi_demand * raw our_price)
+- total size diagnostics: sum(fbi_demand * pkg_height * pkg_length * pkg_width)
 """
 
 import torch
@@ -119,6 +126,218 @@ def add_zero_rate_group(data_raw, zero_thresholds=(0.4, 0.7)):
 # 1. Data loading
 # =====================================================
 
+
+def _infer_pkg_dimension_cols(df):
+    """
+    Infer package height, length, and width columns for package-volume diagnostics.
+    Diagnostic only; not used as model input.
+    """
+    lower_map = {c.lower(): c for c in df.columns}
+
+    candidates = {
+        "height": [
+            "pkg_height", "package_height", "pkg_h", "height",
+            "item_height", "unit_height"
+        ],
+        "length": [
+            "pkg_length", "package_length", "pkg_l", "length",
+            "item_length", "unit_length"
+        ],
+        "width": [
+            "pkg_width", "package_width", "pkg_w", "width",
+            "item_width", "unit_width"
+        ],
+    }
+
+    out = {}
+
+    for dim_name, names in candidates.items():
+        out[dim_name] = None
+        for name in names:
+            if name in lower_map:
+                out[dim_name] = lower_map[name]
+                break
+
+    return out
+
+
+
+
+def _get_1d_col(df, col):
+    """
+    Return one 1-D Series even if df has duplicate column names.
+    """
+    x = df[col]
+    if isinstance(x, pd.DataFrame):
+        x = x.iloc[:, 0]
+    return x
+
+
+
+def _compute_total_dph_cap(df, q=0.995):
+    """
+    Compute a global cap from total_dph.
+
+    For fast experiments, this uses the current modeling dataframe.
+    For a stricter production backtest, compute this cap using training weeks only.
+    """
+    if "total_dph" not in df.columns:
+        return np.inf
+
+    s = pd.to_numeric(df["total_dph"], errors="coerce").fillna(0.0).clip(lower=0)
+
+    if len(s) == 0 or s.sum() <= 0:
+        return np.inf
+
+    cap = float(s.quantile(q))
+
+    if not np.isfinite(cap) or cap <= 0:
+        return np.inf
+
+    return cap
+
+
+def _apply_dph_cap(df, cap):
+    """
+    Apply one total_dph-based cap to total_dph, buy_box_dph, and in_stock_dph.
+    This stabilizes heavy-tailed exposure decoder targets.
+    """
+    for c in ["total_dph", "buy_box_dph", "in_stock_dph"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0).clip(lower=0)
+            if np.isfinite(cap):
+                df[c] = df[c].clip(upper=cap)
+    return df
+
+
+
+def _select_stock_decoder_extra_cols(data_raw):
+    """
+    Select additional features to help the stock decoder predict future in_stock_dph_hat.
+
+    These are NOT true future in_stock_dph. They are product / popularity / price / promo
+    / package features that can help predict future exposure.
+
+    We keep a conservative list to avoid leakage-prone realized future outcomes.
+    """
+    candidate_cols = [
+        # Product/category/static identity proxies
+        "gl_product_group",
+        "category_code",
+        "brand_class",
+        "sort_type",
+        "variation",
+        "ind_new_asin",
+        "ind_amxl_hb",
+        "hbt",
+        "ind_target_audience",
+        "ind_top10_brand",
+        "ind_top10_review_brand",
+
+        # Review / popularity proxies.
+        # NOTE: total_dph and buy_box_dph are intentionally excluded here
+        # because future realized traffic / buy-box signals may cause leakage.
+        "cust_avg_active_review_rating",
+        "customer_active_review_count",
+        "customer_average_review_rating",
+        "customer_review_count",
+        "glance_view_band_cat",
+        "hb_rank",
+        "hb_score",
+        "facebook_fan_count",
+        "instagram_fan_count",
+        "twitter_follower_count",
+        "youtube_subscriber_count",
+
+        # Price / promotion
+        "list_price",
+        "price_bands",
+        "ind_promotion",
+        "promotion_amount",
+        "promotion_ratio",
+        "promotion_pricing_amount",
+        "promotion_type",
+        "pricing_type",
+        "asin_promo_start_week",
+        "asin_promo_end_week",
+        "asin_promo_wordcount",
+
+        # Package / AMXL size
+        "pkg_height",
+        "pkg_length",
+        "pkg_width",
+        "pkg_weight",
+
+        # Calendar-ish columns
+        "order_month",
+        "order_year",
+        "week_index",
+        "ind_prime_week",
+    ]
+
+    # Avoid realized target / future outcome columns.
+    exclude_cols = {
+        "fbi_demand",
+        "order_units",
+        "scot_oos",
+        "in_stock_dph",
+        "asin",
+        "order_week",
+    }
+
+    cols = [
+        c for c in candidate_cols
+        if c in data_raw.columns and c not in exclude_cols
+    ]
+
+    return cols
+
+
+def _encode_stock_decoder_extra_features(df, extra_cols):
+    """
+    Convert extra stock-decoder features to numeric features.
+
+    Object/categorical columns are ordinal-encoded by pandas.factorize.
+    This keeps the implementation lightweight and avoids requiring sklearn encoders.
+    """
+    out_cols = []
+
+    for c in extra_cols:
+        new_c = f"stock_extra__{c}"
+
+        if c not in df.columns:
+            continue
+
+        if pd.api.types.is_numeric_dtype(df[c]):
+            val = pd.to_numeric(_get_1d_col(df, c), errors="coerce").fillna(0.0)
+
+            # Conservative transforms by feature type.
+            cl = c.lower()
+            if (
+                "count" in cl or "dph" in cl or "price" in cl
+                or "amount" in cl or "rank" in cl or "score" in cl
+                or "height" in cl or "length" in cl or "width" in cl
+                or "weight" in cl or "wordcount" in cl
+            ):
+                val = np.log1p(val.clip(lower=0))
+
+            # Scale robustly to avoid huge values.
+            std = float(val.std()) if float(val.std()) > 1e-8 else 1.0
+            mean = float(val.mean())
+            df[new_c] = ((val - mean) / std).clip(-5, 5)
+
+        else:
+            codes, uniques = pd.factorize(_get_1d_col(df, c).astype(str).fillna("MISSING"))
+            # normalize category code to roughly [0,1]
+            denom = max(len(uniques) - 1, 1)
+            df[new_c] = codes.astype(float) / denom
+
+        out_cols.append(new_c)
+
+    return df, out_cols
+
+
+
 def _safe_numeric(df, col, default=0.0):
     if col not in df.columns:
         df[col] = default
@@ -186,9 +405,9 @@ def _zero_streak(active):
     return out
 
 
-def load_real_data(data_raw):
+def load_real_data(data_raw, dph_cap_q=0.995):
     """
-    25 history features, all leak-free.
+    34 history features.
     Feature index map:
       0  log1p(demand)
       1  active indicator
@@ -215,14 +434,133 @@ def load_real_data(data_raw):
       22 positive_mean_13_log       ← lag-fixed
       23 positive_max_13_log        ← lag-fixed
       24 positive_std_13
+
+      Added historical DPH funnel features:
+      25 total_dph_log
+      26 buy_box_dph_log
+      27 total_dph_mean_4_log
+      28 total_dph_mean_13_log
+      29 buy_box_dph_mean_4_log
+      30 buy_box_dph_mean_13_log
+      31 buy_box_rate
+      32 in_stock_rate
+      33 in_stock_given_buybox
     """
+    data_raw = data_raw.copy()
+
+    # Make sure order_week is datetime before creating calendar features.
+    data_raw["order_week"] = pd.to_datetime(data_raw["order_week"], errors="coerce")
+
     holiday_cols = [c for c in data_raw.columns if c.startswith("holiday_indicator_")]
-    context_cols = ["our_price", "in_stock_dph"] + holiday_cols
+    distance_cols = [c for c in data_raw.columns if c.startswith("distance_")]
+    stock_extra_raw_cols = _select_stock_decoder_extra_cols(data_raw)
+    pkg_cols = _infer_pkg_dimension_cols(data_raw)
+
+    # ------------------------------------------------------------
+    # Future-known context features.
+    # These are safe because they are calendar / planned / static features.
+    # ------------------------------------------------------------
+    context_cols = ["our_price"] + holiday_cols + distance_cols
+
+    # Explicit business seasonality.
+    # Useful for bulky seasonal products such as grills, outdoor furniture,
+    # fitness equipment, etc.
+    data_raw["order_month"] = data_raw["order_week"].dt.month.astype(float)
+    data_raw["month_sin"] = np.sin(2 * np.pi * data_raw["order_month"] / 12.0)
+    data_raw["month_cos"] = np.cos(2 * np.pi * data_raw["order_month"] / 12.0)
+
+    data_raw["season_winter"] = data_raw["order_month"].isin([12, 1, 2]).astype(float)
+    data_raw["season_spring"] = data_raw["order_month"].isin([3, 4, 5]).astype(float)
+    data_raw["season_summer"] = data_raw["order_month"].isin([6, 7, 8]).astype(float)
+    data_raw["season_fall"] = data_raw["order_month"].isin([9, 10, 11]).astype(float)
+
+    seasonal_context_cols = [
+        "order_month",
+        "month_sin",
+        "month_cos",
+        "season_winter",
+        "season_spring",
+        "season_summer",
+        "season_fall",
+    ]
+
+    # Major shopping-event proximity features.
+    # If distance_* exists, convert it to proximity = 1 near event, 0 far.
+    major_distance_cols = [
+        "distance_blackfriday",
+        "distance_cybermonday",
+        "distance_primeday",
+        "distance_christmasday",
+        "distance_thanksgivingday",
+        "distance_newyearseve",
+    ]
+
+    proximity_cols = []
+    for c in major_distance_cols:
+        if c in data_raw.columns:
+            new_c = f"{c}_proximity"
+            dist_val = pd.to_numeric(data_raw[c], errors="coerce").fillna(0.0)
+            data_raw[new_c] = (1.0 - dist_val.abs()).clip(lower=0.0, upper=1.0)
+            proximity_cols.append(new_c)
+
+    context_cols = context_cols + [c for c in seasonal_context_cols + proximity_cols if c not in context_cols]
 
     base_cols = ["asin", "order_week", "fbi_demand", "scot_oos"]
-    keep_cols = [c for c in base_cols + context_cols if c in data_raw.columns]
+
+    # Keep in_stock_dph for history encoder only.
+    # It is intentionally excluded from future_context.
+    # Keep DPH variables for history-only safe proxy features.
+    # They are not used as raw future context.
+    history_only_cols = ["in_stock_dph", "total_dph", "buy_box_dph"]
+
+    extra_diag_cols = [c for c in pkg_cols.values() if c is not None]
+
+    keep_cols = [
+        c for c in base_cols + context_cols + history_only_cols + extra_diag_cols + stock_extra_raw_cols
+        if c in data_raw.columns
+    ]
+
+    # Remove duplicate column names. Duplicates can happen because package columns
+    # are used both for total_size diagnostics and stock-decoder extra features.
+    keep_cols = list(dict.fromkeys(keep_cols))
+
     df = data_raw[keep_cols].copy()
+
+    # Encode additional product / popularity / promo / size features for stock decoder.
+    df, stock_extra_cols = _encode_stock_decoder_extra_features(df, stock_extra_raw_cols)
+
+    # Add encoded stock-extra columns to future_context.
+    # These features help the stock decoder predict future in_stock_dph_hat.
+    context_cols = list(dict.fromkeys(context_cols + stock_extra_cols))
+
+    # Forecast-origin-safe historical DPH proxy features.
+    # These columns are placeholders here and are filled inside DemandDataset
+    # using only history up to each forecast origin.
+    dph_proxy_cols = [
+        "hist_total_dph_last_log",
+        "hist_total_dph_mean4_log",
+        "hist_total_dph_mean13_log",
+        "hist_buy_box_dph_last_log",
+        "hist_buy_box_dph_mean4_log",
+        "hist_buy_box_dph_mean13_log",
+    ]
+    for c in dph_proxy_cols:
+        df[c] = 0.0
+
+    context_cols = list(dict.fromkeys(context_cols + dph_proxy_cols))
     df = df.rename(columns={"asin":"ASIN","order_week":"Week","fbi_demand":"Demand","scot_oos":"OOS"})
+
+    h_col = pkg_cols.get("height")
+    l_col = pkg_cols.get("length")
+    w_col = pkg_cols.get("width")
+
+    if h_col is not None and l_col is not None and w_col is not None:
+        pkg_h = pd.to_numeric(_get_1d_col(df, h_col), errors="coerce").fillna(0).clip(lower=0)
+        pkg_l = pd.to_numeric(_get_1d_col(df, l_col), errors="coerce").fillna(0).clip(lower=0)
+        pkg_w = pd.to_numeric(_get_1d_col(df, w_col), errors="coerce").fillna(0).clip(lower=0)
+        df["pkg_volume_raw"] = pkg_h * pkg_l * pkg_w
+    else:
+        df["pkg_volume_raw"] = np.nan
 
     df["Week"] = pd.to_datetime(df["Week"])
     df["Demand"] = pd.to_numeric(df["Demand"], errors="coerce").fillna(0).clip(lower=0)
@@ -230,11 +568,37 @@ def load_real_data(data_raw):
     for c in context_cols:
         df = _safe_numeric(df, c, default=0.0)
 
-    df["our_price"] = np.log1p(df["our_price"].clip(lower=0))
-    df["in_stock_dph"] = df["in_stock_dph"].clip(lower=0)
-    df["in_stock_dph"] = df.groupby("ASIN")["in_stock_dph"].shift(1).fillna(0)
+    # Keep raw price for amount diagnostics, then use log price for model context.
+    df["our_price_raw"] = df["our_price"].clip(lower=0)
+    df["our_price"] = np.log1p(df["our_price_raw"])
+
+    # Use historical in_stock_dph directly in the encoder; no lag shift.
+    # Future in_stock_dph is not used in future_context.
+    if "in_stock_dph" in df.columns:
+        df["in_stock_dph"] = pd.to_numeric(df["in_stock_dph"], errors="coerce").fillna(0.0)
+        df["in_stock_dph"] = df["in_stock_dph"].clip(lower=0)
+    else:
+        df["in_stock_dph"] = 0.0
+
+    # Historical total_dph / buy_box_dph are used only as forecast-origin-safe summaries.
+    for c in ["total_dph", "buy_box_dph"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0).clip(lower=0)
+        else:
+            df[c] = 0.0
+
+    # Cap heavy-tailed DPH targets using total_dph as a unified exposure scale cap.
+    # This cap is applied before constructing decoder targets.
+    dph_cap = _compute_total_dph_cap(df, q=dph_cap_q)
+    df = _apply_dph_cap(df, dph_cap)
     for c in holiday_cols:
         df[c] = df[c].clip(lower=0, upper=1)
+
+    # Distance-to-holiday features are future-known scalar calendar features.
+    # Keep direction if raw values are signed: negative = before holiday, positive = after holiday.
+    for c in distance_cols:
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
+        df[c] = df[c].clip(lower=-12, upper=12) / 12.0
 
     df = df.sort_values(["ASIN", "Week"]).reset_index(drop=True)
 
@@ -269,7 +633,12 @@ def load_real_data(data_raw):
             d_t[i] = (i - last) / 52.0 if last >= 0 else 1.0
 
         in_stock_lag = group["in_stock_dph"].values.astype(float)
+        instock_raw  = group["in_stock_dph"].values.astype(float)
         price_log    = group["our_price"].values.astype(float)
+        price_raw    = group["our_price_raw"].values.astype(float)
+        pkg_volume_raw = group["pkg_volume_raw"].values.astype(float)
+        total_dph_raw = group["total_dph"].values.astype(float)
+        buy_box_dph_raw = group["buy_box_dph"].values.astype(float)
 
         # All rolling features now exclude current step (leak-free)
         hist_nonzero_mean_52 = _rolling_positive_mean(demand, 52)
@@ -282,6 +651,20 @@ def load_real_data(data_raw):
         oos_rate_13     = _rolling_mean(oos, 13)
         instock_mean_4  = _rolling_mean(in_stock_lag, 4)
         instock_mean_13 = _rolling_mean(in_stock_lag, 13)
+
+        total_dph_mean_4  = _rolling_mean(total_dph_raw, 4)
+        total_dph_mean_13 = _rolling_mean(total_dph_raw, 13)
+        buy_box_dph_mean_4  = _rolling_mean(buy_box_dph_raw, 4)
+        buy_box_dph_mean_13 = _rolling_mean(buy_box_dph_raw, 13)
+
+        buy_box_rate = buy_box_dph_raw / (total_dph_raw + 1.0)
+        in_stock_rate = instock_raw / (total_dph_raw + 1.0)
+        in_stock_given_buybox = instock_raw / (buy_box_dph_raw + 1.0)
+
+        buy_box_rate = np.clip(buy_box_rate, 0.0, 10.0)
+        in_stock_rate = np.clip(in_stock_rate, 0.0, 10.0)
+        in_stock_given_buybox = np.clip(in_stock_given_buybox, 0.0, 10.0)
+
         zero_streak     = _zero_streak(b_t) / 52.0
 
         positive_mean_4  = _rolling_positive_mean(demand, 4)
@@ -315,9 +698,20 @@ def load_real_data(data_raw):
             np.log1p(positive_mean_13),
             np.log1p(positive_max_13),
             positive_std_13,
+
+            np.log1p(total_dph_raw),
+            np.log1p(buy_box_dph_raw),
+            np.log1p(total_dph_mean_4),
+            np.log1p(total_dph_mean_13),
+            np.log1p(buy_box_dph_mean_4),
+            np.log1p(buy_box_dph_mean_13),
+            buy_box_rate,
+            in_stock_rate,
+            in_stock_given_buybox,
         ], axis=1).astype(np.float32)
 
         future_context = group[context_cols].values.astype(np.float32)
+
 
         data[asin] = {
             "features": features,
@@ -325,9 +719,29 @@ def load_real_data(data_raw):
             "demand": demand.astype(np.float32),
             "week": weeks,
             "oos": oos.astype(np.float32),
+            "price_raw": price_raw.astype(np.float32),
+            "pkg_volume_raw": pkg_volume_raw.astype(np.float32),
+            "instock_raw": instock_raw.astype(np.float32),
+            "total_dph_raw": total_dph_raw.astype(np.float32),
+            "buy_box_dph_raw": buy_box_dph_raw.astype(np.float32),
+            "dph_proxy_context_idx": {
+                c: context_cols.index(c) for c in dph_proxy_cols if c in context_cols
+            },
         }
 
-    print("History encoder dim: 25 (all leak-free)")
+    print("History encoder dim: 34")
+    print(f"Package dimension columns for total_size: {pkg_cols}")
+    print("History in_stock_dph: raw historical value, no lag shift")
+    print("Future context excludes in_stock_dph")
+    print("Future context includes distance_* calendar features + explicit season/month + major-event proximity")
+    print("Integrated exposure decoder: predicts total_dph_hat, buy_box_dph_hat, in_stock_dph_hat")
+    print("Stock decoder safe mode: excludes future true total_dph and buy_box_dph")
+    print("Safe historical DPH proxies: total_dph/buy_box_dph last/mean4/mean13")
+    print("History encoder includes DPH funnel features")
+    print(f"DPH cap q: {dph_cap_q} | cap value: {dph_cap}")
+    print(f"Seasonal context cols added: {[c for c in ['order_month','month_sin','month_cos','season_winter','season_spring','season_summer','season_fall'] if c in context_cols]}")
+    print(f"Major-event proximity cols added: {[c for c in context_cols if c.endswith('_proximity')]}")
+    print(f"Historical DPH proxy cols added: {[c for c in context_cols if c.startswith('hist_') and 'dph' in c]}")
     print(f"Context dim: {len(context_cols)}")
     return data, len(context_cols), context_cols
 
@@ -351,13 +765,69 @@ class DemandDataset(Dataset):
                 self.samples.append({
                     "x": torch.tensor(d["features"][start:start+history], dtype=torch.float32),
                     "future_context": torch.tensor(
-                        d["future_context"][start+history:start+history+horizon],
+                        self._make_future_context_with_dph_proxies(
+                            d=d,
+                            start=start,
+                            history=history,
+                            horizon=horizon,
+                        ),
                         dtype=torch.float32),
                     "y": torch.tensor(d["demand"][start+history:start+history+horizon], dtype=torch.float32),
                     "asin": asin,
                     "target_week": [str(w)[:10] for w in d["week"][start+history:start+history+horizon]],
                     "oos": torch.tensor(d["oos"][start+history:start+history+horizon], dtype=torch.float32),
+                    "our_price": torch.tensor(
+                        d["price_raw"][start+history:start+history+horizon],
+                        dtype=torch.float32),
+                    "pkg_volume": torch.tensor(
+                        d["pkg_volume_raw"][start+history:start+history+horizon],
+                        dtype=torch.float32),
+                    "future_instock": torch.tensor(
+                        d["instock_raw"][start+history:start+history+horizon],
+                        dtype=torch.float32),
+                    "future_total_dph": torch.tensor(
+                        d["total_dph_raw"][start+history:start+history+horizon],
+                        dtype=torch.float32),
+                    "future_buy_box_dph": torch.tensor(
+                        d["buy_box_dph_raw"][start+history:start+history+horizon],
+                        dtype=torch.float32),
                 })
+
+    def _safe_hist_mean(self, arr, start, history, window):
+        hist = arr[start:start+history]
+        if len(hist) == 0:
+            return 0.0
+        hist = hist[-min(window, len(hist)):]
+        return float(np.mean(hist))
+
+    def _make_future_context_with_dph_proxies(self, d, start, history, horizon):
+        """
+        Fill historical DPH summary proxy features using only values up to forecast origin.
+        These are repeated across the horizon and do not use future true DPH.
+        """
+        fc = d["future_context"][start+history:start+history+horizon].copy()
+        idx = d.get("dph_proxy_context_idx", {})
+
+        total_hist = d.get("total_dph_raw", None)
+        buy_hist = d.get("buy_box_dph_raw", None)
+
+        def fill(col, val):
+            if col in idx:
+                fc[:, idx[col]] = np.log1p(max(float(val), 0.0))
+
+        if total_hist is not None:
+            total_last = total_hist[start+history-1] if history > 0 else 0.0
+            fill("hist_total_dph_last_log", total_last)
+            fill("hist_total_dph_mean4_log", self._safe_hist_mean(total_hist, start, history, 4))
+            fill("hist_total_dph_mean13_log", self._safe_hist_mean(total_hist, start, history, 13))
+
+        if buy_hist is not None:
+            buy_last = buy_hist[start+history-1] if history > 0 else 0.0
+            fill("hist_buy_box_dph_last_log", buy_last)
+            fill("hist_buy_box_dph_mean4_log", self._safe_hist_mean(buy_hist, start, history, 4))
+            fill("hist_buy_box_dph_mean13_log", self._safe_hist_mean(buy_hist, start, history, 13))
+
+        return fc
 
     def __len__(self): return len(self.samples)
     def __getitem__(self, i): return self.samples[i]
@@ -418,7 +888,7 @@ class SparsePeakAttention(nn.Module):
 
 
 class TCNSparseAttnEncoder(nn.Module):
-    def __init__(self, input_dim=25, d_model=32, horizon=20):
+    def __init__(self, input_dim=34, d_model=32, horizon=20):
         super().__init__()
         self.horizon = horizon
         self.input_proj = nn.Linear(input_dim, d_model)
@@ -497,57 +967,145 @@ class Epinet(nn.Module):
         return out[:,:self.horizon], out[:,self.horizon:]
 
 
-class TCN_ENN(nn.Module):
-    def __init__(self, input_dim=25, context_dim=2, d_model=32,
-                 d_z=16, horizon=20, prior_scale=0.3):
+
+
+class ExposureDecoder(nn.Module):
+    """
+    Multi-output exposure decoder.
+
+    Predicts three future exposure funnel signals:
+      1. total_dph_hat
+      2. buy_box_dph_hat
+      3. in_stock_dph_hat
+
+    It uses encoder state h_t and known/safe future context.
+    Demand head consumes predicted exposure hats, never true future DPH.
+    """
+    def __init__(self, d_model, context_dim, horizon=20, hidden=64):
         super().__init__()
-        self.d_z = d_z; self.horizon = horizon
-        self.encoder     = TCNSparseAttnEncoder(input_dim, d_model, horizon)
-        self.z_generator = ContextZGenerator(d_model, context_dim, d_z, horizon)
-        self.epinet      = Epinet(d_model, d_z, horizon, prior_scale)
+        self.horizon = horizon
+        self.net = nn.Sequential(
+            nn.Linear(d_model + context_dim + 2, hidden),
+            nn.ReLU(),
+            nn.Dropout(0.10),
+            nn.Linear(hidden, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, 3),
+        )
+
+    def forward(self, h_t, future_context):
+        B, H, C = future_context.shape
+        h_rep = h_t.unsqueeze(1).expand(B, H, h_t.shape[-1])
+
+        horizon_idx = torch.arange(H, device=future_context.device).float()
+        horizon_idx = horizon_idx.view(1, H, 1).expand(B, H, 1) / max(H, 1)
+
+        horizon_sin = torch.sin(2 * np.pi * horizon_idx)
+        horizon_cos = torch.cos(2 * np.pi * horizon_idx)
+
+        inp = torch.cat([h_rep, future_context, horizon_sin, horizon_cos], dim=-1)
+
+        exposure_log_hat = self.net(inp)
+        exposure_log_hat = F.softplus(exposure_log_hat)  # log1p exposure hats, nonnegative
+
+        return exposure_log_hat
+
+
+
+class TCN_ENN(nn.Module):
+    def __init__(self, input_dim=34, context_dim=2, d_model=32,
+                 d_z=16, horizon=20, prior_scale=0.3,
+                 use_stock_decoder=True):
+        super().__init__()
+        self.d_z = d_z
+        self.horizon = horizon
+        self.use_stock_decoder = use_stock_decoder
+        self.context_dim = context_dim
+
+        self.encoder = TCNSparseAttnEncoder(input_dim, d_model, horizon)
+
+        if use_stock_decoder:
+            self.stock_decoder = ExposureDecoder(d_model, context_dim, horizon)
+            z_context_dim = context_dim + 3  # add predicted log1p(total/buy_box/in_stock DPH hats)
+        else:
+            self.stock_decoder = None
+            z_context_dim = context_dim
+
+        self.z_generator = ContextZGenerator(d_model, z_context_dim, d_z, horizon)
+        self.epinet = Epinet(d_model, d_z, horizon, prior_scale)
+
+    def _augment_context_with_stock_hat(self, h_t, future_context):
+        """
+        Predict future exposure hats and append them to future_context.
+
+        Demand head sees predicted exposure hats only:
+            total_dph_hat, buy_box_dph_hat, in_stock_dph_hat
+
+        It never sees true future DPH values.
+        """
+        if not self.use_stock_decoder:
+            return future_context, None
+
+        exposure_log_hat = self.stock_decoder(h_t, future_context)  # [B, H, 3]
+        future_context_aug = torch.cat(
+            [future_context, exposure_log_hat],
+            dim=-1,
+        )
+        return future_context_aug, exposure_log_hat
 
     def forward(self, x, future_context, nZ=8):
         mu_base, alpha_base, h_t = self.encoder(x)
-        phi = h_t.detach()
-        z_mean, z_std = self.z_generator(phi, future_context)
+        future_context_aug, stock_log_hat = self._augment_context_with_stock_hat(h_t, future_context)
 
-        # z 正则：防止后验过度扩张
+        phi = h_t.detach()
+        z_mean, z_std = self.z_generator(phi, future_context_aug)
+
+        # z regularization
         z_reg = 0.001 * (z_mean**2 + z_std**2).mean()
 
         preds = []
         for _ in range(nZ):
             eps = torch.randn_like(z_mean)
-            z   = z_mean + z_std * eps
+            z = z_mean + z_std * eps
             mu_e, al_e = self.epinet(phi, z)
-            mu    = F.softplus(mu_base + mu_e)
+            mu = F.softplus(mu_base + mu_e)
             alpha = F.softplus(alpha_base + al_e) + 1e-4
             preds.append((mu, alpha))
 
-        return preds, z_reg
+        return preds, z_reg, stock_log_hat
 
-    def predict(self, x, future_context, M=50):
+    def predict(self, x, future_context, M=50, return_stock=False):
         self.eval()
         with torch.no_grad():
             mu_base, alpha_base, h_t = self.encoder(x)
+            future_context_aug, stock_log_hat = self._augment_context_with_stock_hat(h_t, future_context)
+
             phi = h_t.detach()
-            z_mean, z_std = self.z_generator(phi, future_context)
+            z_mean, z_std = self.z_generator(phi, future_context_aug)
+
             samples = []
             for _ in range(M):
                 eps = torch.randn_like(z_mean)
-                z   = z_mean + z_std * eps
+                z = z_mean + z_std * eps
                 mu_e, al_e = self.epinet(phi, z)
-                mu    = F.softplus(mu_base + mu_e)
+                mu = F.softplus(mu_base + mu_e)
                 alpha = F.softplus(alpha_base + al_e) + 1e-4
-                dist  = torch.distributions.NegativeBinomial(
-                    total_count=(1.0/alpha).clamp(min=1e-4),
-                    probs=(mu*alpha/(1+mu*alpha)).clamp(1e-6, 1-1e-6),
+                dist = torch.distributions.NegativeBinomial(
+                    total_count=(1.0 / alpha).clamp(min=1e-4),
+                    probs=(mu * alpha / (1 + mu * alpha)).clamp(1e-6, 1 - 1e-6),
                 )
                 samples.append(dist.sample().float())
+
             samples = torch.stack(samples, dim=1)
             p50 = samples.quantile(0.5, dim=1)
             p70 = samples.quantile(0.7, dim=1)
             p70 = torch.maximum(p70, p50)
+
+        if return_stock:
+            return p50, p70, stock_log_hat
+
         return p50, p70
+
 
 
 # =====================================================
@@ -573,6 +1131,52 @@ def tail_weighted_negbin_nll(y, mu, alpha, beta_tail=0.5):
 def pinball(y, pred, q):
     d = y - pred
     return torch.mean(torch.max(q*d, (q-1)*d))
+
+
+def stock_decoder_loss(exposure_log_hat, future_instock_true,
+                       future_total_dph_true=None,
+                       future_buy_box_dph_true=None,
+                       mean_weight=0.30):
+    """
+    Multi-output exposure decoder loss.
+
+    The decoder predicts:
+      exposure_log_hat[..., 0] = log1p(total_dph_hat)
+      exposure_log_hat[..., 1] = log1p(buy_box_dph_hat)
+      exposure_log_hat[..., 2] = log1p(in_stock_dph_hat)
+
+    True future DPH values are used only as auxiliary supervision.
+    Demand prediction uses predicted hats only.
+    """
+    if exposure_log_hat is None:
+        return torch.tensor(0.0, device=future_instock_true.device)
+
+    if future_total_dph_true is None:
+        future_total_dph_true = torch.zeros_like(future_instock_true)
+
+    if future_buy_box_dph_true is None:
+        future_buy_box_dph_true = torch.zeros_like(future_instock_true)
+
+    true_stack = torch.stack([
+        future_total_dph_true.clamp(min=0.0),
+        future_buy_box_dph_true.clamp(min=0.0),
+        future_instock_true.clamp(min=0.0),
+    ], dim=-1)
+
+    target_log = torch.log1p(true_stack)
+
+    point_loss = F.huber_loss(exposure_log_hat, target_log, delta=1.0)
+
+    pred_level = torch.expm1(exposure_log_hat).clamp(min=0.0)
+    true_level = true_stack
+
+    mean_pred = torch.log1p(pred_level.mean(dim=(0, 1)))
+    mean_true = torch.log1p(true_level.mean(dim=(0, 1)))
+
+    mean_loss = torch.mean(torch.abs(mean_pred - mean_true))
+
+    return point_loss + mean_weight * mean_loss
+
 
 
 
@@ -746,7 +1350,15 @@ def diagnose_encoder(model, va_ld):
         for b in va_ld:
             _, _, h_t = model.encoder(b["x"])
             phi = h_t.detach()
-            zm, zs = model.z_generator(phi, b["future_context"])
+
+            # Stock-decoder version:
+            # z_generator expects future_context augmented with predicted stock_hat.
+            if hasattr(model, "_augment_context_with_stock_hat"):
+                fc_for_z, _ = model._augment_context_with_stock_hat(h_t, b["future_context"])
+            else:
+                fc_for_z = b["future_context"]
+
+            zm, zs = model.z_generator(phi, fc_for_z)
             z_means.append(zm.numpy())
             z_stds.append(zs.numpy())
 
@@ -795,8 +1407,10 @@ def train(
     lr=1e-3,
     lambda_q=0.05,
     beta_tail=0.5,
-    patience=5,        # 早停
-    lambda_z_reg=1.0,  # z 正则权重
+    patience=5,        # early stop
+    lambda_z_reg=1.0,  # z regularization
+    lambda_stock=0.05, # auxiliary exposure decoder loss weight
+    lambda_stock_mean_weight=0.30, # mean calibration inside exposure decoder loss
 ):
     opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
     sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
@@ -814,7 +1428,7 @@ def train(
             fc = b["future_context"]
             y  = b["y"]
 
-            preds, z_reg = model(x, fc, nZ=nZ)
+            preds, z_reg, stock_log_hat = model(x, fc, nZ=nZ)
 
             nll_loss = sum(
                 tail_weighted_negbin_nll(y, mu, alpha, beta_tail=beta_tail)
@@ -827,7 +1441,23 @@ def train(
             p70_train  = torch.maximum(p70_train, p50_train)
             q_loss     = pinball(y, p50_train, 0.5) + pinball(y, p70_train, 0.7)
 
-            loss = nll_loss + lambda_q * q_loss + lambda_z_reg * z_reg
+            if "future_instock" in b:
+                s_loss = stock_decoder_loss(
+                    stock_log_hat,
+                    b["future_instock"],
+                    b.get("future_total_dph", None),
+                    b.get("future_buy_box_dph", None),
+                    mean_weight=lambda_stock_mean_weight,
+                )
+            else:
+                s_loss = torch.tensor(0.0, device=y.device)
+
+            loss = (
+                nll_loss
+                + lambda_q * q_loss
+                + lambda_z_reg * z_reg
+                + lambda_stock * s_loss
+            )
 
             opt.zero_grad()
             loss.backward()
@@ -861,7 +1491,7 @@ def train(
             f"Epoch {epoch+1:3d} | "
             f"train={tr_loss/max(1,len(tr_ld)):.4f} | "
             f"val={vl:.4f} | "
-            f"beta_tail={beta_tail}"
+            f"beta_tail={beta_tail} | stock_loss_w={lambda_stock}"
             + (" *" if improved else "")
         )
 
@@ -901,7 +1531,7 @@ def generate_forecast_df(model, va_ld, M=50):
     model.eval()
     with torch.no_grad():
         for b in va_ld:
-            p50, p70 = model.predict(b["x"], b["future_context"], M=M)
+            p50, p70, stock_log_hat = model.predict(b["x"], b["future_context"], M=M, return_stock=True)
             hist_mean = (b["x"][:,:,0].exp()-1).mean(dim=1,keepdim=True).clamp(min=0)
             hm50 = hist_mean.expand_as(b["y"])
             hm70 = hm50 * 1.25
@@ -912,6 +1542,30 @@ def generate_forecast_df(model, va_ld, M=50):
                         "order_week": pd.to_datetime(b["target_week"][h][i]),
                         "fcst_week_index": h+1,
                         "fbi_demand": b["y"][i,h].item(),
+                        "our_price": b["our_price"][i,h].item(),
+                        "true_amt": b["y"][i,h].item() * b["our_price"][i,h].item(),
+                        "pkg_volume": b["pkg_volume"][i,h].item(),
+                        "true_size": b["y"][i,h].item() * b["pkg_volume"][i,h].item(),
+                        "true_future_total_dph": b["future_total_dph"][i,h].item()
+                            if "future_total_dph" in b else np.nan,
+                        "true_future_buy_box_dph": b["future_buy_box_dph"][i,h].item()
+                            if "future_buy_box_dph" in b else np.nan,
+                        "true_future_instock": b["future_instock"][i,h].item()
+                            if "future_instock" in b else np.nan,
+
+                        "pred_total_dph_hat": torch.expm1(stock_log_hat[i,h,0]).item()
+                            if stock_log_hat is not None else np.nan,
+                        "pred_buy_box_dph_hat": torch.expm1(stock_log_hat[i,h,1]).item()
+                            if stock_log_hat is not None else np.nan,
+                        "pred_instock_dph_hat": torch.expm1(stock_log_hat[i,h,2]).item()
+                            if stock_log_hat is not None else np.nan,
+
+                        "pred_total_dph_log_hat": stock_log_hat[i,h,0].item()
+                            if stock_log_hat is not None else np.nan,
+                        "pred_buy_box_dph_log_hat": stock_log_hat[i,h,1].item()
+                            if stock_log_hat is not None else np.nan,
+                        "pred_instock_log_hat": stock_log_hat[i,h,2].item()
+                            if stock_log_hat is not None else np.nan,
                         "scot_oos": b["oos"][i,h].item(),
                         "oos": b["oos"][i,h].item(),
                         "oos_status": b["oos"][i,h].item(),
@@ -1025,6 +1679,9 @@ def run_nb_high_sparse(
     beta_tail=0.5,
     patience=5,
     lambda_z_reg=1.0,
+    lambda_stock=0.05,
+    lambda_stock_mean_weight=0.30,
+    dph_cap_q=0.995,
     remove_extreme=True,
     extreme_q=0.99,
 ):
@@ -1040,7 +1697,7 @@ def run_nb_high_sparse(
     if remove_extreme:
         data_high, _, _ = filter_extreme_asins(data_high, q=extreme_q)
 
-    data, context_dim, context_cols = load_real_data(data_high)
+    data, context_dim, context_cols = load_real_data(data_high, dph_cap_q=dph_cap_q)
     all_demand = np.concatenate([d["demand"] for d in data.values()])
     print(f"ASINs: {len(data)} | Zero rate: {(all_demand==0).mean():.1%}")
 
@@ -1058,7 +1715,7 @@ def run_nb_high_sparse(
     train(model, tr_ld, va_ld,
           epochs=epochs, nZ=8, lr=1e-3,
           lambda_q=lambda_q, beta_tail=beta_tail,
-          patience=patience, lambda_z_reg=lambda_z_reg)
+          patience=patience, lambda_z_reg=lambda_z_reg, lambda_stock=lambda_stock, lambda_stock_mean_weight=lambda_stock_mean_weight)
 
     # Encoder diagnostics.
     diagnose_encoder(model, va_ld)
@@ -1079,6 +1736,7 @@ def run_nb_high_sparse(
 
     return {
         "model": model,
+        "context_cols": context_cols,
         "forecast_df": forecast_df,
         "diag_df": diag_df,
         "diag_p50": diag_p50,
@@ -1180,6 +1838,9 @@ def run_nb_high_sparse_with_wape(
     beta_tail=0.5,
     patience=5,
     lambda_z_reg=1.0,
+    lambda_stock=0.05,
+    lambda_stock_mean_weight=0.30,
+    dph_cap_q=0.995,
     remove_extreme=True,
     extreme_q=0.99,
     remove_oos_dp=True,
@@ -1318,6 +1979,8 @@ def summarize_wape_by_sparse_group(wape_df, joined_df_with_group):
         "n_asins",
         "n_rows",
         "total_fbi_demand",
+        "total_amt",
+        "total_size",
         "demand_share",
         "avg_total_demand_per_asin",
         "true_mean",
@@ -1457,6 +2120,16 @@ def run_high_sparse_scot_alignment_wape(
         "n_rows": len(forecast_df_scot_real),
         "n_asins": forecast_df_scot_real["asin"].nunique(),
         "true_mean": forecast_df_scot_real["fbi_demand"].mean(),
+        "total_amt": (
+            forecast_df_scot_real["true_amt"].sum()
+            if "true_amt" in forecast_df_scot_real.columns
+            else np.nan
+        ),
+        "total_size": (
+            forecast_df_scot_real["true_size"].sum()
+            if "true_size" in forecast_df_scot_real.columns
+            else np.nan
+        ),
         "amxl_p50_mean": forecast_df_scot_real["p50_amxl"].mean(),
         "amxl_p70_mean": forecast_df_scot_real["p70_amxl"].mean(),
         "real_scot_p50_mean": forecast_df_scot_real["p50_scot"].mean(),
@@ -1552,6 +2225,9 @@ def run_nb_high_sparse_from_sample_scot_intersection(
     beta_tail=0.5,
     patience=5,
     lambda_z_reg=1.0,
+    lambda_stock=0.05,
+    lambda_stock_mean_weight=0.30,
+    dph_cap_q=0.995,
     remove_extreme=True,
     extreme_q=0.99,
     run_wape=True,
@@ -1591,7 +2267,7 @@ def run_nb_high_sparse_from_sample_scot_intersection(
         removed_extreme = pd.DataFrame()
         extreme_cap = np.nan
 
-    data, context_dim, context_cols = load_real_data(data_high)
+    data, context_dim, context_cols = load_real_data(data_high, dph_cap_q=dph_cap_q)
 
     all_demand = np.concatenate([d["demand"] for d in data.values()])
     print(f"ASINs used for training: {len(data)}")
@@ -1606,7 +2282,7 @@ def run_nb_high_sparse_from_sample_scot_intersection(
     print(f"Train samples: {len(tr_ds)} | Val samples: {len(va_ds)}")
 
     model = TCN_ENN(
-        input_dim=25,
+        input_dim=34,
         context_dim=context_dim,
         d_model=d_model,
         d_z=d_z,
@@ -1629,6 +2305,8 @@ def run_nb_high_sparse_from_sample_scot_intersection(
         beta_tail=beta_tail,
         patience=patience,
         lambda_z_reg=lambda_z_reg,
+        lambda_stock=lambda_stock,
+        lambda_stock_mean_weight=lambda_stock_mean_weight,
     )
 
     diagnose_encoder(model, va_ld)
@@ -1651,6 +2329,7 @@ def run_nb_high_sparse_from_sample_scot_intersection(
 
     result = {
         "model": model,
+        "context_cols": context_cols,
         "forecast_df": forecast_df,
         "diag_df": diag_df,
         "diag_p50": diag_p50,
@@ -1666,6 +2345,8 @@ def run_nb_high_sparse_from_sample_scot_intersection(
         "removed_extreme": removed_extreme,
         "extreme_cap": extreme_cap,
     }
+
+    result["stock_decoder_diag"] = diagnose_stock_decoder(result)
 
     if run_wape:
         result["real_scot_outputs"] = run_high_sparse_scot_alignment_wape(
@@ -1703,6 +2384,9 @@ def run_nb_all_sample_scot_intersection(
     beta_tail=0.5,
     patience=5,
     lambda_z_reg=1.0,
+    lambda_stock=0.05,
+    lambda_stock_mean_weight=0.30,
+    dph_cap_q=0.995,
     remove_extreme=True,
     extreme_q=0.99,
     run_wape=True,
@@ -1775,7 +2459,7 @@ def run_nb_all_sample_scot_intersection(
     print(f"Train samples: {len(tr_ds)} | Val samples: {len(va_ds)}")
 
     model = TCN_ENN(
-        input_dim=25,
+        input_dim=34,
         context_dim=context_dim,
         d_model=d_model,
         d_z=d_z,
@@ -1798,6 +2482,8 @@ def run_nb_all_sample_scot_intersection(
         beta_tail=beta_tail,
         patience=patience,
         lambda_z_reg=lambda_z_reg,
+        lambda_stock=lambda_stock,
+        lambda_stock_mean_weight=lambda_stock_mean_weight,
     )
 
     diagnose_encoder(model, va_ld)
@@ -1821,6 +2507,7 @@ def run_nb_all_sample_scot_intersection(
 
     result = {
         "model": model,
+        "context_cols": context_cols,
         "forecast_df": forecast_df,
         "diag_df": diag_df,
         "diag_p50": diag_p50,
@@ -1874,7 +2561,7 @@ def print_final_diagnostics(result):
         print("Weeks:", joined["order_week"].nunique())
         print("Window:", joined["order_week"].min(), "to", joined["order_week"].max())
         keep_cols = [
-            "asin", "order_week", "zero_group", "fbi_demand",
+            "asin", "order_week", "zero_group", "fbi_demand", "our_price", "true_amt", "pkg_volume", "true_size",
             "p50_amxl", "p70_amxl", "p50_scot", "p70_scot",
         ]
         keep_cols = [c for c in keep_cols if c in joined.columns]
@@ -2031,3 +2718,378 @@ def print_final_diagnostics(result):
 #
 # joined_df = result_all_intersection["real_scot_outputs"]["forecast_df_scot_real_with_group"]
 # sparse_group_wape = result_all_intersection["real_scot_outputs"]["sparse_group_wape"]
+
+
+# Main no-distance version with total amount diagnostics:
+#
+# result_all_intersection = run_nb_all_sample_scot_intersection(
+#     data_raw1=data_raw1,
+#     scot_df=scot_df,
+#     n_asins=5000,
+#     seed=42,
+#     zero_thresholds=(0.4, 0.7),
+#     prior_scale=0.3,
+#     epochs=60,
+#     history=52,
+#     horizon=20,
+#     d_model=32,
+#     d_z=16,
+#     batch_size=64,
+#     M_eval=100,
+#     lambda_q=0.05,
+#     beta_tail=0.5,
+#     patience=5,
+#     lambda_z_reg=1.0,
+#     remove_extreme=True,
+#     extreme_q=0.99,
+#     run_wape=True,
+#     remove_oos_dp=True,
+# )
+#
+# sparse_group_wape = result_all_intersection["real_scot_outputs"]["sparse_group_wape"]
+# joined_df = result_all_intersection["real_scot_outputs"]["forecast_df_scot_real_with_group"]
+# print(sparse_group_wape)
+
+
+# =====================================================
+# 15. In-stock feature checker
+# =====================================================
+
+def check_instock_feature_setup(result):
+    """
+    Check the current in_stock_dph setup:
+      - history encoder uses raw historical in_stock_dph features
+      - future_context excludes in_stock_dph
+    """
+    data_train = result.get("data_train", None)
+    va_ld = result.get("va_ld", None)
+
+    print("\n" + "=" * 80)
+    print("IN_STOCK_DPH FEATURE SETUP CHECK")
+    print("=" * 80)
+    print("History encoder: raw historical in_stock_dph, no shift")
+    print("Future context: excludes in_stock_dph")
+
+    if va_ld is not None:
+        for batch in va_ld:
+            x = batch["x"]
+            fc = batch["future_context"]
+            print("history x shape:", tuple(x.shape))
+            print("future_context shape:", tuple(fc.shape))
+            print("history in_stock_dph feature example, first sample:")
+            print(x[0, :, 11].detach().cpu().numpy()[:10])
+            break
+
+    if data_train is not None:
+        print("data_train columns containing stock/instock:")
+        print([c for c in data_train.columns if "stock" in c.lower() or "instock" in c.lower()])
+
+
+
+# =====================================================
+# 16. Context feature checker
+# =====================================================
+
+def check_context_feature_columns(data_raw1):
+    """
+    Print holiday indicator and distance feature columns available in data_raw1.
+    """
+    holiday_cols = [c for c in data_raw1.columns if c.startswith("holiday_indicator_")]
+    distance_cols = [c for c in data_raw1.columns if c.startswith("distance_")]
+
+    print("\n" + "=" * 80)
+    print("CONTEXT FEATURE COLUMN CHECK")
+    print("=" * 80)
+    print("holiday_indicator_* count:", len(holiday_cols))
+    print(holiday_cols)
+    print("\ndistance_* count:", len(distance_cols))
+    print(distance_cols)
+
+    return {
+        "holiday_cols": holiday_cols,
+        "distance_cols": distance_cols,
+    }
+
+
+
+
+# =====================================================
+# 16. Stock decoder diagnostics
+# =====================================================
+
+def diagnose_stock_decoder(result):
+    """
+    Diagnose integrated multi-output exposure decoder.
+    """
+    forecast_df = result.get("forecast_df", None)
+    if forecast_df is None:
+        print("No forecast_df found.")
+        return {}
+
+    pairs = [
+        ("total_dph", "true_future_total_dph", "pred_total_dph_hat"),
+        ("buy_box_dph", "true_future_buy_box_dph", "pred_buy_box_dph_hat"),
+        ("in_stock_dph", "true_future_instock", "pred_instock_dph_hat"),
+    ]
+
+    overall_rows = []
+    by_horizon_rows = []
+
+    for name, true_col, pred_col in pairs:
+        if true_col not in forecast_df.columns or pred_col not in forecast_df.columns:
+            continue
+
+        y = pd.to_numeric(forecast_df[true_col], errors="coerce").fillna(0).clip(lower=0).values
+        p = pd.to_numeric(forecast_df[pred_col], errors="coerce").fillna(0).clip(lower=0).values
+
+        denom = np.abs(y).sum()
+        overall_rows.append({
+            "target": name,
+            "rows": len(forecast_df),
+            "true_mean": y.mean(),
+            "pred_mean": p.mean(),
+            "WAPE": np.abs(y - p).sum() / denom if denom > 0 else np.nan,
+            "log_MAE": np.mean(np.abs(np.log1p(y) - np.log1p(p))),
+            "corr": np.corrcoef(y, p)[0, 1] if np.std(y) > 0 and np.std(p) > 0 else np.nan,
+            "true_zero_rate": (y <= 0).mean(),
+            "pred_zero_rate": (p <= 0).mean(),
+        })
+
+        if "horizon" in forecast_df.columns:
+            for h, g in forecast_df.groupby("horizon"):
+                yh = pd.to_numeric(g[true_col], errors="coerce").fillna(0).clip(lower=0).values
+                ph = pd.to_numeric(g[pred_col], errors="coerce").fillna(0).clip(lower=0).values
+                dh = np.abs(yh).sum()
+                by_horizon_rows.append({
+                    "target": name,
+                    "horizon": h,
+                    "rows": len(g),
+                    "true_mean": yh.mean(),
+                    "pred_mean": ph.mean(),
+                    "WAPE": np.abs(yh - ph).sum() / dh if dh > 0 else np.nan,
+                    "log_MAE": np.mean(np.abs(np.log1p(yh) - np.log1p(ph))),
+                    "corr": np.corrcoef(yh, ph)[0, 1] if np.std(yh) > 0 and np.std(ph) > 0 else np.nan,
+                })
+
+    overall = pd.DataFrame(overall_rows)
+    by_horizon = pd.DataFrame(by_horizon_rows)
+
+    print("\n" + "=" * 80)
+    print("INTEGRATED MULTI-OUTPUT EXPOSURE DECODER DIAGNOSTIC")
+    print("=" * 80)
+    print(overall)
+
+    if len(by_horizon) > 0:
+        print("\nBy horizon:")
+        print(by_horizon)
+
+    return {
+        "overall": overall,
+        "by_horizon": by_horizon,
+    }
+
+
+def check_stock_decoder_extra_feature_columns(data_raw1):
+    """
+    Check which additional stock-decoder features will be used.
+    """
+    cols = _select_stock_decoder_extra_cols(data_raw1)
+
+    print("\n" + "=" * 80)
+    print("STOCK DECODER EXTRA FEATURE COLUMN CHECK")
+    print("=" * 80)
+    print("count:", len(cols))
+    print(cols)
+
+    missing_interesting = [
+        c for c in [
+            "gl_product_group", "category_code", "brand_class",
+            "glance_view_band_cat",
+            "hb_rank", "hb_score", "customer_review_count",
+            "customer_average_review_rating", "ind_promotion",
+            "promotion_amount", "promotion_ratio",
+            "pkg_height", "pkg_length", "pkg_width", "pkg_weight",
+        ]
+        if c not in data_raw1.columns
+    ]
+
+    print("\nMissing from recommended list:")
+    print(missing_interesting)
+
+    return cols
+
+
+
+
+def check_no_buybox_total_dph_in_context(data_raw1):
+    """
+    Verify that buy_box_dph and total_dph are not selected as stock decoder extra features.
+    """
+    cols = _select_stock_decoder_extra_cols(data_raw1)
+
+    bad = [c for c in ["buy_box_dph", "total_dph"] if c in cols]
+
+    print("\n" + "=" * 80)
+    print("BUY_BOX / TOTAL_DPH SAFE-CONTEXT CHECK")
+    print("=" * 80)
+    print("Selected extra feature count:", len(cols))
+    print("buy_box_dph or total_dph selected:", bad)
+
+    if len(bad) == 0:
+        print("OK: buy_box_dph and total_dph are excluded from stock decoder future context.")
+    else:
+        print("WARNING: leakage-risk columns are still selected:", bad)
+
+    return cols
+
+
+
+
+def check_safe_historical_dph_proxy_context(result, n_batches=1):
+    """
+    Check that historical DPH proxy columns are present and constant within horizon.
+    """
+    va_ld = result.get("va_ld", None)
+    context_cols = result.get("context_cols", None)
+
+    print("\n" + "=" * 80)
+    print("SAFE HISTORICAL DPH PROXY CONTEXT CHECK")
+    print("=" * 80)
+
+    if context_cols is not None:
+        proxy_cols = [c for c in context_cols if c.startswith("hist_total_dph") or c.startswith("hist_buy_box_dph")]
+        print("Proxy cols:", proxy_cols)
+
+    if va_ld is None:
+        print("No va_ld found.")
+        return
+
+    for bi, b in enumerate(va_ld):
+        fc = b["future_context"].detach().cpu().numpy()
+        print("future_context shape:", fc.shape)
+
+        if context_cols is not None:
+            for c in proxy_cols:
+                j = context_cols.index(c)
+                print(c, "first sample values:", fc[0, :, j])
+                print(c, "unique first sample:", np.unique(fc[0, :, j]))
+
+        if bi + 1 >= n_batches:
+            break
+
+
+
+# Main usage for multi-output exposure-decoder version:
+#
+# result_all_intersection = run_nb_all_sample_scot_intersection(
+#     data_raw1=data_raw1,
+#     scot_df=scot_df,
+#     n_asins=5000,
+#     seed=42,
+#     zero_thresholds=(0.4, 0.7),
+#     prior_scale=0.3,
+#     epochs=60,
+#     history=52,
+#     horizon=20,
+#     d_model=32,
+#     d_z=16,
+#     batch_size=64,
+#     M_eval=100,
+#     lambda_q=0.05,
+#     beta_tail=0.5,
+#     patience=5,
+#     lambda_z_reg=1.0,
+#     lambda_stock=0.1,
+#     lambda_stock_mean_weight=0.30,
+#     dph_cap_q=0.995,
+#     remove_extreme=True,
+#     extreme_q=0.99,
+#     run_wape=True,
+#     remove_oos_dp=True,
+# )
+#
+# exposure_diag = diagnose_stock_decoder(result_all_intersection)
+#
+# forecast_df = result_all_intersection["forecast_df"]
+# print(forecast_df[[
+#     "asin", "order_week",
+#     "true_future_total_dph", "pred_total_dph_hat",
+#     "true_future_buy_box_dph", "pred_buy_box_dph_hat",
+#     "true_future_instock", "pred_instock_dph_hat",
+# ]].head())
+
+
+
+def diagnose_dph_cap_effect(data_raw1, q=0.995):
+    """
+    Show the cap value and how many DPH rows would be capped.
+    """
+    df = data_raw1.copy()
+    cap = _compute_total_dph_cap(df, q=q)
+
+    rows = []
+    for c in ["total_dph", "buy_box_dph", "in_stock_dph"]:
+        if c in df.columns:
+            s = pd.to_numeric(df[c], errors="coerce").fillna(0.0).clip(lower=0)
+            rows.append({
+                "col": c,
+                "cap": cap,
+                "mean_before": s.mean(),
+                "mean_after": s.clip(upper=cap).mean() if np.isfinite(cap) else s.mean(),
+                "median": s.median(),
+                "max_before": s.max(),
+                "share_capped": (s > cap).mean() if np.isfinite(cap) else 0.0,
+            })
+
+    out = pd.DataFrame(rows)
+    print("\n" + "=" * 80)
+    print("DPH CAP EFFECT")
+    print("=" * 80)
+    print(out)
+    return out
+
+
+
+
+def diagnose_context_columns(result):
+    """
+    Check whether season / major event proximity / historical DPH proxy columns
+    truly entered future_context.
+    """
+    context_cols = result.get("context_cols", None)
+
+    if context_cols is None:
+        print("No context_cols found in result. Make sure run function returns context_cols.")
+        return {}
+
+    basic = [
+        "order_month",
+        "month_sin",
+        "month_cos",
+        "season_winter",
+        "season_spring",
+        "season_summer",
+        "season_fall",
+    ]
+
+    proximity = [c for c in context_cols if c.endswith("_proximity")]
+    dph_proxy = [c for c in context_cols if c.startswith("hist_") and "dph" in c]
+
+    print("\n" + "=" * 80)
+    print("SEASONAL + DPH PROXY CONTEXT COLUMN CHECK")
+    print("=" * 80)
+    print("Basic seasonal cols present:")
+    print({c: (c in context_cols) for c in basic})
+    print("\nMajor event proximity cols:")
+    print(proximity)
+    print("\nHistorical DPH proxy cols:")
+    print(dph_proxy)
+    print("\nContext dim:", len(context_cols))
+
+    return {
+        "basic": {c: (c in context_cols) for c in basic},
+        "proximity_cols": proximity,
+        "dph_proxy_cols": dph_proxy,
+        "context_dim": len(context_cols),
+    }
+
