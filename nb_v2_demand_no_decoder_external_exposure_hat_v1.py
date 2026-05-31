@@ -4399,31 +4399,33 @@ def run_demand_with_anchor_attention_instock_hat(
 # # result_focus comes from:
 # # result_focus = run_attention_only_focused(...)
 #
-# result_demand_attn_instock = run_demand_with_anchor_attention_instock_hat(
-#     data_raw1=data_raw1,
-#     scot_df=scot_df,
-#     result_focus_or_hat=result_focus,
-#
-#     n_asins=5000,
-#     seed=42,
-#     zero_thresholds=(0.4, 0.7),
-#     prior_scale=0.3,
-#     epochs=60,
-#     history=52,
-#     horizon=20,
-#     d_model=32,
-#     d_z=16,
-#     batch_size=64,
-#     M_eval=100,
-#     lambda_q=0.05,
-#     beta_tail=0.5,
-#     patience=5,
-#     lambda_z_reg=1.0,
-#     remove_extreme=True,
-#     extreme_q=0.99,
-#     run_wape=True,
-#     remove_oos_dp=True,
-# )
+result_demand_attn_instock = run_demand_with_anchor_attention_instock_hat(
+    data_raw1=data_raw1,
+    scot_df=scot_df,
+    result_focus_or_hat=exposure_hat_for_demand,
+
+    n_asins=5000,
+    seed=42,
+    zero_thresholds=(0.4, 0.7),
+    prior_scale=0.3,
+    epochs=60,
+    history=52,
+    horizon=20,
+    d_model=32,
+    d_z=16,
+    batch_size=64,
+    M_eval=100,
+    lambda_q=0.05,
+    beta_tail=0.5,
+    patience=5,
+    lambda_z_reg=1.0,
+    remove_extreme=True,
+    extreme_q=0.99,
+    run_wape=True,
+    remove_oos_dp=True,
+)
+
+diagnose_external_exposure_hat_context(result_demand_attn_instock)
 #
 # diagnose_external_exposure_hat_context(result_demand_attn_instock)
 #
