@@ -3290,24 +3290,21 @@ Use it to answer:
 
 
 # ============================================================
-# OVERRIDE: TRUE SAME-DAY IN_STOCK ONLY ORACLE VERSION
+# OVERRIDE: TRUE CURRENT TOTAL + BUY_BOX + IN_STOCK ORACLE VERSION
 # ============================================================
-# This block overrides the original TCN_ENN / stock loss / forecast df.
-#
 # Purpose:
-#   Keep the original encoder / ENN / demand head / training loop unchanged,
-#   but remove total_dph and buy_box_dph from the future exposure signal.
+#   Keep original encoder / ENN / demand head / NB likelihood unchanged.
 #
-# What demand model receives:
-#   future_context_aug = concat(
-#       original future_context,
-#       log1p(TRUE same-day future_instock)
-#   )
+# Difference from old true-lag decoder version:
+#   OLD:
+#     decoder used true previous future exposure as lag.
 #
-# It does NOT use:
-#   TRUE future total_dph
-#   TRUE future buy_box_dph
-#   exposure decoder prediction
+#   THIS VERSION:
+#     no exposure decoder.
+#     directly append current/same-day TRUE future exposure:
+#       log1p(TRUE current total_dph)
+#       log1p(TRUE current buy_box_dph)
+#       log1p(TRUE current in_stock_dph)
 #
 # This is an oracle diagnostic, not deployable.
 # ============================================================
@@ -3320,71 +3317,69 @@ class TCN_ENN(nn.Module):
         self.d_z = d_z
         self.horizon = horizon
 
-        # Keep this attribute name for compatibility with existing diagnostics.
-        # Here it means: use TRUE same-day in_stock as oracle future covariate.
+        # Keep the same attribute name for compatibility.
+        # Here it means: append TRUE current exposure funnel as oracle future covariates.
         self.use_stock_decoder = use_stock_decoder
-        self.use_true_same_day_instock = use_stock_decoder
+        self.use_true_current_exposure = use_stock_decoder
         self.context_dim = context_dim
 
         self.encoder = TCNSparseAttnEncoder(input_dim, d_model, horizon)
 
-        # Only one additional future covariate:
-        #   log1p(TRUE same-day in_stock_dph)
-        if self.use_true_same_day_instock:
-            z_context_dim = context_dim + 1
+        # Append 3 true current exposure features:
+        # total, buy_box, in_stock
+        if self.use_true_current_exposure:
+            z_context_dim = context_dim + 3
         else:
             z_context_dim = context_dim
 
+        # No exposure decoder is trained or used.
         self.stock_decoder = None
+
         self.z_generator = ContextZGenerator(d_model, z_context_dim, d_z, horizon)
         self.epinet = Epinet(d_model, d_z, horizon, prior_scale)
 
-    def _extract_true_instock_log(self, future_context, true_future_exposure=None):
+    def _extract_true_current_exposure_log(self, future_context, true_future_exposure=None):
         B, H, C = future_context.shape
 
         if true_future_exposure is None:
-            # For rare diagnostic calls without future exposure, append zeros
-            # so tensor dimensions remain valid.
-            true_instock = torch.zeros(B, H, device=future_context.device, dtype=future_context.dtype)
+            # Compatibility fallback.
+            return torch.zeros(B, H, 3, device=future_context.device, dtype=future_context.dtype)
 
-        else:
-            # Accepted shapes:
-            #   [B, H, 3] with columns total, buy_box, in_stock
-            #   [B, H, 1]
-            #   [B, H]
-            if true_future_exposure.dim() == 3:
-                if true_future_exposure.shape[-1] >= 3:
-                    true_instock = true_future_exposure[:, :, 2]
-                else:
-                    true_instock = true_future_exposure[:, :, 0]
-            elif true_future_exposure.dim() == 2:
-                true_instock = true_future_exposure
-            else:
-                raise ValueError(
-                    "true_future_exposure must have shape [B,H], [B,H,1], or [B,H,3]."
-                )
+        if true_future_exposure.dim() != 3 or true_future_exposure.shape[-1] < 3:
+            raise ValueError(
+                "true_future_exposure must have shape [B,H,3] with columns "
+                "[total_dph, buy_box_dph, in_stock_dph]."
+            )
 
-            true_instock = true_instock.to(device=future_context.device, dtype=future_context.dtype)
+        true_exp = true_future_exposure[:, :, :3].to(
+            device=future_context.device,
+            dtype=future_context.dtype,
+        )
 
-        return torch.log1p(true_instock.clamp(min=0.0)).unsqueeze(-1)
+        return torch.log1p(true_exp.clamp(min=0.0))
 
     def _augment_context_with_stock_hat(self, h_t, future_context, true_future_exposure=None):
         """
-        Append TRUE same-day future in_stock to future_context.
+        Append current/same-day TRUE future exposure funnel.
 
-        This does not use total_dph or buy_box_dph.
-        This does not run a decoder.
+        Appended columns:
+          0: log1p(TRUE current total_dph)
+          1: log1p(TRUE current buy_box_dph)
+          2: log1p(TRUE current in_stock_dph)
+
+        No decoder.
+        No lag.
         """
-        if not self.use_true_same_day_instock:
+        if not self.use_true_current_exposure:
             return future_context, None
 
-        true_instock_log = self._extract_true_instock_log(
+        true_exp_log = self._extract_true_current_exposure_log(
             future_context=future_context,
             true_future_exposure=true_future_exposure,
         )
 
-        future_context_aug = torch.cat([future_context, true_instock_log], dim=-1)
-        return future_context_aug, true_instock_log
+        future_context_aug = torch.cat([future_context, true_exp_log], dim=-1)
+        return future_context_aug, true_exp_log
 
     def forward(self, x, future_context, nZ=8, true_future_exposure=None):
         mu_base, alpha_base, h_t = self.encoder(x)
@@ -3454,11 +3449,8 @@ def stock_decoder_loss(exposure_log_hat, future_instock_true,
                        future_buy_box_dph_true=None,
                        mean_weight=0.30):
     """
-    Override for true same-day in_stock oracle.
-
-    There is no exposure decoder to train.
-    The appended stock_log_hat is just log1p(TRUE future in_stock).
-    Therefore auxiliary stock loss is zero.
+    No stock decoder is trained in current true exposure oracle.
+    The appended stock_log_hat is just log1p(TRUE current total/buy_box/in_stock).
     """
     device = future_instock_true.device if hasattr(future_instock_true, "device") else "cpu"
     return torch.tensor(0.0, device=device)
@@ -3489,13 +3481,17 @@ def generate_forecast_df(model, va_ld, M=50):
 
             for i in range(b["y"].shape[0]):
                 for h in range(b["y"].shape[1]):
-                    # stock_log_hat is [B,H,1] = log1p(TRUE same-day in_stock)
                     if stock_log_hat is not None:
-                        oracle_instock_log = stock_log_hat[i, h, 0].item()
-                        oracle_instock_level = torch.expm1(stock_log_hat[i, h, 0]).item()
+                        total_log = stock_log_hat[i, h, 0].item()
+                        buy_log = stock_log_hat[i, h, 1].item()
+                        instock_log = stock_log_hat[i, h, 2].item()
+
+                        total_level = torch.expm1(stock_log_hat[i, h, 0]).item()
+                        buy_level = torch.expm1(stock_log_hat[i, h, 1]).item()
+                        instock_level = torch.expm1(stock_log_hat[i, h, 2]).item()
                     else:
-                        oracle_instock_log = np.nan
-                        oracle_instock_level = np.nan
+                        total_log = buy_log = instock_log = np.nan
+                        total_level = buy_level = instock_level = np.nan
 
                     rows.append({
                         "asin": b["asin"][i],
@@ -3514,15 +3510,14 @@ def generate_forecast_df(model, va_ld, M=50):
                         "true_future_instock": b["future_instock"][i, h].item()
                             if "future_instock" in b else np.nan,
 
-                        # For compatibility with downstream diagnostics.
-                        # total / buy_box are intentionally not used and set to NaN.
-                        "pred_total_dph_hat": np.nan,
-                        "pred_buy_box_dph_hat": np.nan,
-                        "pred_instock_dph_hat": oracle_instock_level,
+                        # These are oracle current true exposure values.
+                        "pred_total_dph_hat": total_level,
+                        "pred_buy_box_dph_hat": buy_level,
+                        "pred_instock_dph_hat": instock_level,
 
-                        "pred_total_dph_log_hat": np.nan,
-                        "pred_buy_box_dph_log_hat": np.nan,
-                        "pred_instock_log_hat": oracle_instock_log,
+                        "pred_total_dph_log_hat": total_log,
+                        "pred_buy_box_dph_log_hat": buy_log,
+                        "pred_instock_log_hat": instock_log,
 
                         "scot_oos": b["oos"][i, h].item(),
                         "oos": b["oos"][i, h].item(),
@@ -3537,7 +3532,7 @@ def generate_forecast_df(model, va_ld, M=50):
     return pd.DataFrame(rows)
 
 
-def run_true_same_day_instock_only_oracle(
+def run_true_current_exposure_3_oracle(
     data_raw1,
     scot_df,
     n_asins=5000,
@@ -3564,24 +3559,28 @@ def run_true_same_day_instock_only_oracle(
     remove_oos_dp=True,
 ):
     """
-    Clean usage wrapper.
+    Current true exposure funnel oracle.
 
-    This runs the original experiment, but with the overridden model above:
-      - same encoder
-      - same ENN
-      - same demand head
-      - no total_dph future signal
-      - no buy_box_dph future signal
-      - TRUE same-day future in_stock is appended as one oracle future covariate
+    Uses current/same-day TRUE:
+      total_dph
+      buy_box_dph
+      in_stock_dph
 
-    Not deployable. This is an upper-bound diagnostic.
+    as three future covariates appended to z context.
+
+    Difference from the old version:
+      no lag-1 exposure.
+      no rolling decoder.
+      direct current true exposure.
     """
     print("\n" + "=" * 100)
-    print("TRUE SAME-DAY IN_STOCK ONLY ORACLE")
+    print("TRUE CURRENT EXPOSURE 3-FEATURE ORACLE")
     print("=" * 100)
-    print("Demand model receives exactly one future exposure covariate:")
-    print("  log1p(TRUE same-day future in_stock_dph)")
-    print("It does NOT receive future total_dph or buy_box_dph.")
+    print("Demand model receives these three current/same-day oracle features:")
+    print("  log1p(TRUE current total_dph)")
+    print("  log1p(TRUE current buy_box_dph)")
+    print("  log1p(TRUE current in_stock_dph)")
+    print("No lag. No exposure decoder.")
 
     return run_nb_all_sample_scot_intersection(
         data_raw1=data_raw1,
@@ -3611,1011 +3610,13 @@ def run_true_same_day_instock_only_oracle(
     )
 
 
-
 # ============================================================
-# ATTENTION IN_STOCK VERSION: replace TRUE in_stock with attn predicted in_stock
-# ============================================================
-
-def attach_attention_instock_to_raw_data(
-    data_raw1,
-    result_calib_or_focus_or_hat,
-):
-    """
-    Attach UNCALIBRATED anchor_attention in_stock_hat to data_raw1 by asin + order_week.
-
-    Accepted input:
-      1. result_calib from run_attention_focused_with_calibration(...)
-         Uses:
-             result_calib["result_focus"]["exposure_hat_for_demand"]
-         NOT:
-             result_calib["exposure_hat_for_demand_calib"]
-
-      2. result_focus from run_attention_only_focused(...)
-         Uses:
-             result_focus["exposure_hat_for_demand"]
-
-      3. DataFrame with:
-             asin, order_week, pred_instock_dph
-
-      4. DataFrame with:
-             asin, order_week, attn_instock_dph
-
-    Output:
-      data_raw1 copy with:
-          attn_pred_instock_dph
-          attn_pred_instock_log
-
-    Important:
-      This is predicted anchor_attention in_stock, NOT true future in_stock.
-    """
-    # -----------------------------
-    # 1. Extract attention hat
-    # -----------------------------
-    if isinstance(result_calib_or_focus_or_hat, dict) and "result_focus" in result_calib_or_focus_or_hat:
-        rf = result_calib_or_focus_or_hat["result_focus"]
-
-        if isinstance(rf, dict) and "exposure_hat_for_demand" in rf:
-            hat = rf["exposure_hat_for_demand"].copy()
-            source = "result_calib['result_focus']['exposure_hat_for_demand']"
-        elif isinstance(rf, dict) and "attn_df" in rf:
-            hat = rf["attn_df"].copy()
-            source = "result_calib['result_focus']['attn_df']"
-        else:
-            raise ValueError("result_calib['result_focus'] has no exposure_hat_for_demand or attn_df.")
-
-    elif isinstance(result_calib_or_focus_or_hat, dict) and "exposure_hat_for_demand" in result_calib_or_focus_or_hat:
-        hat = result_calib_or_focus_or_hat["exposure_hat_for_demand"].copy()
-        source = "result_focus['exposure_hat_for_demand']"
-
-    elif isinstance(result_calib_or_focus_or_hat, dict) and "attn_df" in result_calib_or_focus_or_hat:
-        hat = result_calib_or_focus_or_hat["attn_df"].copy()
-        source = "result_focus['attn_df']"
-
-    else:
-        hat = result_calib_or_focus_or_hat.copy()
-        source = "dataframe input"
-
-    if "asin" not in hat.columns or "order_week" not in hat.columns:
-        raise ValueError("attention hat must contain asin and order_week.")
-
-    if "pred_instock_dph" not in hat.columns:
-        if "attn_instock_dph" in hat.columns:
-            hat["pred_instock_dph"] = hat["attn_instock_dph"]
-        else:
-            raise ValueError("attention hat must contain pred_instock_dph or attn_instock_dph.")
-
-    hat = hat[["asin", "order_week", "pred_instock_dph"]].copy()
-    hat["asin"] = hat["asin"].astype(str)
-    hat["order_week"] = pd.to_datetime(hat["order_week"])
-    hat["pred_instock_dph"] = (
-        pd.to_numeric(hat["pred_instock_dph"], errors="coerce")
-        .fillna(0.0)
-        .clip(lower=0.0)
-    )
-
-    hat = (
-        hat.groupby(["asin", "order_week"], as_index=False)
-        .agg(attn_pred_instock_dph=("pred_instock_dph", "mean"))
-    )
-
-    # -----------------------------
-    # 2. Merge to raw data
-    # -----------------------------
-    df = data_raw1.copy()
-    df["asin"] = df["asin"].astype(str)
-    df["order_week"] = pd.to_datetime(df["order_week"])
-
-    out = df.merge(
-        hat,
-        on=["asin", "order_week"],
-        how="left",
-    )
-
-    # Missing means no attention prediction for that ASIN/week.
-    # Use 0 to keep model runnable and avoid true leakage.
-    out["attn_pred_instock_dph"] = (
-        pd.to_numeric(out["attn_pred_instock_dph"], errors="coerce")
-        .fillna(0.0)
-        .clip(lower=0.0)
-    )
-    out["attn_pred_instock_log"] = np.log1p(out["attn_pred_instock_dph"])
-
-    print("\n" + "=" * 100)
-    print("ATTENTION IN_STOCK HAT ATTACHED TO RAW DATA")
-    print("=" * 100)
-    print("Source:", source)
-    print("Added columns:")
-    print("  attn_pred_instock_dph")
-    print("  attn_pred_instock_log")
-    print(out[["attn_pred_instock_dph", "attn_pred_instock_log"]].describe().round(4).to_string())
-
-    if "in_stock_dph" in out.columns:
-        true_mean = pd.to_numeric(out["in_stock_dph"], errors="coerce").fillna(0).clip(lower=0).mean()
-        pred_mean = out["attn_pred_instock_dph"].mean()
-        print(f"\nTrue in_stock mean in merged raw data: {true_mean:.4f}")
-        print(f"Attention in_stock mean in merged raw data: {pred_mean:.4f}")
-        print(f"Pred/True ratio: {pred_mean / (true_mean + 1e-8):.4f}")
-
-    return out
-
-
-# Save a reference to the original load_real_data defined above.
-_ORIGINAL_LOAD_REAL_DATA_FOR_ATTN_INSTOCK = load_real_data
-
-
-def load_real_data(data_raw, dph_cap_q=0.995):
-    """
-    Override load_real_data for attention in_stock experiment.
-
-    It first calls the original load_real_data, then replaces each ASIN sequence's
-    future_instock source with the attached attention prediction.
-
-    The overridden TCN_ENN below appends:
-        log1p(attention predicted in_stock)
-    to future_context.
-
-    It does NOT append true in_stock.
-    """
-    data, context_dim, context_cols = _ORIGINAL_LOAD_REAL_DATA_FOR_ATTN_INSTOCK(
-        data_raw,
-        dph_cap_q=dph_cap_q,
-    )
-
-    # Need attached prediction columns.
-    if "attn_pred_instock_dph" not in data_raw.columns:
-        raise ValueError(
-            "data_raw must contain attn_pred_instock_dph. "
-            "Call attach_attention_instock_to_raw_data first."
-        )
-
-    df = data_raw.copy()
-    df["asin"] = df["asin"].astype(str)
-    df["order_week"] = pd.to_datetime(df["order_week"])
-    df["attn_pred_instock_dph"] = (
-        pd.to_numeric(df["attn_pred_instock_dph"], errors="coerce")
-        .fillna(0.0)
-        .clip(lower=0.0)
-    )
-
-    df = df.sort_values(["asin", "order_week"]).reset_index(drop=True)
-
-    # Replace/attach model input series at ASIN level.
-    for asin, group in df.groupby("asin"):
-        asin_key = str(asin)
-        if asin_key in data:
-            data[asin_key]["attn_pred_instock_raw"] = (
-                group["attn_pred_instock_dph"].values.astype(np.float32)
-            )
-
-    print("\n" + "=" * 100)
-    print("LOAD_REAL_DATA OVERRIDE: ATTENTION PREDICTED IN_STOCK AVAILABLE")
-    print("=" * 100)
-    print("Demand model will use attn_pred_instock_raw as future oracle-like covariate.")
-    print("This is predicted anchor_attention in_stock, not true in_stock.")
-
-    return data, context_dim, context_cols
-
-
-class DemandDataset(Dataset):
-    """
-    Override DemandDataset to include future_attn_instock.
-
-    Everything else follows the original dataset logic.
-    """
-    def __init__(self, data, history=52, horizon=20, mode="train", val_weeks=20):
-        self.samples = []
-        for asin, d in data.items():
-            T = len(d["demand"])
-            if mode == "train":
-                starts = range(max(0, T - val_weeks - horizon - history + 1))
-            else:
-                s = T - history - horizon
-                starts = [s] if s >= 0 else []
-
-            for start in starts:
-                sample = {
-                    "x": torch.tensor(d["features"][start:start+history], dtype=torch.float32),
-                    "future_context": torch.tensor(
-                        self._make_future_context_with_dph_proxies(
-                            d=d,
-                            start=start,
-                            history=history,
-                            horizon=horizon,
-                        ),
-                        dtype=torch.float32),
-                    "y": torch.tensor(d["demand"][start+history:start+history+horizon], dtype=torch.float32),
-                    "asin": asin,
-                    "target_week": [str(w)[:10] for w in d["week"][start+history:start+history+horizon]],
-                    "oos": torch.tensor(d["oos"][start+history:start+history+horizon], dtype=torch.float32),
-                    "our_price": torch.tensor(
-                        d["price_raw"][start+history:start+history+horizon],
-                        dtype=torch.float32),
-                    "pkg_volume": torch.tensor(
-                        d["pkg_volume_raw"][start+history:start+history+horizon],
-                        dtype=torch.float32),
-                    "future_instock": torch.tensor(
-                        d["instock_raw"][start+history:start+history+horizon],
-                        dtype=torch.float32),
-                    "future_total_dph": torch.tensor(
-                        d["total_dph_raw"][start+history:start+history+horizon],
-                        dtype=torch.float32),
-                    "future_buy_box_dph": torch.tensor(
-                        d["buy_box_dph_raw"][start+history:start+history+horizon],
-                        dtype=torch.float32),
-                }
-
-                if "attn_pred_instock_raw" in d:
-                    sample["future_attn_instock"] = torch.tensor(
-                        d["attn_pred_instock_raw"][start+history:start+history+horizon],
-                        dtype=torch.float32,
-                    )
-                else:
-                    sample["future_attn_instock"] = torch.zeros(horizon, dtype=torch.float32)
-
-                self.samples.append(sample)
-
-    def _safe_hist_mean(self, arr, start, history, window):
-        hist = arr[start:start+history]
-        if len(hist) == 0:
-            return 0.0
-        hist = hist[-min(window, len(hist)):]
-        return float(np.mean(hist))
-
-    def _make_future_context_with_dph_proxies(self, d, start, history, horizon):
-        fc = d["future_context"][start+history:start+history+horizon].copy()
-        idx = d.get("dph_proxy_context_idx", {})
-
-        total_hist = d.get("total_dph_raw", None)
-        buy_hist = d.get("buy_box_dph_raw", None)
-        instock_hist = d.get("instock_raw", None)
-
-        def fill(col, val):
-            if col in idx:
-                fc[:, idx[col]] = np.log1p(max(float(val), 0.0))
-
-        if total_hist is not None:
-            total_last = total_hist[start+history-1] if history > 0 else 0.0
-            fill("hist_total_dph_last_log", total_last)
-            fill("hist_total_dph_mean4_log", self._safe_hist_mean(total_hist, start, history, 4))
-            fill("hist_total_dph_mean13_log", self._safe_hist_mean(total_hist, start, history, 13))
-
-        if buy_hist is not None:
-            buy_last = buy_hist[start+history-1] if history > 0 else 0.0
-            fill("hist_buy_box_dph_last_log", buy_last)
-            fill("hist_buy_box_dph_mean4_log", self._safe_hist_mean(buy_hist, start, history, 4))
-            fill("hist_buy_box_dph_mean13_log", self._safe_hist_mean(buy_hist, start, history, 13))
-
-        if instock_hist is not None:
-            instock_last = instock_hist[start+history-1] if history > 0 else 0.0
-            fill("hist_instock_dph_last_log", instock_last)
-            fill("hist_instock_dph_mean4_log", self._safe_hist_mean(instock_hist, start, history, 4))
-            fill("hist_instock_dph_mean13_log", self._safe_hist_mean(instock_hist, start, history, 13))
-
-        return fc
-
-    def __len__(self):
-        return len(self.samples)
-
-    def __getitem__(self, i):
-        return self.samples[i]
-
-
-class TCN_ENN(nn.Module):
-    """
-    Override TCN_ENN to append ATTENTION predicted in_stock only.
-
-    Same encoder / ENN / demand head.
-    No total/buy_box future exposure.
-    No exposure decoder.
-    """
-    def __init__(self, input_dim=34, context_dim=2, d_model=32,
-                 d_z=16, horizon=20, prior_scale=0.3,
-                 use_stock_decoder=True):
-        super().__init__()
-        self.d_z = d_z
-        self.horizon = horizon
-        self.use_stock_decoder = use_stock_decoder
-        self.use_attention_instock = use_stock_decoder
-        self.context_dim = context_dim
-
-        self.encoder = TCNSparseAttnEncoder(input_dim, d_model, horizon)
-
-        if self.use_attention_instock:
-            z_context_dim = context_dim + 1
-        else:
-            z_context_dim = context_dim
-
-        self.stock_decoder = None
-        self.z_generator = ContextZGenerator(d_model, z_context_dim, d_z, horizon)
-        self.epinet = Epinet(d_model, d_z, horizon, prior_scale)
-
-    def _extract_attention_instock_log(self, future_context, true_future_exposure=None):
-        """
-        This method is kept for compatibility but does not use true_future_exposure.
-        The attention in_stock is passed through true_future_exposure argument
-        by train/evaluate wrappers below as [B,H] tensor.
-        """
-        if true_future_exposure is None:
-            B, H, C = future_context.shape
-            return torch.zeros(B, H, 1, device=future_context.device, dtype=future_context.dtype)
-
-        if true_future_exposure.dim() == 3:
-            # If shape [B,H,1], use that; if [B,H,3], use column 2.
-            if true_future_exposure.shape[-1] >= 3:
-                attn_instock = true_future_exposure[:, :, 2]
-            else:
-                attn_instock = true_future_exposure[:, :, 0]
-        elif true_future_exposure.dim() == 2:
-            attn_instock = true_future_exposure
-        else:
-            raise ValueError("Expected attention in_stock tensor shape [B,H] or [B,H,1].")
-
-        return torch.log1p(attn_instock.to(future_context.device).clamp(min=0.0)).unsqueeze(-1)
-
-    def _augment_context_with_stock_hat(self, h_t, future_context, true_future_exposure=None):
-        if not self.use_attention_instock:
-            return future_context, None
-
-        attn_instock_log = self._extract_attention_instock_log(
-            future_context=future_context,
-            true_future_exposure=true_future_exposure,
-        )
-
-        future_context_aug = torch.cat([future_context, attn_instock_log], dim=-1)
-        return future_context_aug, attn_instock_log
-
-    def forward(self, x, future_context, nZ=8, true_future_exposure=None):
-        mu_base, alpha_base, h_t = self.encoder(x)
-
-        future_context_aug, stock_log_hat = self._augment_context_with_stock_hat(
-            h_t,
-            future_context,
-            true_future_exposure=true_future_exposure,
-        )
-
-        phi = h_t.detach()
-        z_mean, z_std = self.z_generator(phi, future_context_aug)
-
-        z_reg = 0.001 * (z_mean**2 + z_std**2).mean()
-
-        preds = []
-        for _ in range(nZ):
-            eps = torch.randn_like(z_mean)
-            z = z_mean + z_std * eps
-            mu_e, al_e = self.epinet(phi, z)
-            mu = F.softplus(mu_base + mu_e)
-            alpha = F.softplus(alpha_base + al_e) + 1e-4
-            preds.append((mu, alpha))
-
-        return preds, z_reg, stock_log_hat
-
-    def predict(self, x, future_context, M=50, return_stock=False, true_future_exposure=None):
-        self.eval()
-        with torch.no_grad():
-            mu_base, alpha_base, h_t = self.encoder(x)
-
-            future_context_aug, stock_log_hat = self._augment_context_with_stock_hat(
-                h_t,
-                future_context,
-                true_future_exposure=true_future_exposure,
-            )
-
-            phi = h_t.detach()
-            z_mean, z_std = self.z_generator(phi, future_context_aug)
-
-            samples = []
-            for _ in range(M):
-                eps = torch.randn_like(z_mean)
-                z = z_mean + z_std * eps
-                mu_e, al_e = self.epinet(phi, z)
-                mu = F.softplus(mu_base + mu_e)
-                alpha = F.softplus(alpha_base + al_e) + 1e-4
-                dist = torch.distributions.NegativeBinomial(
-                    total_count=(1.0 / alpha).clamp(min=1e-4),
-                    probs=(mu * alpha / (1 + mu * alpha)).clamp(1e-6, 1 - 1e-6),
-                )
-                samples.append(dist.sample().float())
-
-            samples = torch.stack(samples, dim=1)
-            p50 = samples.quantile(0.5, dim=1)
-            p70 = samples.quantile(0.7, dim=1)
-            p70 = torch.maximum(p70, p50)
-
-        if return_stock:
-            return p50, p70, stock_log_hat
-
-        return p50, p70
-
-
-def stock_decoder_loss(exposure_log_hat, future_instock_true,
-                       future_total_dph_true=None,
-                       future_buy_box_dph_true=None,
-                       mean_weight=0.30):
-    """
-    No stock decoder is trained in attention in_stock version.
-    """
-    device = future_instock_true.device if hasattr(future_instock_true, "device") else "cpu"
-    return torch.tensor(0.0, device=device)
-
-
-def _get_attention_instock_tensor_from_batch(b):
-    """
-    Get attention predicted in_stock tensor from batch.
-    Shape [B,H].
-    """
-    if "future_attn_instock" not in b:
-        raise KeyError("Batch does not contain future_attn_instock. Check DemandDataset override.")
-    return b["future_attn_instock"]
-
-
-def train(
-    model,
-    tr_ld,
-    va_ld,
-    epochs=60,
-    nZ=8,
-    lr=1e-3,
-    lambda_q=0.05,
-    beta_tail=0.5,
-    patience=5,
-    lambda_z_reg=1.0,
-    lambda_stock=0.0,
-    lambda_stock_mean_weight=0.0,
-):
-    """
-    Override train:
-      use future_attn_instock as the one appended future exposure covariate.
-    """
-    opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
-    sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
-
-    best_val = float("inf")
-    best_sd = None
-    no_improve = 0
-
-    for epoch in range(epochs):
-        model.train()
-        tr_loss = 0.0
-
-        for bi, b in enumerate(tr_ld):
-            x = b["x"]
-            fc = b["future_context"]
-            y = b["y"]
-
-            attn_future_instock = _get_attention_instock_tensor_from_batch(b)
-
-            preds, z_reg, stock_log_hat = model(
-                x,
-                fc,
-                nZ=nZ,
-                true_future_exposure=attn_future_instock,
-            )
-
-            nll_loss = sum(
-                tail_weighted_negbin_nll(y, mu, alpha, beta_tail=beta_tail)
-                for mu, alpha in preds
-            ) / nZ
-
-            mu_stack = torch.stack([mu for mu, _ in preds], dim=1)
-            p50_train = mu_stack.quantile(0.5, dim=1)
-            p70_train = mu_stack.quantile(0.7, dim=1)
-            p70_train = torch.maximum(p70_train, p50_train)
-            q_loss = pinball(y, p50_train, 0.5) + pinball(y, p70_train, 0.7)
-
-            loss = (
-                nll_loss
-                + lambda_q * q_loss
-                + lambda_z_reg * z_reg
-            )
-
-            opt.zero_grad()
-            loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            opt.step()
-            tr_loss += loss.item()
-
-            if epoch == 0:
-                diagnose_training_batch(b, preds, epoch, bi)
-
-        sch.step()
-
-        model.eval()
-        vl = 0.0
-        with torch.no_grad():
-            for b in va_ld:
-                attn_future_instock = _get_attention_instock_tensor_from_batch(b)
-                p50, p70 = model.predict(
-                    b["x"],
-                    b["future_context"],
-                    M=50,
-                    true_future_exposure=attn_future_instock,
-                )
-                vl += (pinball(b["y"], p50, 0.5) + pinball(b["y"], p70, 0.7)).item()
-
-        vl /= max(1, len(va_ld))
-
-        improved = vl < best_val
-        if improved:
-            best_val = vl
-            best_sd = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-            no_improve = 0
-        else:
-            no_improve += 1
-
-        print(
-            f"Epoch {epoch+1:3d} | "
-            f"train={tr_loss/max(1,len(tr_ld)):.4f} | "
-            f"val={vl:.4f} | "
-            f"beta_tail={beta_tail} | ATTENTION_INSTOCK_ONLY"
-            + (" *" if improved else "")
-        )
-
-        if no_improve >= patience:
-            print(f"Early stopping at epoch {epoch+1} (patience={patience})")
-            break
-
-    if best_sd:
-        model.load_state_dict(best_sd)
-
-    print(f"Best val: {best_val:.4f}")
-
-
-def evaluate(model, va_ld, M=100):
-    all_y, all_p50, all_p70 = [], [], []
-    model.eval()
-    with torch.no_grad():
-        for b in va_ld:
-            attn_future_instock = _get_attention_instock_tensor_from_batch(b)
-            p50, p70 = model.predict(
-                b["x"],
-                b["future_context"],
-                M=M,
-                true_future_exposure=attn_future_instock,
-            )
-            all_y.append(b["y"].numpy())
-            all_p50.append(p50.numpy())
-            all_p70.append(p70.numpy())
-
-    y = np.concatenate(all_y)
-    p50 = np.concatenate(all_p50)
-    p70 = np.concatenate(all_p70)
-    yt = torch.tensor(y)
-
-    return {
-        "pinball50": pinball(yt, torch.tensor(p50), 0.5).item(),
-        "pinball70": pinball(yt, torch.tensor(p70), 0.7).item(),
-    }
-
-
-def generate_forecast_df(model, va_ld, M=50):
-    rows = []
-    model.eval()
-    with torch.no_grad():
-        for b in va_ld:
-            attn_future_instock = _get_attention_instock_tensor_from_batch(b)
-
-            p50, p70, stock_log_hat = model.predict(
-                b["x"],
-                b["future_context"],
-                M=M,
-                return_stock=True,
-                true_future_exposure=attn_future_instock,
-            )
-
-            hist_mean = (b["x"][:, :, 0].exp() - 1).mean(dim=1, keepdim=True).clamp(min=0)
-            hm50 = hist_mean.expand_as(b["y"])
-            hm70 = hm50 * 1.25
-
-            for i in range(b["y"].shape[0]):
-                for h in range(b["y"].shape[1]):
-                    attn_instock_log = stock_log_hat[i, h, 0].item() if stock_log_hat is not None else np.nan
-                    attn_instock_level = torch.expm1(stock_log_hat[i, h, 0]).item() if stock_log_hat is not None else np.nan
-
-                    rows.append({
-                        "asin": b["asin"][i],
-                        "order_week": pd.to_datetime(b["target_week"][h][i]),
-                        "fcst_week_index": h + 1,
-                        "fbi_demand": b["y"][i, h].item(),
-                        "our_price": b["our_price"][i, h].item(),
-                        "true_amt": b["y"][i, h].item() * b["our_price"][i, h].item(),
-                        "pkg_volume": b["pkg_volume"][i, h].item(),
-                        "true_size": b["y"][i, h].item() * b["pkg_volume"][i, h].item(),
-
-                        "true_future_total_dph": b["future_total_dph"][i, h].item()
-                            if "future_total_dph" in b else np.nan,
-                        "true_future_buy_box_dph": b["future_buy_box_dph"][i, h].item()
-                            if "future_buy_box_dph" in b else np.nan,
-                        "true_future_instock": b["future_instock"][i, h].item()
-                            if "future_instock" in b else np.nan,
-
-                        "pred_total_dph_hat": np.nan,
-                        "pred_buy_box_dph_hat": np.nan,
-                        "pred_instock_dph_hat": attn_instock_level,
-
-                        "pred_total_dph_log_hat": np.nan,
-                        "pred_buy_box_dph_log_hat": np.nan,
-                        "pred_instock_log_hat": attn_instock_log,
-
-                        "scot_oos": b["oos"][i, h].item(),
-                        "oos": b["oos"][i, h].item(),
-                        "oos_status": b["oos"][i, h].item(),
-
-                        "p50_amxl": p50[i, h].item(),
-                        "p70_amxl": p70[i, h].item(),
-                        "p50_scot": hm50[i, h].item(),
-                        "p70_scot": hm70[i, h].item(),
-                    })
-
-    return pd.DataFrame(rows)
-
-
-def generate_diagnostic_df(model, va_ld, M=100, threshold=0.5):
-    rows = []
-    model.eval()
-    with torch.no_grad():
-        for b in va_ld:
-            attn_future_instock = _get_attention_instock_tensor_from_batch(b)
-            p50, p70 = model.predict(
-                b["x"],
-                b["future_context"],
-                M=M,
-                true_future_exposure=attn_future_instock,
-            )
-
-            for i in range(b["y"].shape[0]):
-                for h in range(b["y"].shape[1]):
-                    y_val = b["y"][i, h].item()
-                    p50_val = p50[i, h].item()
-                    p70_val = p70[i, h].item()
-
-                    rows.append({
-                        "asin": b["asin"][i],
-                        "order_week": pd.to_datetime(b["target_week"][h][i]),
-                        "horizon": h + 1,
-                        "y": y_val,
-                        "p50": p50_val,
-                        "p70": p70_val,
-                        "true_active": int(y_val > 0),
-                        "pred_active_p50": int(p50_val > threshold),
-                        "pred_active_p70": int(p70_val > threshold),
-                    })
-
-    return pd.DataFrame(rows)
-
-
-def run_attention_instock_only_in_old_decoder_style(
-    data_raw1,
-    scot_df,
-    result_calib_or_focus_or_hat,
-    n_asins=5000,
-    seed=42,
-    zero_thresholds=(0.4, 0.7),
-    prior_scale=0.3,
-    epochs=60,
-    history=52,
-    horizon=20,
-    d_model=32,
-    d_z=16,
-    batch_size=64,
-    M_eval=100,
-    lambda_q=0.05,
-    beta_tail=0.5,
-    patience=5,
-    lambda_z_reg=1.0,
-    lambda_stock=0.0,
-    lambda_stock_mean_weight=0.0,
-    dph_cap_q=0.995,
-    remove_extreme=True,
-    extreme_q=0.99,
-    run_wape=True,
-    remove_oos_dp=True,
-):
-    """
-    Same structure as old true-instock oracle style,
-    but replace TRUE future in_stock with PREDICTED anchor_attention in_stock.
-
-    It uses:
-        log1p(anchor_attention predicted in_stock)
-
-    It does NOT use:
-        true future in_stock
-        true future total_dph
-        true future buy_box_dph
-        exposure decoder prediction
-    """
-    print("\n" + "=" * 100)
-    print("ATTENTION IN_STOCK ONLY | OLD DECODER-STYLE CONTEXT INJECTION")
-    print("=" * 100)
-    print("Demand model receives:")
-    print("  log1p(anchor_attention predicted in_stock_dph)")
-    print("It does NOT receive true in_stock, total_dph, or buy_box_dph.")
-
-    data_with_attn = attach_attention_instock_to_raw_data(
-        data_raw1=data_raw1,
-        result_calib_or_focus_or_hat=result_calib_or_focus_or_hat,
-    )
-
-    return run_nb_all_sample_scot_intersection(
-        data_raw1=data_with_attn,
-        scot_df=scot_df,
-        n_asins=n_asins,
-        seed=seed,
-        zero_thresholds=zero_thresholds,
-        prior_scale=prior_scale,
-        epochs=epochs,
-        history=history,
-        horizon=horizon,
-        d_model=d_model,
-        d_z=d_z,
-        batch_size=batch_size,
-        M_eval=M_eval,
-        lambda_q=lambda_q,
-        beta_tail=beta_tail,
-        patience=patience,
-        lambda_z_reg=lambda_z_reg,
-        lambda_stock=lambda_stock,
-        lambda_stock_mean_weight=lambda_stock_mean_weight,
-        dph_cap_q=dph_cap_q,
-        remove_extreme=remove_extreme,
-        extreme_q=extreme_q,
-        run_wape=run_wape,
-        remove_oos_dp=remove_oos_dp,
-    )
-
-
-
-# ============================================================
-# LAG-1 ATTENTION IN_STOCK VERSION
-# ============================================================
-
-def attach_attention_instock_lag1_to_raw_data(
-    data_raw1,
-    result_calib_or_focus_or_hat,
-    fallback_to_true_lag=True,
-):
-    """
-    Attach LAG-1 anchor_attention in_stock_hat to data_raw1.
-
-    For each ASIN/week t, the model receives:
-
-        feature(t) = predicted_attention_instock(t-1)
-
-    If predicted_attention_instock(t-1) is missing and fallback_to_true_lag=True,
-    it uses the observed historical lag:
-
-        feature(t) = true_in_stock_dph(t-1)
-
-    This is useful for horizon h=1, where predicted h=0 usually does not exist.
-
-    It still uses only ONE future covariate:
-        log1p(lag1 attention predicted in_stock)
-
-    It does NOT use:
-        same-day predicted in_stock
-        same-day true in_stock
-        total_dph
-        buy_box_dph
-    """
-
-    # -----------------------------
-    # 1. Extract uncalibrated attention hat
-    # -----------------------------
-    if isinstance(result_calib_or_focus_or_hat, dict) and "result_focus" in result_calib_or_focus_or_hat:
-        rf = result_calib_or_focus_or_hat["result_focus"]
-
-        if isinstance(rf, dict) and "exposure_hat_for_demand" in rf:
-            hat = rf["exposure_hat_for_demand"].copy()
-            source = "result_calib['result_focus']['exposure_hat_for_demand']"
-        elif isinstance(rf, dict) and "attn_df" in rf:
-            hat = rf["attn_df"].copy()
-            source = "result_calib['result_focus']['attn_df']"
-        else:
-            raise ValueError("result_calib['result_focus'] has no exposure_hat_for_demand or attn_df.")
-
-    elif isinstance(result_calib_or_focus_or_hat, dict) and "exposure_hat_for_demand" in result_calib_or_focus_or_hat:
-        hat = result_calib_or_focus_or_hat["exposure_hat_for_demand"].copy()
-        source = "result_focus['exposure_hat_for_demand']"
-
-    elif isinstance(result_calib_or_focus_or_hat, dict) and "attn_df" in result_calib_or_focus_or_hat:
-        hat = result_calib_or_focus_or_hat["attn_df"].copy()
-        source = "result_focus['attn_df']"
-
-    else:
-        hat = result_calib_or_focus_or_hat.copy()
-        source = "dataframe input"
-
-    if "asin" not in hat.columns or "order_week" not in hat.columns:
-        raise ValueError("attention hat must contain asin and order_week.")
-
-    if "pred_instock_dph" not in hat.columns:
-        if "attn_instock_dph" in hat.columns:
-            hat["pred_instock_dph"] = hat["attn_instock_dph"]
-        else:
-            raise ValueError("attention hat must contain pred_instock_dph or attn_instock_dph.")
-
-    hat = hat[["asin", "order_week", "pred_instock_dph"]].copy()
-    hat["asin"] = hat["asin"].astype(str)
-    hat["order_week"] = pd.to_datetime(hat["order_week"])
-    hat["pred_instock_dph"] = (
-        pd.to_numeric(hat["pred_instock_dph"], errors="coerce")
-        .fillna(0.0)
-        .clip(lower=0.0)
-    )
-
-    hat = (
-        hat.groupby(["asin", "order_week"], as_index=False)
-        .agg(attn_pred_instock_same_day=("pred_instock_dph", "mean"))
-    )
-
-    # -----------------------------
-    # 2. Merge same-day predictions to raw data, then shift to lag-1
-    # -----------------------------
-    df = data_raw1.copy()
-    df["asin"] = df["asin"].astype(str)
-    df["order_week"] = pd.to_datetime(df["order_week"])
-
-    out = df.merge(
-        hat,
-        on=["asin", "order_week"],
-        how="left",
-    )
-
-    out["attn_pred_instock_same_day"] = (
-        pd.to_numeric(out["attn_pred_instock_same_day"], errors="coerce")
-        .clip(lower=0.0)
-    )
-
-    out = out.sort_values(["asin", "order_week"]).reset_index(drop=True)
-
-    # Lag-1 predicted attention in-stock by ASIN.
-    out["attn_pred_instock_lag1"] = (
-        out.groupby("asin")["attn_pred_instock_same_day"].shift(1)
-    )
-
-    # Optional fallback for first horizon / missing prediction:
-    # use last observed true in_stock_dph(t-1), which is available at time t.
-    if fallback_to_true_lag:
-        if "in_stock_dph" not in out.columns:
-            raise ValueError("fallback_to_true_lag=True requires data_raw1['in_stock_dph'].")
-
-        true_instock = (
-            pd.to_numeric(out["in_stock_dph"], errors="coerce")
-            .fillna(0.0)
-            .clip(lower=0.0)
-        )
-        out["true_instock_lag1"] = out.groupby("asin")[true_instock.name].shift(1)
-
-        out["attn_pred_instock_lag1"] = out["attn_pred_instock_lag1"].fillna(
-            out["true_instock_lag1"]
-        )
-
-    out["attn_pred_instock_lag1"] = (
-        pd.to_numeric(out["attn_pred_instock_lag1"], errors="coerce")
-        .fillna(0.0)
-        .clip(lower=0.0)
-    )
-
-    # IMPORTANT:
-    # Existing load_real_data override reads this column name:
-    #     attn_pred_instock_dph
-    # So we set it to the lag-1 feature.
-    out["attn_pred_instock_dph"] = out["attn_pred_instock_lag1"]
-    out["attn_pred_instock_log"] = np.log1p(out["attn_pred_instock_dph"])
-
-    print("\n" + "=" * 100)
-    print("LAG-1 ATTENTION IN_STOCK HAT ATTACHED TO RAW DATA")
-    print("=" * 100)
-    print("Source:", source)
-    print("Feature used by demand model:")
-    print("  attn_pred_instock_dph = predicted_attention_instock(t-1)")
-    print("  attn_pred_instock_log = log1p(predicted_attention_instock(t-1))")
-    print("fallback_to_true_lag:", fallback_to_true_lag)
-    print("\nSame-day attention prediction summary:")
-    print(out[["attn_pred_instock_same_day"]].describe().round(4).to_string())
-    print("\nLag-1 feature summary:")
-    print(out[["attn_pred_instock_dph", "attn_pred_instock_log"]].describe().round(4).to_string())
-
-    if "in_stock_dph" in out.columns:
-        true_mean = pd.to_numeric(out["in_stock_dph"], errors="coerce").fillna(0).clip(lower=0).mean()
-        lag_mean = out["attn_pred_instock_dph"].mean()
-        print(f"\nTrue same-day in_stock mean in raw data: {true_mean:.4f}")
-        print(f"Lag-1 attention in_stock feature mean: {lag_mean:.4f}")
-        print(f"Lag-feature / true-sameday ratio: {lag_mean / (true_mean + 1e-8):.4f}")
-
-    return out
-
-
-def run_attention_instock_lag1_only_in_old_decoder_style(
-    data_raw1,
-    scot_df,
-    result_calib_or_focus_or_hat,
-    fallback_to_true_lag=True,
-    n_asins=5000,
-    seed=42,
-    zero_thresholds=(0.4, 0.7),
-    prior_scale=0.3,
-    epochs=60,
-    history=52,
-    horizon=20,
-    d_model=32,
-    d_z=16,
-    batch_size=64,
-    M_eval=100,
-    lambda_q=0.05,
-    beta_tail=0.5,
-    patience=5,
-    lambda_z_reg=1.0,
-    lambda_stock=0.0,
-    lambda_stock_mean_weight=0.0,
-    dph_cap_q=0.995,
-    remove_extreme=True,
-    extreme_q=0.99,
-    run_wape=True,
-    remove_oos_dp=True,
-):
-    """
-    Same as attention in_stock only old-style,
-    but uses LAG-1 of the attention predicted in_stock feature.
-
-    Demand model receives:
-        log1p(anchor_attention predicted in_stock at t-1)
-
-    It does NOT receive:
-        same-day attention in_stock
-        true same-day in_stock
-        total_dph
-        buy_box_dph
-    """
-    print("\n" + "=" * 100)
-    print("ATTENTION IN_STOCK LAG-1 ONLY | OLD DECODER-STYLE CONTEXT INJECTION")
-    print("=" * 100)
-    print("Demand model receives:")
-    print("  log1p(anchor_attention predicted in_stock_dph at t-1)")
-    print("It does NOT receive same-day in_stock, total_dph, or buy_box_dph.")
-
-    data_with_attn_lag1 = attach_attention_instock_lag1_to_raw_data(
-        data_raw1=data_raw1,
-        result_calib_or_focus_or_hat=result_calib_or_focus_or_hat,
-        fallback_to_true_lag=fallback_to_true_lag,
-    )
-
-    return run_nb_all_sample_scot_intersection(
-        data_raw1=data_with_attn_lag1,
-        scot_df=scot_df,
-        n_asins=n_asins,
-        seed=seed,
-        zero_thresholds=zero_thresholds,
-        prior_scale=prior_scale,
-        epochs=epochs,
-        history=history,
-        horizon=horizon,
-        d_model=d_model,
-        d_z=d_z,
-        batch_size=batch_size,
-        M_eval=M_eval,
-        lambda_q=lambda_q,
-        beta_tail=beta_tail,
-        patience=patience,
-        lambda_z_reg=lambda_z_reg,
-        lambda_stock=lambda_stock,
-        lambda_stock_mean_weight=lambda_stock_mean_weight,
-        dph_cap_q=dph_cap_q,
-        remove_extreme=remove_extreme,
-        extreme_q=extreme_q,
-        run_wape=run_wape,
-        remove_oos_dp=remove_oos_dp,
-    )
-
-
-# ============================================================
-# Recommended usage: lag-1 attention in_stock feature
+# Recommended usage
 # ============================================================
 #
-# result_attn_instock_lag1_oldstyle = run_attention_instock_lag1_only_in_old_decoder_style(
+# result_true_current_exp3 = run_true_current_exposure_3_oracle(
 #     data_raw1=data_raw1,
 #     scot_df=scot_df,
-#     result_calib_or_focus_or_hat=result_calib,
-#     fallback_to_true_lag=True,
 #     n_asins=5000,
 #     seed=42,
 #     zero_thresholds=(0.4, 0.7),
