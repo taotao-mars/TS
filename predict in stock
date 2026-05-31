@@ -3269,6 +3269,287 @@ def make_external_hat_df_with_calibrated_instock(
 # exposure_hat_for_demand_calib = make_external_hat_df_with_calibrated_instock(calib_df)
 #
 
+
+
+# ============================================================
+# 15. Clean focused prediction with calibration
+# ============================================================
+
+def focused_calibration_report(calib_df):
+    """
+    Clean report for calibrated anchor-attention in_stock_hat.
+
+    Focus:
+      1. attention vs calibrated attention overall
+      2. long horizon h=13-20 improvement
+      3. AUC by horizon
+      4. calibration scale
+    """
+    df = calib_df.copy()
+
+    required = [
+        "true_instock_dph",
+        "pred_instock_dph",
+        "attn_instock_dph",
+        "calib_instock_dph",
+        "pred_instock_dph_last",
+        "pred_instock_dph_mean13",
+        "horizon",
+    ]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"Missing columns for focused_calibration_report: {missing}")
+
+    methods = [
+        ("raw_model", "pred_instock_dph"),
+        ("anchor_attention", "attn_instock_dph"),
+        ("calibrated_attention", "calib_instock_dph"),
+        ("naive_last", "pred_instock_dph_last"),
+        ("naive_mean13", "pred_instock_dph_mean13"),
+    ]
+
+    def metric(g, col):
+        y = g["true_instock_dph"].values
+        p = g[col].values
+        return {
+            "ratio": np.mean(p) / (np.mean(y) + 1e-8),
+            "WAPE": _wape(y, p),
+            "Pearson": _corr(y, p),
+            "Spearman": _safe_spearman(y, p),
+            "active_AUC": _auc((y > 0).astype(int), p),
+        }
+
+    print("\n" + "=" * 100)
+    print("A. CALIBRATION OVERALL: IN_STOCK_DPH")
+    print("=" * 100)
+
+    overall_rows = []
+    for name, col in methods:
+        m = metric(df, col)
+        m["method"] = name
+        overall_rows.append(m)
+
+    overall = pd.DataFrame(overall_rows)[
+        ["method", "ratio", "WAPE", "Pearson", "Spearman", "active_AUC"]
+    ]
+    print(overall.round(5).to_string(index=False))
+
+    df["horizon_block"] = pd.cut(
+        df["horizon"],
+        bins=[0, 5, 12, 20],
+        labels=["short_1_5", "mid_6_12", "long_13_20"],
+        include_lowest=True,
+    )
+
+    print("\n" + "=" * 100)
+    print("B. CALIBRATION BY HORIZON BLOCK")
+    print("=" * 100)
+
+    block_rows = []
+    for block, g in df.groupby("horizon_block", observed=True):
+        for name, col in methods:
+            m = metric(g, col)
+            m["block"] = block
+            m["method"] = name
+            block_rows.append(m)
+
+    block_df = pd.DataFrame(block_rows)[
+        ["block", "method", "ratio", "WAPE", "Pearson", "Spearman", "active_AUC"]
+    ]
+    print(block_df.round(5).to_string(index=False))
+
+    print("\n" + "=" * 100)
+    print("C. CALIBRATION ACTIVE_AUC BY HORIZON")
+    print("=" * 100)
+
+    auc_rows = []
+    for h, g in df.groupby("horizon"):
+        y = (g["true_instock_dph"].values > 0).astype(int)
+        row = {"horizon": int(h)}
+        for name, col in [
+            ("raw_AUC", "pred_instock_dph"),
+            ("attn_AUC", "attn_instock_dph"),
+            ("calib_AUC", "calib_instock_dph"),
+            ("last_AUC", "pred_instock_dph_last"),
+            ("mean13_AUC", "pred_instock_dph_mean13"),
+        ]:
+            row[name] = _auc(y, g[col].values)
+
+        row["calib_minus_attn_AUC"] = row["calib_AUC"] - row["attn_AUC"]
+        row["calib_minus_raw_AUC"] = row["calib_AUC"] - row["raw_AUC"]
+        auc_rows.append(row)
+
+    auc_df = pd.DataFrame(auc_rows)
+    print(auc_df.round(5).to_string(index=False))
+
+    print("\n" + "=" * 100)
+    print("D. CALIBRATION IMPROVEMENT SUMMARY")
+    print("=" * 100)
+
+    attn_overall = overall[overall["method"] == "anchor_attention"].iloc[0]
+    calib_overall = overall[overall["method"] == "calibrated_attention"].iloc[0]
+
+    attn_long = block_df[
+        (block_df["block"].astype(str) == "long_13_20")
+        & (block_df["method"] == "anchor_attention")
+    ].iloc[0]
+
+    calib_long = block_df[
+        (block_df["block"].astype(str) == "long_13_20")
+        & (block_df["method"] == "calibrated_attention")
+    ].iloc[0]
+
+    delta = pd.DataFrame([
+        {
+            "scope": "overall",
+            "ratio_before": attn_overall["ratio"],
+            "ratio_after": calib_overall["ratio"],
+            "WAPE_change": calib_overall["WAPE"] - attn_overall["WAPE"],
+            "AUC_change": calib_overall["active_AUC"] - attn_overall["active_AUC"],
+            "Spearman_change": calib_overall["Spearman"] - attn_overall["Spearman"],
+        },
+        {
+            "scope": "long_13_20",
+            "ratio_before": attn_long["ratio"],
+            "ratio_after": calib_long["ratio"],
+            "WAPE_change": calib_long["WAPE"] - attn_long["WAPE"],
+            "AUC_change": calib_long["active_AUC"] - attn_long["active_AUC"],
+            "Spearman_change": calib_long["Spearman"] - attn_long["Spearman"],
+        },
+    ])
+    print(delta.round(5).to_string(index=False))
+
+    print("\nCalibration scale summary:")
+    if "calib_scale" in df.columns:
+        print(df["calib_scale"].describe().round(5).to_string())
+
+    return {
+        "overall": overall,
+        "by_block": block_df,
+        "auc_by_horizon": auc_df,
+        "delta": delta,
+    }
+
+
+def run_attention_focused_with_calibration(
+    data_raw1,
+    scot_df,
+    n_asins=5000,
+    seed=42,
+    history=52,
+    horizon=20,
+    d_model=64,
+    batch_size=64,
+    exposure_epochs=60,
+    exposure_lr=1e-3,
+    exposure_patience=8,
+    attn_epochs=80,
+    attn_batch_size=1024,
+    attn_lr=1e-3,
+    attn_patience=10,
+    attn_hidden=64,
+    attn_dropout=0.10,
+    calib_method="high_only",
+    calib_cap_scale=(0.90, 1.15),
+    calib_high_quantile=0.50,
+    calib_blend_strength=0.75,
+    suppress_full_print=True,
+):
+    """
+    Clean focused pipeline with calibration.
+
+    Step 1:
+      Run direct TCN + anchor attention.
+
+    Step 2:
+      Calibrate attention in_stock_hat.
+      Default is conservative:
+        method = high_only
+        cap_scale = (0.90, 1.15)
+        high_quantile = 0.50
+        blend_strength = 0.75
+
+    Step 3:
+      Print only the focused calibration report.
+
+    Output:
+      result["exposure_hat_for_demand_calib"]
+      can be passed to demand model.
+    """
+    result_focus = run_attention_only_focused(
+        data_raw1=data_raw1,
+        scot_df=scot_df,
+        n_asins=n_asins,
+        seed=seed,
+        history=history,
+        horizon=horizon,
+        d_model=d_model,
+        batch_size=batch_size,
+        exposure_epochs=exposure_epochs,
+        exposure_lr=exposure_lr,
+        exposure_patience=exposure_patience,
+        attn_epochs=attn_epochs,
+        attn_batch_size=attn_batch_size,
+        attn_lr=attn_lr,
+        attn_patience=attn_patience,
+        attn_hidden=attn_hidden,
+        attn_dropout=attn_dropout,
+        suppress_full_print=suppress_full_print,
+    )
+
+    attn_df = result_focus["attn_df"]
+
+    calib_df = calibrate_attention_instock_hat(
+        attn_df,
+        method=calib_method,
+        cap_scale=calib_cap_scale,
+        high_quantile=calib_high_quantile,
+        blend_strength=calib_blend_strength,
+    )
+
+    calib_report = focused_calibration_report(calib_df)
+
+    exposure_hat_for_demand_calib = make_external_hat_df_with_calibrated_instock(
+        calib_df,
+        use_calibrated_instock=True,
+    )
+
+    print("\n" + "=" * 100)
+    print("CALIBRATED OUTPUT READY")
+    print("=" * 100)
+    print("Use result_calib['exposure_hat_for_demand_calib'] for demand model.")
+    print("pred_instock_dph is calibrated normal-scale value, not log.")
+
+    return {
+        "result_focus": result_focus,
+        "attn_df": attn_df,
+        "calib_df": calib_df,
+        "calib_report": calib_report,
+        "exposure_hat_for_demand_calib": exposure_hat_for_demand_calib,
+    }
+
+
+# ============================================================
+# Recommended usage:
+# ============================================================
+#
+# result_calib = run_attention_focused_with_calibration(
+#     data_raw1=data_raw1,
+#     scot_df=scot_df,
+#     n_asins=5000,
+#     seed=42,
+#     history=52,
+#     horizon=20,
+#     calib_method="high_only",
+#     calib_cap_scale=(0.90, 1.15),
+#     calib_high_quantile=0.50,
+#     calib_blend_strength=0.75,
+#     suppress_full_print=True,
+# )
+#
+# exposure_hat_for_demand_calib = result_calib["exposure_hat_for_demand_calib"]
+#
+
 # ============================================================
 # Usage
 # ============================================================
