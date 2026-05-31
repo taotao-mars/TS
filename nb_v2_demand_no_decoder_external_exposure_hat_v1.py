@@ -2817,30 +2817,25 @@ def print_final_diagnostics(result):
 
 def attach_external_exposure_hat(data_raw1, exposure_hat_df):
     """
-    Merge exposure-only predictions back to raw data by asin + order_week.
+    IN_STOCK-ONLY external exposure attachment.
 
-    exposure_hat_df should come from:
-        result_exp["forecast_df"]
+    This function has been modified to use ONLY:
+        pred_instock_dph -> external_instock_dph_hat_log
 
-    Required columns:
-        asin
-        order_week
+    It intentionally does NOT require:
         pred_total_dph
         pred_buy_box_dph
-        pred_instock_dph
 
-    After merge, load_real_data will convert these to log future_context columns:
-        external_total_dph_hat_log
-        external_buy_box_dph_hat_log
-        external_instock_dph_hat_log
-
-    Note:
-      For a strict full training setup, exposure_hat should ideally be generated
-      for every training origin. This helper is a quick validation-window test
-      using the aligned exposure-only output.
+    This fixes the error:
+        Missing columns: ['pred_total_dph', 'pred_buy_box_dph']
     """
     df = data_raw1.copy()
     hat = exposure_hat_df.copy()
+
+    required = ["asin", "order_week", "pred_instock_dph"]
+    missing = [c for c in required if c not in hat.columns]
+    if missing:
+        raise ValueError(f"instock-only exposure_hat_df missing columns: {missing}")
 
     df["asin"] = df["asin"].astype(str)
     hat["asin"] = hat["asin"].astype(str)
@@ -2848,41 +2843,48 @@ def attach_external_exposure_hat(data_raw1, exposure_hat_df):
     df["order_week"] = pd.to_datetime(df["order_week"])
     hat["order_week"] = pd.to_datetime(hat["order_week"])
 
-    required = [
-        "asin",
-        "order_week",
-        "pred_total_dph",
-        "pred_buy_box_dph",
-        "pred_instock_dph",
-    ]
-    missing = [c for c in required if c not in hat.columns]
-    if missing:
-        raise ValueError(f"exposure_hat_df missing columns: {missing}")
-
-    hat = hat[required].copy()
-
-    # If multiple predictions exist for same asin/week, average them.
-    hat = (
-        hat.groupby(["asin", "order_week"], as_index=False)
-        .agg(
-            pred_total_dph=("pred_total_dph", "mean"),
-            pred_buy_box_dph=("pred_buy_box_dph", "mean"),
-            pred_instock_dph=("pred_instock_dph", "mean"),
-        )
+    hat["pred_instock_dph"] = (
+        pd.to_numeric(hat["pred_instock_dph"], errors="coerce")
+        .fillna(0.0)
+        .clip(lower=0.0)
     )
 
-    out = df.merge(hat, on=["asin", "order_week"], how="left")
+    # If multiple predictions exist for the same ASIN/week, average them.
+    hat = (
+        hat.groupby(["asin", "order_week"], as_index=False)
+        .agg(pred_instock_dph=("pred_instock_dph", "mean"))
+    )
 
-    print("\n" + "=" * 80)
-    print("ATTACH EXTERNAL EXPOSURE HAT")
-    print("=" * 80)
-    print("Raw rows:", len(df))
-    print("Hat rows:", len(hat))
-    print("Rows with pred_total_dph:", out["pred_total_dph"].notna().sum())
-    print("Rows with pred_buy_box_dph:", out["pred_buy_box_dph"].notna().sum())
-    print("Rows with pred_instock_dph:", out["pred_instock_dph"].notna().sum())
+    out = df.merge(
+        hat[["asin", "order_week", "pred_instock_dph"]],
+        on=["asin", "order_week"],
+        how="left",
+    )
+
+    out["pred_instock_dph"] = (
+        pd.to_numeric(out["pred_instock_dph"], errors="coerce")
+        .fillna(0.0)
+        .clip(lower=0.0)
+    )
+
+    # The ONLY external future covariate.
+    out["external_instock_dph_hat_log"] = np.log1p(out["pred_instock_dph"])
+
+    # Make sure old three-feature columns are not used accidentally.
+    for c in ["external_total_dph_hat_log", "external_buy_box_dph_hat_log"]:
+        if c in out.columns:
+            out = out.drop(columns=[c])
+
+    print("\n" + "=" * 100)
+    print("ATTACH EXTERNAL EXPOSURE HAT: IN_STOCK ONLY")
+    print("=" * 100)
+    print("Required input columns: asin, order_week, pred_instock_dph")
+    print("Added feature: external_instock_dph_hat_log")
+    print("Did NOT use pred_total_dph or pred_buy_box_dph")
+    print(out[["pred_instock_dph", "external_instock_dph_hat_log"]].describe().round(4).to_string())
 
     return out
+
 
 
 def run_nb_all_sample_scot_intersection_with_external_exposure(
@@ -4726,6 +4728,165 @@ def run_demand_with_uncalibrated_attention_instock_hat(
         exposure_hat=result_calib_or_focus_or_hat,
         **kwargs,
     )
+
+
+# ============================================================
+# FINAL CLEAN IN_STOCK-ONLY DEMAND WRAPPER
+# ============================================================
+
+def prepare_instock_only_hat_from_attention_result(result_obj):
+    """
+    Extract UNCALIBRATED anchor_attention in_stock_hat.
+
+    Accepted inputs:
+      1. result_calib from run_attention_focused_with_calibration(...)
+         Uses result_calib["result_focus"]["exposure_hat_for_demand"]
+         and intentionally ignores result_calib["exposure_hat_for_demand_calib"].
+
+      2. result_focus from run_attention_only_focused(...)
+         Uses result_focus["exposure_hat_for_demand"].
+
+      3. DataFrame with asin, order_week, pred_instock_dph.
+
+      4. DataFrame with asin, order_week, attn_instock_dph.
+    """
+    if isinstance(result_obj, dict) and "result_focus" in result_obj:
+        rf = result_obj["result_focus"]
+        if "exposure_hat_for_demand" in rf:
+            df = rf["exposure_hat_for_demand"].copy()
+            source = "result_calib['result_focus']['exposure_hat_for_demand']"
+        elif "attn_df" in rf:
+            df = rf["attn_df"].copy()
+            source = "result_calib['result_focus']['attn_df']"
+        else:
+            raise ValueError("result_calib['result_focus'] has no exposure_hat_for_demand or attn_df.")
+
+    elif isinstance(result_obj, dict) and "exposure_hat_for_demand" in result_obj:
+        df = result_obj["exposure_hat_for_demand"].copy()
+        source = "result_focus['exposure_hat_for_demand']"
+
+    elif isinstance(result_obj, dict) and "attn_df" in result_obj:
+        df = result_obj["attn_df"].copy()
+        source = "result_focus['attn_df']"
+
+    else:
+        df = result_obj.copy()
+        source = "dataframe input"
+
+    if "asin" not in df.columns or "order_week" not in df.columns:
+        raise ValueError("Input must contain asin and order_week.")
+
+    if "pred_instock_dph" not in df.columns:
+        if "attn_instock_dph" in df.columns:
+            df["pred_instock_dph"] = df["attn_instock_dph"]
+        else:
+            raise ValueError("Input must contain pred_instock_dph or attn_instock_dph.")
+
+    out = df[["asin", "order_week", "pred_instock_dph"]].copy()
+    out["asin"] = out["asin"].astype(str)
+    out["order_week"] = pd.to_datetime(out["order_week"])
+    out["pred_instock_dph"] = (
+        pd.to_numeric(out["pred_instock_dph"], errors="coerce")
+        .fillna(0.0)
+        .clip(lower=0.0)
+    )
+
+    out = (
+        out.groupby(["asin", "order_week"], as_index=False)
+        .agg(pred_instock_dph=("pred_instock_dph", "mean"))
+    )
+
+    print("\n" + "=" * 100)
+    print("UNCALIBRATED ANCHOR_ATTENTION IN_STOCK HAT SELECTED")
+    print("=" * 100)
+    print("Source:", source)
+    print(out[["pred_instock_dph"]].describe().round(4).to_string())
+    print("\nExpected mean: around 341 for your current attention run.")
+    return out
+
+
+def run_demand_with_uncalibrated_attention_instock_hat(
+    data_raw1,
+    scot_df,
+    result_calib_or_focus_or_hat,
+    n_asins=5000,
+    seed=42,
+    zero_thresholds=(0.4, 0.7),
+    prior_scale=0.3,
+    epochs=60,
+    history=52,
+    horizon=20,
+    d_model=32,
+    d_z=16,
+    batch_size=64,
+    M_eval=100,
+    lambda_q=0.05,
+    beta_tail=0.5,
+    patience=5,
+    lambda_z_reg=1.0,
+    remove_extreme=True,
+    extreme_q=0.99,
+    run_wape=True,
+    remove_oos_dp=True,
+):
+    """
+    Final clean experiment:
+
+      UNCALIBRATED anchor_attention pred_instock_dph
+          -> external_instock_dph_hat_log
+          -> demand model
+
+    Encoder/ENN/demand heads are unchanged.
+    Internal exposure decoder is disabled.
+    No total/buy_box external predictions are used.
+    """
+    instock_hat = prepare_instock_only_hat_from_attention_result(
+        result_calib_or_focus_or_hat
+    )
+
+    result = run_nb_all_sample_scot_intersection_with_external_exposure(
+        data_raw1=data_raw1,
+        scot_df=scot_df,
+        exposure_hat_df=instock_hat,
+
+        n_asins=n_asins,
+        seed=seed,
+        zero_thresholds=zero_thresholds,
+        prior_scale=prior_scale,
+        epochs=epochs,
+        history=history,
+        horizon=horizon,
+        d_model=d_model,
+        d_z=d_z,
+        batch_size=batch_size,
+        M_eval=M_eval,
+        lambda_q=lambda_q,
+        beta_tail=beta_tail,
+        patience=patience,
+        lambda_z_reg=lambda_z_reg,
+        remove_extreme=remove_extreme,
+        extreme_q=extreme_q,
+        run_wape=run_wape,
+        remove_oos_dp=remove_oos_dp,
+    )
+
+    print("\n" + "=" * 100)
+    print("IN_STOCK-ONLY ATTENTION HAT CONNECTED TO DEMAND MODEL")
+    print("=" * 100)
+    print("Used feature:")
+    print("  external_instock_dph_hat_log")
+    print("\nNot used:")
+    print("  external_total_dph_hat_log")
+    print("  external_buy_box_dph_hat_log")
+    print("\nInternal exposure decoder should be disabled:")
+    print("  use_stock_decoder = False")
+
+    try:
+        diagnose_external_exposure_hat_context(result)
+    except Exception as e:
+        print("diagnose_external_exposure_hat_context failed:", repr(e))
+
+    return result
 
 
 # ============================================================
