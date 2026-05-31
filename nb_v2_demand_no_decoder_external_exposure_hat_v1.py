@@ -2919,103 +2919,7 @@ def run_nb_all_sample_scot_intersection_with_external_exposure(
     )
 
 
-# Main usage: train one model on all sample-SCOT intersection ASINs.
-#
-# result_all_intersection = run_nb_all_sample_scot_intersection(
-#     data_raw1=data_raw1,
-#     scot_df=scot_df,
-#     n_asins=5000,
-#     seed=42,
-#     zero_thresholds=(0.4, 0.7),
-#     prior_scale=0.3,
-#     epochs=60,
-#     history=52,
-#     horizon=20,
-#     d_model=32,
-#     d_z=16,
-#     batch_size=64,
-#     M_eval=100,
-#     lambda_q=0.05,
-#     beta_tail=0.5,
-#     patience=5,
-#     lambda_z_reg=1.0,
-#     remove_extreme=True,
-#     extreme_q=0.99,
-#     run_wape=True,
-#     remove_oos_dp=True,
-# )
-#
-# joined_df = result_all_intersection["real_scot_outputs"]["forecast_df_scot_real_with_group"]
-# sparse_group_wape = result_all_intersection["real_scot_outputs"]["sparse_group_wape"]
-# print(sparse_group_wape)
 
-
-# Main usage:
-#
-# result_all_intersection = run_nb_all_sample_scot_intersection(
-#     data_raw1=data_raw1,
-#     scot_df=scot_df,
-#     n_asins=5000,
-#     seed=42,
-#     zero_thresholds=(0.4, 0.7),
-#     prior_scale=0.3,
-#     epochs=60,
-#     history=52,
-#     horizon=20,
-#     d_model=32,
-#     d_z=16,
-#     batch_size=64,
-#     M_eval=100,
-#     lambda_q=0.05,
-#     beta_tail=0.5,
-#     patience=5,
-#     lambda_z_reg=1.0,
-#     remove_extreme=True,
-#     extreme_q=0.99,
-#     run_wape=True,
-#     remove_oos_dp=True,
-# )
-#
-# print_final_diagnostics(result_all_intersection)
-#
-# joined_df = result_all_intersection["real_scot_outputs"]["forecast_df_scot_real_with_group"]
-# sparse_group_wape = result_all_intersection["real_scot_outputs"]["sparse_group_wape"]
-
-
-# Main no-distance version with total amount diagnostics:
-#
-# result_all_intersection = run_nb_all_sample_scot_intersection(
-#     data_raw1=data_raw1,
-#     scot_df=scot_df,
-#     n_asins=5000,
-#     seed=42,
-#     zero_thresholds=(0.4, 0.7),
-#     prior_scale=0.3,
-#     epochs=60,
-#     history=52,
-#     horizon=20,
-#     d_model=32,
-#     d_z=16,
-#     batch_size=64,
-#     M_eval=100,
-#     lambda_q=0.05,
-#     beta_tail=0.5,
-#     patience=5,
-#     lambda_z_reg=1.0,
-#     remove_extreme=True,
-#     extreme_q=0.99,
-#     run_wape=True,
-#     remove_oos_dp=True,
-# )
-#
-# sparse_group_wape = result_all_intersection["real_scot_outputs"]["sparse_group_wape"]
-# joined_df = result_all_intersection["real_scot_outputs"]["forecast_df_scot_real_with_group"]
-# print(sparse_group_wape)
-
-
-# =====================================================
-# 15. In-stock feature checker
-# =====================================================
 
 def check_instock_feature_setup(result):
     """
@@ -4304,39 +4208,6 @@ run_demand_with_attention_exposure_hat = run_demand_with_external_exposure_hat
 
 
 # ============================================================
-# Recommended usage:
-# ============================================================
-#
-# # From your attention exposure model:
-# # result_focus = run_attention_only_focused(...)
-# exposure_hat_for_demand = result_focus["exposure_hat_for_demand"]
-#
-# result_demand_hat = run_demand_with_external_exposure_hat(
-#     data_raw1=data_raw1,
-#     scot_df=scot_df,
-#     exposure_hat=exposure_hat_for_demand,
-#     n_asins=5000,
-#     seed=42,
-#     zero_thresholds=(0.4, 0.7),
-#     prior_scale=0.3,
-#     epochs=60,
-#     history=52,
-#     horizon=20,
-#     d_model=32,
-#     d_z=16,
-#     batch_size=64,
-#     M_eval=100,
-#     lambda_q=0.05,
-#     beta_tail=0.5,
-#     patience=5,
-#     lambda_z_reg=1.0,
-#     remove_extreme=True,
-#     extreme_q=0.99,
-#     run_wape=True,
-#     remove_oos_dp=True,
-# )
-#
-
 
 
 def run_demand_with_external_instock_hat_only(
@@ -4365,39 +4236,6 @@ def run_demand_with_external_instock_hat_only(
         exposure_hat=exposure_hat,
         **kwargs,
     )
-
-
-# Recommended usage:
-#
-# exposure_hat_for_demand = result_focus["exposure_hat_for_demand"]
-#
-# result_demand_instock_only = run_demand_with_external_instock_hat_only(
-#     data_raw1=data_raw1,
-#     scot_df=scot_df,
-#     exposure_hat=exposure_hat_for_demand,
-#     n_asins=5000,
-#     seed=42,
-#     zero_thresholds=(0.4, 0.7),
-#     prior_scale=0.3,
-#     epochs=60,
-#     history=52,
-#     horizon=20,
-#     d_model=32,
-#     d_z=16,
-#     batch_size=64,
-#     M_eval=100,
-#     lambda_q=0.05,
-#     beta_tail=0.5,
-#     patience=5,
-#     lambda_z_reg=1.0,
-#     remove_extreme=True,
-#     extreme_q=0.99,
-#     run_wape=True,
-#     remove_oos_dp=True,
-# )
-#
-
-
 
 # ============================================================
 # FINAL CLEAN WRAPPER: connect anchor_attention in_stock_hat
@@ -4554,19 +4392,38 @@ def run_demand_with_anchor_attention_instock_hat(
 
     return result
 
-
 # ============================================================
-# Recommended usage:
+# Recommended usage
 # ============================================================
+#
+# # result_focus comes from:
+# # result_focus = run_attention_only_focused(...)
 #
 # result_demand_attn_instock = run_demand_with_anchor_attention_instock_hat(
 #     data_raw1=data_raw1,
 #     scot_df=scot_df,
 #     result_focus_or_hat=result_focus,
+#
 #     n_asins=5000,
 #     seed=42,
+#     zero_thresholds=(0.4, 0.7),
+#     prior_scale=0.3,
+#     epochs=60,
 #     history=52,
 #     horizon=20,
-#     epochs=60,
+#     d_model=32,
+#     d_z=16,
+#     batch_size=64,
+#     M_eval=100,
+#     lambda_q=0.05,
+#     beta_tail=0.5,
+#     patience=5,
+#     lambda_z_reg=1.0,
+#     remove_extreme=True,
+#     extreme_q=0.99,
+#     run_wape=True,
+#     remove_oos_dp=True,
 # )
+#
+# diagnose_external_exposure_hat_context(result_demand_attn_instock)
 #
