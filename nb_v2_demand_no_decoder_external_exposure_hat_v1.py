@@ -2891,7 +2891,7 @@ def run_nb_all_sample_scot_intersection_with_external_exposure(
     **kwargs,
 ):
     """
-    Quick test:
+    External exposure-hat demand test:
       1. merge exposure-only predictions into data_raw1
       2. run the original demand experiment
       3. internal decoder is disabled in this file
@@ -4157,3 +4157,182 @@ def diagnose_external_exposure_hat_context(result):
 
     return cols
 
+
+
+
+# ============================================================
+# CLEAN DEMAND MODEL WITH EXTERNAL EXPOSURE HAT
+# ============================================================
+
+def prepare_external_exposure_hat_for_demand(exposure_hat):
+    """
+    Prepare the external exposure_hat dataframe for the demand model.
+
+    Accepts either:
+      1. result_focus dict from run_attention_only_focused(...)
+         using result_focus["exposure_hat_for_demand"]
+      2. result_best dict from run_best_exposure_anchor_attention(...)
+         using result_best["exposure_hat_for_demand"]
+      3. a dataframe with:
+           asin, order_week,
+           pred_total_dph, pred_buy_box_dph, pred_instock_dph
+      4. a dataframe with attention names:
+           asin, order_week,
+           attn_total_dph, attn_buy_box_dph, attn_instock_dph
+
+    Returns dataframe with exactly the columns needed:
+      asin, order_week, pred_total_dph, pred_buy_box_dph, pred_instock_dph
+    """
+    if isinstance(exposure_hat, dict):
+        if "exposure_hat_for_demand" in exposure_hat:
+            hat = exposure_hat["exposure_hat_for_demand"].copy()
+        elif "attn_df" in exposure_hat:
+            hat = exposure_hat["attn_df"].copy()
+        elif "forecast_df" in exposure_hat:
+            hat = exposure_hat["forecast_df"].copy()
+        else:
+            raise ValueError(
+                "Dict exposure_hat must contain one of: "
+                "'exposure_hat_for_demand', 'attn_df', or 'forecast_df'."
+            )
+    else:
+        hat = exposure_hat.copy()
+
+    if "asin" not in hat.columns or "order_week" not in hat.columns:
+        raise ValueError("exposure_hat must contain asin and order_week.")
+
+    # If attention columns exist but pred columns do not, rename them.
+    rename_map = {}
+    if "pred_total_dph" not in hat.columns and "attn_total_dph" in hat.columns:
+        rename_map["attn_total_dph"] = "pred_total_dph"
+    if "pred_buy_box_dph" not in hat.columns and "attn_buy_box_dph" in hat.columns:
+        rename_map["attn_buy_box_dph"] = "pred_buy_box_dph"
+    if "pred_instock_dph" not in hat.columns and "attn_instock_dph" in hat.columns:
+        rename_map["attn_instock_dph"] = "pred_instock_dph"
+
+    if rename_map:
+        hat = hat.rename(columns=rename_map)
+
+    required = [
+        "asin",
+        "order_week",
+        "pred_total_dph",
+        "pred_buy_box_dph",
+        "pred_instock_dph",
+    ]
+    missing = [c for c in required if c not in hat.columns]
+    if missing:
+        raise ValueError(f"Missing required exposure_hat columns: {missing}")
+
+    out = hat[required].copy()
+    out["asin"] = out["asin"].astype(str)
+    out["order_week"] = pd.to_datetime(out["order_week"])
+
+    for c in ["pred_total_dph", "pred_buy_box_dph", "pred_instock_dph"]:
+        out[c] = pd.to_numeric(out[c], errors="coerce").clip(lower=0.0)
+
+    # Deduplicate if several origins produce the same ASIN/week.
+    out = (
+        out.groupby(["asin", "order_week"], as_index=False)
+        .agg(
+            pred_total_dph=("pred_total_dph", "mean"),
+            pred_buy_box_dph=("pred_buy_box_dph", "mean"),
+            pred_instock_dph=("pred_instock_dph", "mean"),
+        )
+    )
+
+    return out
+
+
+def run_demand_with_external_exposure_hat(
+    data_raw1,
+    scot_df,
+    exposure_hat,
+    **kwargs,
+):
+    """
+    Recommended clean demand-model entry point.
+
+    This is the same demand model as before, except:
+      - internal exposure decoder is disabled
+      - future_context directly receives three external predicted values:
+          external_total_dph_hat_log
+          external_buy_box_dph_hat_log
+          external_instock_dph_hat_log
+
+    Use exposure_hat from attention pipeline:
+        exposure_hat = result_focus["exposure_hat_for_demand"]
+
+    Then:
+        result_demand = run_demand_with_external_exposure_hat(
+            data_raw1=data_raw1,
+            scot_df=scot_df,
+            exposure_hat=exposure_hat,
+            n_asins=5000,
+            seed=42,
+            history=52,
+            horizon=20,
+            ...
+        )
+    """
+    clean_hat = prepare_external_exposure_hat_for_demand(exposure_hat)
+
+    result = run_nb_all_sample_scot_intersection_with_external_exposure(
+        data_raw1=data_raw1,
+        scot_df=scot_df,
+        exposure_hat_df=clean_hat,
+        **kwargs,
+    )
+
+    print("\n" + "=" * 100)
+    print("DEMAND MODEL WITH EXTERNAL EXPOSURE HAT: CHECK")
+    print("=" * 100)
+    diagnose_external_exposure_hat_context(result)
+
+    print("\nExpected external features in future_context:")
+    print("  external_total_dph_hat_log")
+    print("  external_buy_box_dph_hat_log")
+    print("  external_instock_dph_hat_log")
+    print("\nInternal exposure decoder should be disabled:")
+    print("  use_stock_decoder = False")
+
+    return result
+
+
+# Backward-compatible alias with a clearer name.
+run_demand_with_attention_exposure_hat = run_demand_with_external_exposure_hat
+
+
+# ============================================================
+# Recommended usage:
+# ============================================================
+#
+# # From your attention exposure model:
+# # result_focus = run_attention_only_focused(...)
+# exposure_hat_for_demand = result_focus["exposure_hat_for_demand"]
+#
+# result_demand_hat = run_demand_with_external_exposure_hat(
+#     data_raw1=data_raw1,
+#     scot_df=scot_df,
+#     exposure_hat=exposure_hat_for_demand,
+#     n_asins=5000,
+#     seed=42,
+#     zero_thresholds=(0.4, 0.7),
+#     prior_scale=0.3,
+#     epochs=60,
+#     history=52,
+#     horizon=20,
+#     d_model=32,
+#     d_z=16,
+#     batch_size=64,
+#     M_eval=100,
+#     lambda_q=0.05,
+#     beta_tail=0.5,
+#     patience=5,
+#     lambda_z_reg=1.0,
+#     remove_extreme=True,
+#     extreme_q=0.99,
+#     run_wape=True,
+#     remove_oos_dp=True,
+# )
+#
