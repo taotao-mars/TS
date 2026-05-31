@@ -493,9 +493,10 @@ def load_real_data(data_raw, dph_cap_q=0.995):
     # External exposure-only predictions, if provided.
     # These are NOT true future DPH. They come from the separately trained exposure-only model.
     external_hat_cols = []
+    # External exposure-only prediction.
+    # Clean isolation test: ONLY use predicted in_stock_dph.
+    # total_dph_hat and buy_box_dph_hat are intentionally ignored here.
     external_map = {
-        "pred_total_dph": "external_total_dph_hat_log",
-        "pred_buy_box_dph": "external_buy_box_dph_hat_log",
         "pred_instock_dph": "external_instock_dph_hat_log",
     }
 
@@ -4256,8 +4257,6 @@ def run_demand_with_external_exposure_hat(
     This is the same demand model as before, except:
       - internal exposure decoder is disabled
       - future_context directly receives three external predicted values:
-          external_total_dph_hat_log
-          external_buy_box_dph_hat_log
           external_instock_dph_hat_log
 
     Use exposure_hat from attention pipeline:
@@ -4290,9 +4289,10 @@ def run_demand_with_external_exposure_hat(
     diagnose_external_exposure_hat_context(result)
 
     print("\nExpected external features in future_context:")
-    print("  external_total_dph_hat_log")
-    print("  external_buy_box_dph_hat_log")
     print("  external_instock_dph_hat_log")
+    print("\nNote:")
+    print("  This clean version intentionally ignores external_total_dph_hat_log")
+    print("  and external_buy_box_dph_hat_log, so the test isolates in_stock_hat.")
     print("\nInternal exposure decoder should be disabled:")
     print("  use_stock_decoder = False")
 
@@ -4312,6 +4312,66 @@ run_demand_with_attention_exposure_hat = run_demand_with_external_exposure_hat
 # exposure_hat_for_demand = result_focus["exposure_hat_for_demand"]
 #
 # result_demand_hat = run_demand_with_external_exposure_hat(
+#     data_raw1=data_raw1,
+#     scot_df=scot_df,
+#     exposure_hat=exposure_hat_for_demand,
+#     n_asins=5000,
+#     seed=42,
+#     zero_thresholds=(0.4, 0.7),
+#     prior_scale=0.3,
+#     epochs=60,
+#     history=52,
+#     horizon=20,
+#     d_model=32,
+#     d_z=16,
+#     batch_size=64,
+#     M_eval=100,
+#     lambda_q=0.05,
+#     beta_tail=0.5,
+#     patience=5,
+#     lambda_z_reg=1.0,
+#     remove_extreme=True,
+#     extreme_q=0.99,
+#     run_wape=True,
+#     remove_oos_dp=True,
+# )
+#
+
+
+
+def run_demand_with_external_instock_hat_only(
+    data_raw1,
+    scot_df,
+    exposure_hat,
+    **kwargs,
+):
+    """
+    Clean isolation test:
+      Same demand model as before.
+      Internal exposure decoder disabled.
+      ONLY external_instock_dph_hat_log is added to future_context.
+
+    The input exposure_hat can still contain:
+      pred_total_dph
+      pred_buy_box_dph
+      pred_instock_dph
+
+    But this version only uses:
+      pred_instock_dph -> external_instock_dph_hat_log
+    """
+    return run_demand_with_external_exposure_hat(
+        data_raw1=data_raw1,
+        scot_df=scot_df,
+        exposure_hat=exposure_hat,
+        **kwargs,
+    )
+
+
+# Recommended usage:
+#
+# exposure_hat_for_demand = result_focus["exposure_hat_for_demand"]
+#
+# result_demand_instock_only = run_demand_with_external_instock_hat_only(
 #     data_raw1=data_raw1,
 #     scot_df=scot_df,
 #     exposure_hat=exposure_hat_for_demand,
