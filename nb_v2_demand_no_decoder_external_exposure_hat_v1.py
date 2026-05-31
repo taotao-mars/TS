@@ -4573,16 +4573,164 @@ def run_demand_with_uncalibrated_attention_instock_hat(
 
 
 # ============================================================
-# Recommended usage
+# PATCH: TRUE IN_STOCK-ONLY external exposure wrapper
 # ============================================================
-#
-# # You just ran:
-# # result_calib = run_attention_focused_with_calibration(...)
-# #
-# # This wrapper will use the UNCALIBRATED attention version:
-# # result_calib["result_focus"]["exposure_hat_for_demand"]
-# # It will NOT use:
-# # result_calib["exposure_hat_for_demand_calib"]
+
+def prepare_external_instock_hat_only(exposure_hat):
+    """
+    Prepare ONLY predicted in_stock_hat for demand model.
+
+    Accepts:
+      - dataframe with asin, order_week, pred_instock_dph
+      - dataframe with asin, order_week, attn_instock_dph
+      - result_focus dict with exposure_hat_for_demand or attn_df
+      - result_calib dict, but uses the UNCALIBRATED attention version:
+            result_calib["result_focus"]["exposure_hat_for_demand"]
+
+    Output:
+      asin, order_week, pred_instock_dph
+
+    This function intentionally does NOT require:
+      pred_total_dph
+      pred_buy_box_dph
+    """
+    if isinstance(exposure_hat, dict):
+        # result_calib from run_attention_focused_with_calibration(...)
+        if "result_focus" in exposure_hat:
+            rf = exposure_hat["result_focus"]
+            if isinstance(rf, dict) and "exposure_hat_for_demand" in rf:
+                df = rf["exposure_hat_for_demand"].copy()
+                source = "result_calib['result_focus']['exposure_hat_for_demand']"
+            elif isinstance(rf, dict) and "attn_df" in rf:
+                df = rf["attn_df"].copy()
+                source = "result_calib['result_focus']['attn_df']"
+            else:
+                raise ValueError("result_calib['result_focus'] has no exposure_hat_for_demand or attn_df.")
+
+        # result_focus from run_attention_only_focused(...)
+        elif "exposure_hat_for_demand" in exposure_hat:
+            df = exposure_hat["exposure_hat_for_demand"].copy()
+            source = "result_focus['exposure_hat_for_demand']"
+
+        elif "attn_df" in exposure_hat:
+            df = exposure_hat["attn_df"].copy()
+            source = "result_focus['attn_df']"
+
+        else:
+            raise ValueError("Dict input must contain result_focus/exposure_hat_for_demand/attn_df.")
+    else:
+        df = exposure_hat.copy()
+        source = "dataframe input"
+
+    if "asin" not in df.columns or "order_week" not in df.columns:
+        raise ValueError("Input must contain asin and order_week.")
+
+    if "pred_instock_dph" not in df.columns:
+        if "attn_instock_dph" in df.columns:
+            df["pred_instock_dph"] = df["attn_instock_dph"]
+        else:
+            raise ValueError("Input must contain pred_instock_dph or attn_instock_dph.")
+
+    out = df[["asin", "order_week", "pred_instock_dph"]].copy()
+    out["asin"] = out["asin"].astype(str)
+    out["order_week"] = pd.to_datetime(out["order_week"])
+    out["pred_instock_dph"] = (
+        pd.to_numeric(out["pred_instock_dph"], errors="coerce")
+        .fillna(0.0)
+        .clip(lower=0.0)
+    )
+
+    out = (
+        out.groupby(["asin", "order_week"], as_index=False)
+        .agg(pred_instock_dph=("pred_instock_dph", "mean"))
+    )
+
+    print("\n" + "=" * 100)
+    print("IN_STOCK-ONLY HAT PREPARED")
+    print("=" * 100)
+    print("Source:", source)
+    print(out[["pred_instock_dph"]].describe().round(4).to_string())
+    print("\nOnly this column will be used:")
+    print("  pred_instock_dph -> external_instock_dph_hat_log")
+    print("\nNo total/buy_box prediction columns are required.")
+
+    return out
+
+
+def run_demand_with_external_instock_hat_only(
+    data_raw1,
+    scot_df,
+    exposure_hat,
+    **kwargs,
+):
+    """
+    TRUE in_stock-only wrapper.
+
+    This function fixes the previous error:
+      Missing required exposure_hat columns:
+      ['pred_total_dph', 'pred_buy_box_dph']
+
+    It only prepares:
+      asin, order_week, pred_instock_dph
+
+    Then it calls the lower-level demand function that has the internal decoder disabled
+    and only adds:
+      external_instock_dph_hat_log
+    """
+    clean_instock_hat = prepare_external_instock_hat_only(exposure_hat)
+
+    result = run_nb_all_sample_scot_intersection_with_external_exposure(
+        data_raw1=data_raw1,
+        scot_df=scot_df,
+        exposure_hat_df=clean_instock_hat,
+        **kwargs,
+    )
+
+    print("\n" + "=" * 100)
+    print("IN_STOCK-ONLY HAT CONNECTED TO DEMAND MODEL")
+    print("=" * 100)
+    print("Expected future_context column:")
+    print("  external_instock_dph_hat_log")
+    print("\nExpected NOT to use:")
+    print("  external_total_dph_hat_log")
+    print("  external_buy_box_dph_hat_log")
+    print("\nExpected decoder status:")
+    print("  use_stock_decoder = False")
+
+    try:
+        diagnose_external_exposure_hat_context(result)
+    except Exception as e:
+        print("diagnose_external_exposure_hat_context failed:", repr(e))
+
+    return result
+
+
+def run_demand_with_uncalibrated_attention_instock_hat(
+    data_raw1,
+    scot_df,
+    result_calib_or_focus_or_hat,
+    **kwargs,
+):
+    """
+    Use UNCALIBRATED anchor_attention in_stock_hat only.
+
+    If you pass result_calib, this function automatically uses:
+      result_calib['result_focus']['exposure_hat_for_demand']
+
+    It does NOT use:
+      result_calib['exposure_hat_for_demand_calib']
+    """
+    return run_demand_with_external_instock_hat_only(
+        data_raw1=data_raw1,
+        scot_df=scot_df,
+        exposure_hat=result_calib_or_focus_or_hat,
+        **kwargs,
+    )
+
+
+# ============================================================
+# Single usage
+# ============================================================
 #
 # result_demand_attn_instock = run_demand_with_uncalibrated_attention_instock_hat(
 #     data_raw1=data_raw1,
