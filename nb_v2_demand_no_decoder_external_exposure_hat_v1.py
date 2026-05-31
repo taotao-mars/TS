@@ -4396,3 +4396,177 @@ def run_demand_with_external_instock_hat_only(
 #     remove_oos_dp=True,
 # )
 #
+
+
+
+# ============================================================
+# FINAL CLEAN WRAPPER: connect anchor_attention in_stock_hat
+# ============================================================
+
+def prepare_anchor_attention_instock_hat(result_focus_or_df):
+    """
+    Prepare anchor-attention in_stock_hat for demand model.
+
+    Accepts:
+      1. result_focus from run_attention_only_focused(...)
+         result_focus["exposure_hat_for_demand"]
+      2. result_focus["attn_df"]
+      3. dataframe with:
+           asin, order_week, pred_instock_dph
+      4. dataframe with:
+           asin, order_week, attn_instock_dph
+
+    Output:
+      asin, order_week, pred_instock_dph
+
+    Important:
+      pred_instock_dph must be NORMAL SCALE, not log.
+      The demand data loader will convert it to:
+          external_instock_dph_hat_log = log1p(pred_instock_dph)
+    """
+    if isinstance(result_focus_or_df, dict):
+        if "exposure_hat_for_demand" in result_focus_or_df:
+            df = result_focus_or_df["exposure_hat_for_demand"].copy()
+        elif "attn_df" in result_focus_or_df:
+            df = result_focus_or_df["attn_df"].copy()
+        else:
+            raise ValueError(
+                "Dict input must contain 'exposure_hat_for_demand' or 'attn_df'."
+            )
+    else:
+        df = result_focus_or_df.copy()
+
+    if "asin" not in df.columns or "order_week" not in df.columns:
+        raise ValueError("Input must contain asin and order_week.")
+
+    if "pred_instock_dph" not in df.columns:
+        if "attn_instock_dph" in df.columns:
+            df["pred_instock_dph"] = df["attn_instock_dph"]
+        else:
+            raise ValueError(
+                "Input must contain either pred_instock_dph or attn_instock_dph."
+            )
+
+    out = df[["asin", "order_week", "pred_instock_dph"]].copy()
+    out["asin"] = out["asin"].astype(str)
+    out["order_week"] = pd.to_datetime(out["order_week"])
+    out["pred_instock_dph"] = (
+        pd.to_numeric(out["pred_instock_dph"], errors="coerce")
+        .fillna(0.0)
+        .clip(lower=0.0)
+    )
+
+    # Deduplicate ASIN/week just in case.
+    out = (
+        out.groupby(["asin", "order_week"], as_index=False)
+        .agg(pred_instock_dph=("pred_instock_dph", "mean"))
+    )
+
+    print("\n" + "=" * 100)
+    print("ANCHOR ATTENTION IN_STOCK HAT PREPARED")
+    print("=" * 100)
+    print(out[["pred_instock_dph"]].describe().round(4).to_string())
+    print("\nCheck: if mean is around hundreds, this is normal scale. If mean is around 5-6, it is log scale and wrong.")
+
+    return out
+
+
+def run_demand_with_anchor_attention_instock_hat(
+    data_raw1,
+    scot_df,
+    result_focus_or_hat,
+    n_asins=5000,
+    seed=42,
+    zero_thresholds=(0.4, 0.7),
+    prior_scale=0.3,
+    epochs=60,
+    history=52,
+    horizon=20,
+    d_model=32,
+    d_z=16,
+    batch_size=64,
+    M_eval=100,
+    lambda_q=0.05,
+    beta_tail=0.5,
+    patience=5,
+    lambda_z_reg=1.0,
+    remove_extreme=True,
+    extreme_q=0.99,
+    run_wape=True,
+    remove_oos_dp=True,
+):
+    """
+    Final clean demand model connection for current best exposure_hat.
+
+    This connects:
+        anchor_attention pred_instock_dph
+    into the demand model as:
+        external_instock_dph_hat_log
+
+    It does NOT use:
+        internal exposure decoder
+        external_total_dph_hat_log
+        external_buy_box_dph_hat_log
+
+    This is the cleanest test:
+        Does attention-based predicted in_stock improve demand forecast?
+    """
+    exposure_hat_instock = prepare_anchor_attention_instock_hat(result_focus_or_hat)
+
+    result = run_demand_with_external_instock_hat_only(
+        data_raw1=data_raw1,
+        scot_df=scot_df,
+        exposure_hat=exposure_hat_instock,
+
+        n_asins=n_asins,
+        seed=seed,
+        zero_thresholds=zero_thresholds,
+        prior_scale=prior_scale,
+        epochs=epochs,
+        history=history,
+        horizon=horizon,
+        d_model=d_model,
+        d_z=d_z,
+        batch_size=batch_size,
+        M_eval=M_eval,
+        lambda_q=lambda_q,
+        beta_tail=beta_tail,
+        patience=patience,
+        lambda_z_reg=lambda_z_reg,
+        remove_extreme=remove_extreme,
+        extreme_q=extreme_q,
+        run_wape=run_wape,
+        remove_oos_dp=remove_oos_dp,
+    )
+
+    print("\n" + "=" * 100)
+    print("ANCHOR ATTENTION IN_STOCK HAT CONNECTED TO DEMAND MODEL")
+    print("=" * 100)
+    print("Expected future_context column:")
+    print("  external_instock_dph_hat_log")
+    print("\nExpected decoder status:")
+    print("  use_stock_decoder = False")
+
+    try:
+        diagnose_external_exposure_hat_context(result)
+    except Exception as e:
+        print("diagnose_external_exposure_hat_context failed:", repr(e))
+
+    return result
+
+
+# ============================================================
+# Recommended usage:
+# ============================================================
+#
+# result_demand_attn_instock = run_demand_with_anchor_attention_instock_hat(
+#     data_raw1=data_raw1,
+#     scot_df=scot_df,
+#     result_focus_or_hat=result_focus,
+#     n_asins=5000,
+#     seed=42,
+#     history=52,
+#     horizon=20,
+#     epochs=60,
+# )
+#
