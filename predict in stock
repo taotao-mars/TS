@@ -2777,802 +2777,9 @@ def run_attention_only_focused(
     }
 
 
-# ============================================================
-# Recommended usage for your current question:
-# ============================================================
-#
-# result_focus = run_attention_only_focused(
-#     data_raw1=data_raw1,
-#     scot_df=scot_df,
-#     n_asins=5000,
-#     seed=42,
-#     history=52,
-#     horizon=20,
-#     d_model=64,
-#     batch_size=64,
-#     exposure_epochs=60,
-#     exposure_lr=1e-3,
-#     exposure_patience=8,
-#     suppress_full_print=True,
-# )
-#
-# key_report = result_focus["key_report"]
-# exposure_hat_for_demand = result_focus["exposure_hat_for_demand"]
-#
-
-
 
 # ============================================================
-# 14. Calibration for anchor-attention exposure_hat
-# ============================================================
-
-def calibrate_attention_instock_hat(
-    attn_df,
-    method="global",
-    target_col="true_instock_dph",
-    pred_col="attn_instock_dph",
-    cap_scale=(0.85, 1.25),
-    high_quantile=0.50,
-    blend_strength=1.0,
-):
-    """
-    Calibrate anchor-attention in_stock_hat to reduce log-scale underestimation.
-
-    Supported methods:
-
-    1. method="global"
-       Multiply all attn_instock_dph by:
-           true_mean / pred_mean
-       with optional clipping by cap_scale.
-
-    2. method="high_only"
-       Only scale rows where pred_col is above high_quantile.
-       This avoids amplifying low/zero-exposure false positives too much.
-
-    3. method="by_horizon_block"
-       Compute separate scale factors for:
-           short h=1-5
-           mid   h=6-12
-           long  h=13-20
-
-    4. method="by_horizon"
-       Compute separate scale factor for each horizon h=1,...,20.
-
-    blend_strength:
-       1.0 means full calibration.
-       0.5 means use half of the correction:
-           effective_scale = 1 + 0.5 * (scale - 1)
-
-    Returns:
-       calibrated dataframe with:
-           calib_instock_dph
-           calib_scale
-           calib_method
-    """
-    df = attn_df.copy()
-
-    if target_col not in df.columns or pred_col not in df.columns:
-        raise ValueError(f"Need {target_col} and {pred_col} in attn_df.")
-
-    lo, hi = cap_scale
-
-    def clipped_scale(y, p):
-        s = np.mean(y) / (np.mean(p) + 1e-8)
-        s = float(np.clip(s, lo, hi))
-        s = 1.0 + blend_strength * (s - 1.0)
-        return s
-
-    df["calib_instock_dph"] = df[pred_col].astype(float).clip(lower=0.0)
-    df["calib_scale"] = 1.0
-    df["calib_method"] = method
-
-    if method == "global":
-        scale = clipped_scale(df[target_col].values, df[pred_col].values)
-        df["calib_instock_dph"] = df[pred_col].astype(float).clip(lower=0.0) * scale
-        df["calib_scale"] = scale
-
-    elif method == "high_only":
-        scale = clipped_scale(df[target_col].values, df[pred_col].values)
-        thr = df[pred_col].quantile(high_quantile)
-
-        high_mask = df[pred_col] >= thr
-        df.loc[high_mask, "calib_instock_dph"] = (
-            df.loc[high_mask, pred_col].astype(float).clip(lower=0.0) * scale
-        )
-        df["calib_scale"] = 1.0
-        df.loc[high_mask, "calib_scale"] = scale
-
-    elif method == "by_horizon_block":
-        df["horizon_block"] = pd.cut(
-            df["horizon"],
-            bins=[0, 5, 12, 20],
-            labels=["short_1_5", "mid_6_12", "long_13_20"],
-            include_lowest=True,
-        )
-
-        for block, g in df.groupby("horizon_block", observed=True):
-            idx = g.index
-            scale = clipped_scale(g[target_col].values, g[pred_col].values)
-            df.loc[idx, "calib_instock_dph"] = (
-                df.loc[idx, pred_col].astype(float).clip(lower=0.0) * scale
-            )
-            df.loc[idx, "calib_scale"] = scale
-
-    elif method == "by_horizon":
-        for h, g in df.groupby("horizon"):
-            idx = g.index
-            scale = clipped_scale(g[target_col].values, g[pred_col].values)
-            df.loc[idx, "calib_instock_dph"] = (
-                df.loc[idx, pred_col].astype(float).clip(lower=0.0) * scale
-            )
-            df.loc[idx, "calib_scale"] = scale
-
-    else:
-        raise ValueError("method must be global, high_only, by_horizon_block, or by_horizon")
-
-    return df
-
-
-def evaluate_calibrated_instock_hat(calib_df):
-    """
-    Compare:
-      raw_model       pred_instock_dph
-      attention       attn_instock_dph
-      calibrated      calib_instock_dph
-      naive_last      pred_instock_dph_last
-      naive_mean13    pred_instock_dph_mean13
-
-    Focuses on:
-      - overall
-      - long horizon block
-      - AUC by horizon
-      - low exposure group
-      - ASIN-level p90 WAPE
-    """
-    df = calib_df.copy()
-
-    required = [
-        "true_instock_dph",
-        "pred_instock_dph",
-        "attn_instock_dph",
-        "calib_instock_dph",
-        "pred_instock_dph_last",
-        "pred_instock_dph_mean13",
-        "horizon",
-        "asin",
-    ]
-    missing = [c for c in required if c not in df.columns]
-    if missing:
-        raise ValueError(f"Missing required columns: {missing}")
-
-    methods = [
-        ("raw_model", "pred_instock_dph"),
-        ("anchor_attention", "attn_instock_dph"),
-        ("calibrated_attention", "calib_instock_dph"),
-        ("naive_last", "pred_instock_dph_last"),
-        ("naive_mean13", "pred_instock_dph_mean13"),
-    ]
-
-    def metric(g, col):
-        y = g["true_instock_dph"].values
-        p = g[col].values
-        return {
-            "ratio": np.mean(p) / (np.mean(y) + 1e-8),
-            "WAPE": _wape(y, p),
-            "Pearson": _corr(y, p),
-            "Spearman": _safe_spearman(y, p),
-            "active_AUC": _auc((y > 0).astype(int), p),
-        }
-
-    print("\n" + "=" * 100)
-    print("CALIBRATION CHECK: OVERALL IN_STOCK_DPH")
-    print("=" * 100)
-
-    overall_rows = []
-    for name, col in methods:
-        m = metric(df, col)
-        m["method"] = name
-        overall_rows.append(m)
-
-    overall = pd.DataFrame(overall_rows)[
-        ["method", "ratio", "WAPE", "Pearson", "Spearman", "active_AUC"]
-    ]
-    print(overall.round(5).to_string(index=False))
-
-    print("\n" + "=" * 100)
-    print("CALIBRATION CHECK: BY HORIZON BLOCK")
-    print("=" * 100)
-
-    df["horizon_block"] = pd.cut(
-        df["horizon"],
-        bins=[0, 5, 12, 20],
-        labels=["short_1_5", "mid_6_12", "long_13_20"],
-        include_lowest=True,
-    )
-
-    block_rows = []
-    for block, g in df.groupby("horizon_block", observed=True):
-        for name, col in methods:
-            m = metric(g, col)
-            m["block"] = block
-            m["method"] = name
-            block_rows.append(m)
-
-    block_df = pd.DataFrame(block_rows)[
-        ["block", "method", "ratio", "WAPE", "Pearson", "Spearman", "active_AUC"]
-    ]
-    print(block_df.round(5).to_string(index=False))
-
-    print("\n" + "=" * 100)
-    print("CALIBRATION CHECK: ACTIVE_AUC BY HORIZON")
-    print("=" * 100)
-
-    auc_rows = []
-    for h, g in df.groupby("horizon"):
-        y = (g["true_instock_dph"].values > 0).astype(int)
-        row = {"horizon": int(h)}
-        for name, col in [
-            ("raw_AUC", "pred_instock_dph"),
-            ("attn_AUC", "attn_instock_dph"),
-            ("calib_AUC", "calib_instock_dph"),
-            ("last_AUC", "pred_instock_dph_last"),
-        ]:
-            row[name] = _auc(y, g[col].values)
-        auc_rows.append(row)
-
-    auc_df = pd.DataFrame(auc_rows)
-    print(auc_df.round(5).to_string(index=False))
-
-    print("\n" + "=" * 100)
-    print("CALIBRATION CHECK: LOW/MID/HIGH TRUE EXPOSURE GROUP")
-    print("=" * 100)
-
-    asin_sum = df.groupby("asin").agg(true_sum=("true_instock_dph", "sum")).reset_index()
-    asin_sum["exposure_group"] = pd.qcut(
-        asin_sum["true_sum"].rank(method="first"),
-        q=3,
-        labels=["low_true_exposure", "mid_true_exposure", "high_true_exposure"],
-    )
-    gdf = df.merge(asin_sum[["asin", "exposure_group"]], on="asin", how="left")
-
-    group_rows = []
-    for group, g in gdf.groupby("exposure_group", observed=True):
-        for name, col in [
-            ("anchor_attention", "attn_instock_dph"),
-            ("calibrated_attention", "calib_instock_dph"),
-        ]:
-            m = metric(g, col)
-            m["group"] = group
-            m["method"] = name
-            group_rows.append(m)
-
-    group_df = pd.DataFrame(group_rows)[
-        ["group", "method", "ratio", "WAPE", "Pearson", "Spearman", "active_AUC"]
-    ]
-    print(group_df.round(5).to_string(index=False))
-
-    print("\n" + "=" * 100)
-    print("CALIBRATION CHECK: ASIN-LEVEL")
-    print("=" * 100)
-
-    asin_rows = []
-    for name, col in [
-        ("anchor_attention", "attn_instock_dph"),
-        ("calibrated_attention", "calib_instock_dph"),
-    ]:
-        tmp = df.groupby("asin").agg(
-            true_20wk_sum=("true_instock_dph", "sum"),
-            pred_20wk_sum=(col, "sum"),
-        ).reset_index()
-
-        per_wape = []
-        for asin, gg in df.groupby("asin"):
-            per_wape.append(_wape(gg["true_instock_dph"].values, gg[col].values))
-        per_wape = np.asarray(per_wape)
-
-        asin_rows.append({
-            "method": name,
-            "asin_sum_Pearson": _corr(tmp["true_20wk_sum"], tmp["pred_20wk_sum"]),
-            "asin_sum_Spearman": _safe_spearman(tmp["true_20wk_sum"], tmp["pred_20wk_sum"]),
-            "median_asin_WAPE": np.quantile(per_wape, 0.5),
-            "p75_asin_WAPE": np.quantile(per_wape, 0.75),
-            "p90_asin_WAPE": np.quantile(per_wape, 0.90),
-        })
-
-    asin_df = pd.DataFrame(asin_rows)
-    print(asin_df.round(5).to_string(index=False))
-
-    print("\nCalibration scale summary:")
-    if "calib_scale" in df.columns:
-        print(df["calib_scale"].describe().round(5).to_string())
-
-    return {
-        "overall": overall,
-        "by_block": block_df,
-        "auc_by_horizon": auc_df,
-        "group_quality": group_df,
-        "asin_level": asin_df,
-    }
-
-
-def grid_search_instock_calibration(
-    attn_df,
-    methods=("global", "high_only", "by_horizon_block"),
-    cap_scales=((0.90, 1.15), (0.85, 1.25), (0.80, 1.35)),
-    high_quantiles=(0.50, 0.60, 0.70),
-    blend_strengths=(0.5, 0.75, 1.0),
-    sort_by="WAPE",
-):
-    """
-    Search calibration choices for attn_instock_dph.
-
-    This is diagnostic:
-      Choose a setting that improves ratio/WAPE without destroying AUC/low group.
-    """
-    rows = []
-
-    for method in methods:
-        for cap in cap_scales:
-            for bs in blend_strengths:
-                q_list = high_quantiles if method == "high_only" else (0.50,)
-                for q in q_list:
-                    try:
-                        cdf = calibrate_attention_instock_hat(
-                            attn_df,
-                            method=method,
-                            cap_scale=cap,
-                            high_quantile=q,
-                            blend_strength=bs,
-                        )
-
-                        y = cdf["true_instock_dph"].values
-                        p = cdf["calib_instock_dph"].values
-
-                        # long block
-                        long = cdf[cdf["horizon"] >= 13]
-                        ly = long["true_instock_dph"].values
-                        lp = long["calib_instock_dph"].values
-
-                        # low group
-                        asin_sum = cdf.groupby("asin").agg(true_sum=("true_instock_dph", "sum")).reset_index()
-                        asin_sum["exposure_group"] = pd.qcut(
-                            asin_sum["true_sum"].rank(method="first"),
-                            q=3,
-                            labels=["low_true_exposure", "mid_true_exposure", "high_true_exposure"],
-                        )
-                        gdf = cdf.merge(asin_sum[["asin", "exposure_group"]], on="asin", how="left")
-                        low = gdf[gdf["exposure_group"] == "low_true_exposure"]
-                        low_y = low["true_instock_dph"].values
-                        low_p = low["calib_instock_dph"].values
-
-                        rows.append({
-                            "method": method,
-                            "cap_low": cap[0],
-                            "cap_high": cap[1],
-                            "blend_strength": bs,
-                            "high_quantile": q,
-                            "ratio": np.mean(p) / (np.mean(y) + 1e-8),
-                            "WAPE": _wape(y, p),
-                            "Pearson": _corr(y, p),
-                            "Spearman": _safe_spearman(y, p),
-                            "active_AUC": _auc((y > 0).astype(int), p),
-                            "long_ratio": np.mean(lp) / (np.mean(ly) + 1e-8),
-                            "long_WAPE": _wape(ly, lp),
-                            "long_AUC": _auc((ly > 0).astype(int), lp),
-                            "low_ratio": np.mean(low_p) / (np.mean(low_y) + 1e-8),
-                            "low_WAPE": _wape(low_y, low_p),
-                        })
-                    except Exception as e:
-                        rows.append({
-                            "method": method,
-                            "cap_low": cap[0],
-                            "cap_high": cap[1],
-                            "blend_strength": bs,
-                            "high_quantile": q,
-                            "error": str(e),
-                        })
-
-    out = pd.DataFrame(rows)
-    if sort_by in out.columns:
-        out = out.sort_values(sort_by, ascending=True)
-
-    print("\n" + "=" * 100)
-    print("INSTOCK CALIBRATION GRID SEARCH")
-    print("=" * 100)
-
-    show = [
-        "method", "cap_low", "cap_high", "blend_strength", "high_quantile",
-        "ratio", "WAPE", "Pearson", "Spearman", "active_AUC",
-        "long_ratio", "long_WAPE", "long_AUC",
-        "low_ratio", "low_WAPE",
-    ]
-    show = [c for c in show if c in out.columns]
-    print(out[show].head(30).round(5).to_string(index=False))
-
-    return out
-
-
-def make_external_hat_df_with_calibrated_instock(
-    calib_df,
-    use_calibrated_instock=True,
-):
-    """
-    Create exposure_hat_df for demand model.
-
-    Keeps total/buy_box from anchor attention if available.
-    Uses calibrated in_stock if use_calibrated_instock=True.
-
-    Required for demand wrapper:
-      asin, order_week, pred_total_dph, pred_buy_box_dph, pred_instock_dph
-    """
-    df = calib_df.copy()
-
-    if "attn_total_dph" in df.columns:
-        df["pred_total_dph"] = df["attn_total_dph"]
-    elif "pred_total_dph" not in df.columns:
-        raise ValueError("Need attn_total_dph or pred_total_dph.")
-
-    if "attn_buy_box_dph" in df.columns:
-        df["pred_buy_box_dph"] = df["attn_buy_box_dph"]
-    elif "pred_buy_box_dph" not in df.columns:
-        raise ValueError("Need attn_buy_box_dph or pred_buy_box_dph.")
-
-    if use_calibrated_instock:
-        if "calib_instock_dph" not in df.columns:
-            raise ValueError("Need calib_instock_dph. Run calibrate_attention_instock_hat first.")
-        df["pred_instock_dph"] = df["calib_instock_dph"]
-    else:
-        if "attn_instock_dph" in df.columns:
-            df["pred_instock_dph"] = df["attn_instock_dph"]
-
-    cols = [
-        "asin",
-        "order_week",
-        "pred_total_dph",
-        "pred_buy_box_dph",
-        "pred_instock_dph",
-    ]
-
-    for c in [
-        "prob_total_active",
-        "prob_buy_box_active",
-        "prob_instock_active",
-        "prob_demand_active",
-        "calib_scale",
-        "calib_method",
-    ]:
-        if c in df.columns:
-            cols.append(c)
-
-    return df[cols].copy()
-
-
-# ============================================================
-# Example usage:
-# ============================================================
-#
-# attn_df = result_focus["attn_df"]
-#
-# calib_grid = grid_search_instock_calibration(attn_df)
-#
-# best = calib_grid.iloc[0]
-# calib_df = calibrate_attention_instock_hat(
-#     attn_df,
-#     method=best["method"],
-#     cap_scale=(float(best["cap_low"]), float(best["cap_high"])),
-#     high_quantile=float(best["high_quantile"]),
-#     blend_strength=float(best["blend_strength"]),
-# )
-#
-# calib_eval = evaluate_calibrated_instock_hat(calib_df)
-#
-# exposure_hat_for_demand_calib = make_external_hat_df_with_calibrated_instock(calib_df)
-#
-
-
-
-# ============================================================
-# 15. Clean focused prediction with calibration
-# ============================================================
-
-def focused_calibration_report(calib_df):
-    """
-    Clean report for calibrated anchor-attention in_stock_hat.
-
-    Focus:
-      1. attention vs calibrated attention overall
-      2. long horizon h=13-20 improvement
-      3. AUC by horizon
-      4. calibration scale
-    """
-    df = calib_df.copy()
-
-    required = [
-        "true_instock_dph",
-        "pred_instock_dph",
-        "attn_instock_dph",
-        "calib_instock_dph",
-        "pred_instock_dph_last",
-        "pred_instock_dph_mean13",
-        "horizon",
-    ]
-    missing = [c for c in required if c not in df.columns]
-    if missing:
-        raise ValueError(f"Missing columns for focused_calibration_report: {missing}")
-
-    methods = [
-        ("raw_model", "pred_instock_dph"),
-        ("anchor_attention", "attn_instock_dph"),
-        ("calibrated_attention", "calib_instock_dph"),
-        ("naive_last", "pred_instock_dph_last"),
-        ("naive_mean13", "pred_instock_dph_mean13"),
-    ]
-
-    def metric(g, col):
-        y = g["true_instock_dph"].values
-        p = g[col].values
-        return {
-            "ratio": np.mean(p) / (np.mean(y) + 1e-8),
-            "WAPE": _wape(y, p),
-            "Pearson": _corr(y, p),
-            "Spearman": _safe_spearman(y, p),
-            "active_AUC": _auc((y > 0).astype(int), p),
-        }
-
-    print("\n" + "=" * 100)
-    print("A. CALIBRATION OVERALL: IN_STOCK_DPH")
-    print("=" * 100)
-
-    overall_rows = []
-    for name, col in methods:
-        m = metric(df, col)
-        m["method"] = name
-        overall_rows.append(m)
-
-    overall = pd.DataFrame(overall_rows)[
-        ["method", "ratio", "WAPE", "Pearson", "Spearman", "active_AUC"]
-    ]
-    print(overall.round(5).to_string(index=False))
-
-    df["horizon_block"] = pd.cut(
-        df["horizon"],
-        bins=[0, 5, 12, 20],
-        labels=["short_1_5", "mid_6_12", "long_13_20"],
-        include_lowest=True,
-    )
-
-    print("\n" + "=" * 100)
-    print("B. CALIBRATION BY HORIZON BLOCK")
-    print("=" * 100)
-
-    block_rows = []
-    for block, g in df.groupby("horizon_block", observed=True):
-        for name, col in methods:
-            m = metric(g, col)
-            m["block"] = block
-            m["method"] = name
-            block_rows.append(m)
-
-    block_df = pd.DataFrame(block_rows)[
-        ["block", "method", "ratio", "WAPE", "Pearson", "Spearman", "active_AUC"]
-    ]
-    print(block_df.round(5).to_string(index=False))
-
-    print("\n" + "=" * 100)
-    print("C. CALIBRATION ACTIVE_AUC BY HORIZON")
-    print("=" * 100)
-
-    auc_rows = []
-    for h, g in df.groupby("horizon"):
-        y = (g["true_instock_dph"].values > 0).astype(int)
-        row = {"horizon": int(h)}
-        for name, col in [
-            ("raw_AUC", "pred_instock_dph"),
-            ("attn_AUC", "attn_instock_dph"),
-            ("calib_AUC", "calib_instock_dph"),
-            ("last_AUC", "pred_instock_dph_last"),
-            ("mean13_AUC", "pred_instock_dph_mean13"),
-        ]:
-            row[name] = _auc(y, g[col].values)
-
-        row["calib_minus_attn_AUC"] = row["calib_AUC"] - row["attn_AUC"]
-        row["calib_minus_raw_AUC"] = row["calib_AUC"] - row["raw_AUC"]
-        auc_rows.append(row)
-
-    auc_df = pd.DataFrame(auc_rows)
-    print(auc_df.round(5).to_string(index=False))
-
-    print("\n" + "=" * 100)
-    print("D. CALIBRATION IMPROVEMENT SUMMARY")
-    print("=" * 100)
-
-    attn_overall = overall[overall["method"] == "anchor_attention"].iloc[0]
-    calib_overall = overall[overall["method"] == "calibrated_attention"].iloc[0]
-
-    attn_long = block_df[
-        (block_df["block"].astype(str) == "long_13_20")
-        & (block_df["method"] == "anchor_attention")
-    ].iloc[0]
-
-    calib_long = block_df[
-        (block_df["block"].astype(str) == "long_13_20")
-        & (block_df["method"] == "calibrated_attention")
-    ].iloc[0]
-
-    delta = pd.DataFrame([
-        {
-            "scope": "overall",
-            "ratio_before": attn_overall["ratio"],
-            "ratio_after": calib_overall["ratio"],
-            "WAPE_change": calib_overall["WAPE"] - attn_overall["WAPE"],
-            "AUC_change": calib_overall["active_AUC"] - attn_overall["active_AUC"],
-            "Spearman_change": calib_overall["Spearman"] - attn_overall["Spearman"],
-        },
-        {
-            "scope": "long_13_20",
-            "ratio_before": attn_long["ratio"],
-            "ratio_after": calib_long["ratio"],
-            "WAPE_change": calib_long["WAPE"] - attn_long["WAPE"],
-            "AUC_change": calib_long["active_AUC"] - attn_long["active_AUC"],
-            "Spearman_change": calib_long["Spearman"] - attn_long["Spearman"],
-        },
-    ])
-    print(delta.round(5).to_string(index=False))
-
-    print("\nCalibration scale summary:")
-    if "calib_scale" in df.columns:
-        print(df["calib_scale"].describe().round(5).to_string())
-
-    return {
-        "overall": overall,
-        "by_block": block_df,
-        "auc_by_horizon": auc_df,
-        "delta": delta,
-    }
-
-
-def run_attention_focused_with_calibration(
-    data_raw1,
-    scot_df,
-    n_asins=5000,
-    seed=42,
-    history=52,
-    horizon=20,
-    d_model=64,
-    batch_size=64,
-    exposure_epochs=60,
-    exposure_lr=1e-3,
-    exposure_patience=8,
-    attn_epochs=80,
-    attn_batch_size=1024,
-    attn_lr=1e-3,
-    attn_patience=10,
-    attn_hidden=64,
-    attn_dropout=0.10,
-    calib_method="high_only",
-    calib_cap_scale=(0.90, 1.15),
-    calib_high_quantile=0.50,
-    calib_blend_strength=0.75,
-    suppress_full_print=True,
-):
-    """
-    Clean focused pipeline with calibration.
-
-    Step 1:
-      Run direct TCN + anchor attention.
-
-    Step 2:
-      Calibrate attention in_stock_hat.
-      Default is conservative:
-        method = high_only
-        cap_scale = (0.90, 1.15)
-        high_quantile = 0.50
-        blend_strength = 0.75
-
-    Step 3:
-      Print only the focused calibration report.
-
-    Output:
-      result["exposure_hat_for_demand_calib"]
-      can be passed to demand model.
-    """
-    result_focus = run_attention_only_focused(
-        data_raw1=data_raw1,
-        scot_df=scot_df,
-        n_asins=n_asins,
-        seed=seed,
-        history=history,
-        horizon=horizon,
-        d_model=d_model,
-        batch_size=batch_size,
-        exposure_epochs=exposure_epochs,
-        exposure_lr=exposure_lr,
-        exposure_patience=exposure_patience,
-        attn_epochs=attn_epochs,
-        attn_batch_size=attn_batch_size,
-        attn_lr=attn_lr,
-        attn_patience=attn_patience,
-        attn_hidden=attn_hidden,
-        attn_dropout=attn_dropout,
-        suppress_full_print=suppress_full_print,
-    )
-
-    attn_df = result_focus["attn_df"]
-
-    calib_df = calibrate_attention_instock_hat(
-        attn_df,
-        method=calib_method,
-        cap_scale=calib_cap_scale,
-        high_quantile=calib_high_quantile,
-        blend_strength=calib_blend_strength,
-    )
-
-    calib_report = focused_calibration_report(calib_df)
-
-    exposure_hat_for_demand_calib = make_external_hat_df_with_calibrated_instock(
-        calib_df,
-        use_calibrated_instock=True,
-    )
-
-    print("\n" + "=" * 100)
-    print("CALIBRATED OUTPUT READY")
-    print("=" * 100)
-    print("Use result_calib['exposure_hat_for_demand_calib'] for demand model.")
-    print("pred_instock_dph is calibrated normal-scale value, not log.")
-
-    return {
-        "result_focus": result_focus,
-        "attn_df": attn_df,
-        "calib_df": calib_df,
-        "calib_report": calib_report,
-        "exposure_hat_for_demand_calib": exposure_hat_for_demand_calib,
-    }
-
-
-# ============================================================
-# Recommended usage:
-# ============================================================
-#
-# result_calib = run_attention_focused_with_calibration(
-#     data_raw1=data_raw1,
-#     scot_df=scot_df,
-#     n_asins=5000,
-#     seed=42,
-#     history=52,
-#     horizon=20,
-#     calib_method="high_only",
-#     calib_cap_scale=(0.90, 1.15),
-#     calib_high_quantile=0.50,
-#     calib_blend_strength=0.75,
-#     suppress_full_print=True,
-# )
-#
-# exposure_hat_for_demand_calib = result_calib["exposure_hat_for_demand_calib"]
-#
-
-# ============================================================
-# Usage
-# ============================================================
-#
-# result_exp = run_exposure_only(
-#     data_raw1=data_raw1,
-#     scot_df=scot_df,
-#     n_asins=5000,
-#     seed=42,
-#     history=52,
-#     horizon=20,
-#     d_model=64,
-#     batch_size=64,
-#     epochs=60,
-#     lr=1e-3,
-#     patience=8,
-# )
-#
-
-
-
-# ============================================================
-# 16. Exposure-model diagnostics: Anchor Attention vs True
+# CLEAN DIAGNOSTIC: Best Anchor Attention vs True
 # ============================================================
 
 try:
@@ -3581,61 +2788,42 @@ except Exception:
     roc_auc_score = None
 
 
-def _diag_safe_auc(y_binary, score):
+def _clean_auc(y_binary, score):
     y_binary = np.asarray(y_binary).astype(int)
     score = np.asarray(score).astype(float)
-
     mask = np.isfinite(score)
     y_binary = y_binary[mask]
     score = score[mask]
-
     if len(y_binary) == 0 or len(np.unique(y_binary)) < 2:
         return np.nan
-
     if roc_auc_score is None:
         return np.nan
-
     return roc_auc_score(y_binary, score)
 
 
-def _diag_safe_corr(y, p, method="pearson"):
+def _clean_corr(y, p, method="spearman"):
     y = pd.Series(y).astype(float)
     p = pd.Series(p).astype(float)
-
     mask = y.notna() & p.notna()
     y = y[mask]
     p = p[mask]
-
     if len(y) < 3:
         return np.nan
-
     if y.std() <= 1e-12 or p.std() <= 1e-12:
         return np.nan
-
     return y.corr(p, method=method)
 
 
-def get_uncalibrated_anchor_attention_exposure_df(result_obj):
+def _clean_get_best_attn_df(result_obj):
     """
-    Extract the uncalibrated anchor-attention exposure dataframe.
+    Get ONLY the best uncalibrated anchor-attention dataframe.
 
-    Supported inputs:
-      1. result_calib from run_attention_focused_with_calibration(...)
-         Uses:
-             result_calib["result_focus"]["attn_df"]
-         or:
-             result_calib["result_focus"]["exposure_hat_for_demand"]
+    If result_obj is result_calib:
+        use result_calib["result_focus"]["attn_df"] if available
+        otherwise result_calib["result_focus"]["exposure_hat_for_demand"]
 
-      2. result_focus from run_attention_only_focused(...)
-         Uses:
-             result_focus["attn_df"]
-         or:
-             result_focus["exposure_hat_for_demand"]
-
-      3. a dataframe directly.
-
-    This intentionally does NOT use:
-        result_calib["exposure_hat_for_demand_calib"]
+    It does NOT use calibration.
+    It does NOT compare other methods.
     """
     if isinstance(result_obj, dict) and "result_focus" in result_obj:
         rf = result_obj["result_focus"]
@@ -3661,37 +2849,25 @@ def get_uncalibrated_anchor_attention_exposure_df(result_obj):
         source = "dataframe input"
 
     print("\n" + "=" * 100)
-    print("EXPOSURE DIAGNOSTIC INPUT")
+    print("USING BEST MODEL: UNCALIBRATED ANCHOR ATTENTION ONLY")
     print("=" * 100)
-    print("Using:", source)
+    print("Source:", source)
     print("Rows:", len(df))
-    print("This is uncalibrated anchor_attention, not calibration.")
 
     return df
 
 
-def _find_target_columns_for_exposure_diag(df, target):
+def _clean_pick_cols(df, target):
     """
-    Find true / raw / attention / naive columns for exposure diagnostics.
-
-    target examples:
-      total_dph
-      buy_box_dph
-      in_stock_dph
+    Pick true and anchor-attention prediction columns.
     """
     if target == "total_dph":
         true_candidates = ["true_total_dph", "true_future_total_dph", "future_total_dph", "total_dph"]
-        raw_candidates = ["pred_total_dph", "raw_total_dph", "model_total_dph"]
-        attn_candidates = ["attn_total_dph", "pred_total_dph"]
-        last_candidates = ["pred_total_dph_last", "total_dph_last", "last_total_dph"]
-        mean13_candidates = ["pred_total_dph_mean13", "total_dph_mean13", "mean13_total_dph"]
+        pred_candidates = ["attn_total_dph", "pred_total_dph"]
 
     elif target == "buy_box_dph":
         true_candidates = ["true_buy_box_dph", "true_future_buy_box_dph", "future_buy_box_dph", "buy_box_dph"]
-        raw_candidates = ["pred_buy_box_dph", "raw_buy_box_dph", "model_buy_box_dph"]
-        attn_candidates = ["attn_buy_box_dph", "pred_buy_box_dph"]
-        last_candidates = ["pred_buy_box_dph_last", "buy_box_dph_last", "last_buy_box_dph"]
-        mean13_candidates = ["pred_buy_box_dph_mean13", "buy_box_dph_mean13", "mean13_buy_box_dph"]
+        pred_candidates = ["attn_buy_box_dph", "pred_buy_box_dph"]
 
     elif target == "in_stock_dph":
         true_candidates = [
@@ -3699,349 +2875,229 @@ def _find_target_columns_for_exposure_diag(df, target):
             "true_future_instock", "true_future_instock_dph",
             "future_instock", "in_stock_dph"
         ]
-        raw_candidates = [
-            "pred_instock_dph", "pred_in_stock_dph",
-            "raw_instock_dph", "raw_in_stock_dph", "model_instock_dph"
-        ]
-        attn_candidates = [
-            "attn_instock_dph", "attn_in_stock_dph", "pred_instock_dph"
-        ]
-        last_candidates = [
-            "pred_instock_dph_last", "pred_in_stock_dph_last",
-            "in_stock_dph_last", "last_instock_dph"
-        ]
-        mean13_candidates = [
-            "pred_instock_dph_mean13", "pred_in_stock_dph_mean13",
-            "in_stock_dph_mean13", "mean13_instock_dph"
+        pred_candidates = [
+            "attn_instock_dph", "attn_in_stock_dph",
+            "pred_instock_dph", "pred_in_stock_dph"
         ]
 
     else:
-        raise ValueError(f"Unknown target: {target}")
+        raise ValueError("target must be total_dph, buy_box_dph, or in_stock_dph")
 
-    def pick(cands):
-        return next((c for c in cands if c in df.columns), None)
+    true_col = next((c for c in true_candidates if c in df.columns), None)
+    pred_col = next((c for c in pred_candidates if c in df.columns), None)
 
-    cols = {
-        "true": pick(true_candidates),
-        "raw": pick(raw_candidates),
-        "attn": pick(attn_candidates),
-        "last": pick(last_candidates),
-        "mean13": pick(mean13_candidates),
-    }
+    if true_col is None:
+        raise ValueError(f"Cannot find true column for {target}. Available columns: {df.columns.tolist()}")
+    if pred_col is None:
+        raise ValueError(f"Cannot find attention prediction column for {target}. Available columns: {df.columns.tolist()}")
 
-    if cols["true"] is None:
-        raise ValueError(
-            f"Cannot find true column for {target}. "
-            f"Tried {true_candidates}. Available: {df.columns.tolist()}"
-        )
-
-    if cols["attn"] is None:
-        raise ValueError(
-            f"Cannot find anchor-attention/pred column for {target}. "
-            f"Tried {attn_candidates}. Available: {df.columns.tolist()}"
-        )
-
-    return cols
+    return true_col, pred_col
 
 
-def _compute_exposure_metrics(g, true_col, pred_col, active_threshold=0.0):
-    yy = pd.to_numeric(g[true_col], errors="coerce").fillna(0.0).clip(lower=0.0).values
-    pp = pd.to_numeric(g[pred_col], errors="coerce").fillna(0.0).clip(lower=0.0).values
-
+def _clean_metrics(g, true_col, pred_col, active_threshold=0.0):
+    y = pd.to_numeric(g[true_col], errors="coerce").fillna(0.0).clip(lower=0.0).values
+    p = pd.to_numeric(g[pred_col], errors="coerce").fillna(0.0).clip(lower=0.0).values
     eps = 1e-8
 
     return {
         "n": len(g),
-        "true_mean": yy.mean(),
-        "pred_mean": pp.mean(),
-        "ratio": pp.mean() / (yy.mean() + eps),
-        "WAPE": np.abs(pp - yy).sum() / (np.abs(yy).sum() + eps),
-        "MAE": np.abs(pp - yy).mean(),
-        "log_MAE": np.abs(np.log1p(pp) - np.log1p(yy)).mean(),
-        "underbias": np.maximum(yy - pp, 0.0).sum() / (np.abs(yy).sum() + eps),
-        "overbias": np.maximum(pp - yy, 0.0).sum() / (np.abs(yy).sum() + eps),
-        "Pearson": _diag_safe_corr(yy, pp, "pearson"),
-        "Spearman": _diag_safe_corr(yy, pp, "spearman"),
-        "active_rate_true": (yy > active_threshold).mean(),
-        "active_rate_pred_positive": (pp > active_threshold).mean(),
-        "active_AUC": _diag_safe_auc(yy > active_threshold, pp),
-        "p50_true": np.quantile(yy, 0.50),
-        "p50_pred": np.quantile(pp, 0.50),
-        "p90_true": np.quantile(yy, 0.90),
-        "p90_pred": np.quantile(pp, 0.90),
-        "p95_true": np.quantile(yy, 0.95),
-        "p95_pred": np.quantile(pp, 0.95),
+        "true_mean": y.mean(),
+        "pred_mean": p.mean(),
+        "ratio": p.mean() / (y.mean() + eps),
+        "WAPE": np.abs(p - y).sum() / (np.abs(y).sum() + eps),
+        "underbias": np.maximum(y - p, 0.0).sum() / (np.abs(y).sum() + eps),
+        "overbias": np.maximum(p - y, 0.0).sum() / (np.abs(y).sum() + eps),
+        "log_MAE": np.abs(np.log1p(p) - np.log1p(y)).mean(),
+        "active_rate": (y > active_threshold).mean(),
+        "active_AUC": _clean_auc(y > active_threshold, p),
+        "Spearman": _clean_corr(y, p, "spearman"),
+        "Pearson": _clean_corr(y, p, "pearson"),
     }
 
 
-def diagnose_exposure_anchor_attention_target(
-    result_obj,
-    target="in_stock_dph",
-    method="attn",
-    active_threshold=0.0,
-    horizon_col="horizon",
-    asin_col="asin",
-    worst_n=20,
-):
-    """
-    Diagnose one exposure target from the exposure model.
-
-    method:
-      "attn"   = anchor_attention prediction
-      "raw"    = raw TCN/direct model prediction, if available
-      "last"   = naive last anchor, if available
-      "mean13" = naive mean13 anchor, if available
-
-    Main output:
-      1. overall active + magnitude
-      2. h1-h20 active / ranking
-      3. h1-h20 magnitude / level
-      4. low/mid/high true exposure
-      5. ASIN 20-week sum diagnostic
-      6. worst ASINs
-    """
-    df = get_uncalibrated_anchor_attention_exposure_df(result_obj)
-    cols = _find_target_columns_for_exposure_diag(df, target)
-
-    true_col = cols["true"]
-    pred_col = cols.get(method)
-
-    if pred_col is None:
-        raise ValueError(
-            f"Method {method} is unavailable for {target}. "
-            f"Found columns: {cols}"
-        )
-
-    print("\n" + "#" * 110)
-    print(f"EXPOSURE MODEL DIAGNOSTIC | target={target} | method={method}")
-    print("#" * 110)
-    print("true_col:", true_col)
-    print("pred_col:", pred_col)
-    print("available method columns:", cols)
-
-    d = df.copy()
-    d["_true"] = pd.to_numeric(d[true_col], errors="coerce").fillna(0.0).clip(lower=0.0)
-    d["_pred"] = pd.to_numeric(d[pred_col], errors="coerce").fillna(0.0).clip(lower=0.0)
-    d["_abs_err"] = (d["_pred"] - d["_true"]).abs()
-    d["_under"] = np.maximum(d["_true"] - d["_pred"], 0.0)
-    d["_over"] = np.maximum(d["_pred"] - d["_true"], 0.0)
-    d["_active_true"] = (d["_true"] > active_threshold).astype(int)
-
-    overall = pd.DataFrame([_compute_exposure_metrics(
-        d, "_true", "_pred", active_threshold=active_threshold
-    )])
-    overall.insert(0, "target", target)
-    overall.insert(1, "method", method)
-
-    print("\n" + "=" * 100)
-    print("1. OVERALL ACTIVE + MAGNITUDE")
-    print("=" * 100)
-    print(overall.round(5).to_string(index=False))
-
-    by_h = None
-    if horizon_col in d.columns:
-        rows = []
-        for h, g in d.groupby(horizon_col):
-            row = _compute_exposure_metrics(
-                g, "_true", "_pred", active_threshold=active_threshold
-            )
-            row["horizon"] = h
-            rows.append(row)
-
-        by_h = pd.DataFrame(rows).sort_values("horizon")
-
-        print("\n" + "=" * 100)
-        print("2. h1-h20 ACTIVE / RANKING")
-        print("=" * 100)
-        print(by_h[[
-            "horizon", "active_rate_true", "active_AUC", "Pearson", "Spearman"
-        ]].round(5).to_string(index=False))
-
-        print("\n" + "=" * 100)
-        print("3. h1-h20 MAGNITUDE / LEVEL")
-        print("=" * 100)
-        print(by_h[[
-            "horizon", "true_mean", "pred_mean", "ratio",
-            "WAPE", "underbias", "overbias", "log_MAE"
-        ]].round(5).to_string(index=False))
-
-    d["_true_group"] = pd.qcut(
-        d["_true"].rank(method="first"),
-        q=3,
-        labels=["low_true", "mid_true", "high_true"],
-    )
-
-    group_rows = []
-    for grp, g in d.groupby("_true_group", observed=True):
-        row = _compute_exposure_metrics(
-            g, "_true", "_pred", active_threshold=active_threshold
-        )
-        row["group"] = str(grp)
-        group_rows.append(row)
-
-    by_group = pd.DataFrame(group_rows)
-
-    print("\n" + "=" * 100)
-    print("4. LOW / MID / HIGH TRUE EXPOSURE")
-    print("=" * 100)
-    print(by_group[[
-        "group", "n", "true_mean", "pred_mean", "ratio", "WAPE",
-        "underbias", "overbias", "active_AUC", "Pearson", "Spearman"
-    ]].round(5).to_string(index=False))
-
-    asin_diag = None
-    asin_sum = None
-    if asin_col in d.columns:
-        eps = 1e-8
-        asin_sum = (
-            d.groupby(asin_col)
-            .agg(
-                true_20wk_sum=("_true", "sum"),
-                pred_20wk_sum=("_pred", "sum"),
-                abs_err_20wk=("_abs_err", "sum"),
-                under_20wk=("_under", "sum"),
-                over_20wk=("_over", "sum"),
-                active_weeks_true=("_active_true", "sum"),
-                n_weeks=("_true", "size"),
-            )
-            .reset_index()
-        )
-
-        asin_sum["sum_ratio"] = asin_sum["pred_20wk_sum"] / (asin_sum["true_20wk_sum"] + eps)
-        asin_sum["asin_wape"] = asin_sum["abs_err_20wk"] / (asin_sum["true_20wk_sum"] + eps)
-        asin_sum["under_rate"] = asin_sum["under_20wk"] / (asin_sum["true_20wk_sum"] + eps)
-        asin_sum["over_rate"] = asin_sum["over_20wk"] / (asin_sum["true_20wk_sum"] + eps)
-
-        asin_diag = pd.DataFrame([{
-            "n_asins": asin_sum[asin_col].nunique(),
-            "asin_sum_Pearson": _diag_safe_corr(
-                asin_sum["true_20wk_sum"], asin_sum["pred_20wk_sum"], "pearson"
-            ),
-            "asin_sum_Spearman": _diag_safe_corr(
-                asin_sum["true_20wk_sum"], asin_sum["pred_20wk_sum"], "spearman"
-            ),
-            "median_asin_wape": asin_sum["asin_wape"].median(),
-            "p75_asin_wape": asin_sum["asin_wape"].quantile(0.75),
-            "p90_asin_wape": asin_sum["asin_wape"].quantile(0.90),
-            "p95_asin_wape": asin_sum["asin_wape"].quantile(0.95),
-            "median_sum_ratio": asin_sum["sum_ratio"].median(),
-            "p10_sum_ratio": asin_sum["sum_ratio"].quantile(0.10),
-            "p90_sum_ratio": asin_sum["sum_ratio"].quantile(0.90),
-        }])
-
-        print("\n" + "=" * 100)
-        print("5. ASIN-LEVEL 20-WEEK SUM")
-        print("=" * 100)
-        print(asin_diag.round(5).to_string(index=False))
-
-        print("\nWorst ASINs by absolute 20-week error:")
-        print(asin_sum.sort_values("abs_err_20wk", ascending=False).head(worst_n).round(4).to_string(index=False))
-
-        print("\nWorst ASINs by ASIN WAPE:")
-        print(asin_sum.sort_values("asin_wape", ascending=False).head(worst_n).round(4).to_string(index=False))
-
-    print("\n" + "=" * 100)
-    print("6. QUICK JUDGMENT")
-    print("=" * 100)
-    o = overall.iloc[0]
-    print(f"{target} ratio:       {o['ratio']:.4f}")
-    print(f"{target} WAPE:        {o['WAPE']:.4f}")
-    print(f"{target} underbias:   {o['underbias']:.4f}")
-    print(f"{target} overbias:    {o['overbias']:.4f}")
-    print(f"{target} active_AUC:  {o['active_AUC']:.4f}")
-    print(f"{target} Spearman:    {o['Spearman']:.4f}")
-
-    if asin_diag is not None:
-        a = asin_diag.iloc[0]
-        print(f"{target} ASIN-sum Spearman: {a['asin_sum_Spearman']:.4f}")
-        print(f"{target} p90 ASIN WAPE:    {a['p90_asin_wape']:.4f}")
-
-    return {
-        "target": target,
-        "method": method,
-        "true_col": true_col,
-        "pred_col": pred_col,
-        "overall": overall,
-        "by_horizon": by_h,
-        "by_true_group": by_group,
-        "asin_diag": asin_diag,
-        "asin_sum": asin_sum,
-        "scored_df": d,
-    }
-
-
-def diagnose_exposure_anchor_attention_all_targets(
+def diagnose_best_anchor_attention_vs_true(
     result_obj,
     targets=("total_dph", "buy_box_dph", "in_stock_dph"),
-    method="attn",
+    horizon_col="horizon",
+    asin_col="asin",
     active_threshold=0.0,
 ):
     """
-    Run exposure-model diagnostics for all three exposure targets.
+    Clean diagnostic for the best exposure model only:
+        Direct TCN + Anchor Attention
+        No calibration
+        No raw model comparison
+        No last/mean baseline comparison
 
-    Default method = "attn":
-        uncalibrated anchor_attention.
+    Outputs exactly three diagnostic dimensions:
+      1. length / horizon h1-h20
+      2. active
+      3. magnitude
+
+    Plus compact ASIN 20-week summary.
     """
-    results = {}
+    df = _clean_get_best_attn_df(result_obj)
+
+    all_results = {}
+    summary_rows = []
+
     for target in targets:
-        results[target] = diagnose_exposure_anchor_attention_target(
-            result_obj=result_obj,
-            target=target,
-            method=method,
-            active_threshold=active_threshold,
+        true_col, pred_col = _clean_pick_cols(df, target)
+
+        print("\n" + "#" * 100)
+        print(f"TARGET: {target}")
+        print("#" * 100)
+        print("true_col:", true_col)
+        print("pred_col:", pred_col)
+
+        d = df.copy()
+        d["_true"] = pd.to_numeric(d[true_col], errors="coerce").fillna(0.0).clip(lower=0.0)
+        d["_pred"] = pd.to_numeric(d[pred_col], errors="coerce").fillna(0.0).clip(lower=0.0)
+
+        overall = pd.DataFrame([_clean_metrics(d, "_true", "_pred", active_threshold)])
+        overall.insert(0, "target", target)
+
+        print("\nOVERALL")
+        print(overall.round(5).to_string(index=False))
+
+        # 1. Length / horizon h1-h20
+        length_table = None
+        active_table = None
+        mag_table = None
+
+        if horizon_col in d.columns:
+            rows = []
+            for h, g in d.groupby(horizon_col):
+                row = _clean_metrics(g, "_true", "_pred", active_threshold)
+                row["horizon"] = h
+                rows.append(row)
+
+            by_h = pd.DataFrame(rows).sort_values("horizon")
+
+            length_table = by_h[[
+                "horizon", "n", "true_mean", "pred_mean", "ratio", "WAPE"
+            ]].copy()
+
+            active_table = by_h[[
+                "horizon", "active_rate", "active_AUC", "Spearman", "Pearson"
+            ]].copy()
+
+            mag_table = by_h[[
+                "horizon", "true_mean", "pred_mean", "ratio",
+                "WAPE", "underbias", "overbias", "log_MAE"
+            ]].copy()
+
+            print("\n1. LENGTH / HORIZON h1-h20")
+            print(length_table.round(5).to_string(index=False))
+
+            print("\n2. ACTIVE BY HORIZON")
+            print(active_table.round(5).to_string(index=False))
+
+            print("\n3. MAGNITUDE BY HORIZON")
+            print(mag_table.round(5).to_string(index=False))
+
+        else:
+            print(f"\nNo horizon column found: {horizon_col}")
+
+        # True magnitude groups: low/mid/high
+        d["_true_group"] = pd.qcut(
+            d["_true"].rank(method="first"),
+            q=3,
+            labels=["low_true", "mid_true", "high_true"],
         )
 
-    rows = []
-    for target, res in results.items():
-        o = res["overall"].iloc[0]
-        row = {
+        group_rows = []
+        for grp, g in d.groupby("_true_group", observed=True):
+            row = _clean_metrics(g, "_true", "_pred", active_threshold)
+            row["group"] = str(grp)
+            group_rows.append(row)
+
+        group_table = pd.DataFrame(group_rows)[[
+            "group", "n", "true_mean", "pred_mean", "ratio",
+            "WAPE", "underbias", "overbias", "active_AUC", "Spearman"
+        ]]
+
+        print("\nMAGNITUDE GROUP: LOW / MID / HIGH TRUE")
+        print(group_table.round(5).to_string(index=False))
+
+        # ASIN-level 20-week sum
+        asin_table = None
+        if asin_col in d.columns:
+            eps = 1e-8
+            asin_sum = (
+                d.groupby(asin_col)
+                .agg(
+                    true_sum=("_true", "sum"),
+                    pred_sum=("_pred", "sum"),
+                )
+                .reset_index()
+            )
+            asin_sum["abs_err"] = (asin_sum["pred_sum"] - asin_sum["true_sum"]).abs()
+            asin_sum["ratio"] = asin_sum["pred_sum"] / (asin_sum["true_sum"] + eps)
+            asin_sum["asin_wape"] = asin_sum["abs_err"] / (asin_sum["true_sum"] + eps)
+
+            asin_table = pd.DataFrame([{
+                "target": target,
+                "n_asins": asin_sum[asin_col].nunique(),
+                "asin_sum_Spearman": _clean_corr(asin_sum["true_sum"], asin_sum["pred_sum"], "spearman"),
+                "asin_sum_Pearson": _clean_corr(asin_sum["true_sum"], asin_sum["pred_sum"], "pearson"),
+                "median_asin_wape": asin_sum["asin_wape"].median(),
+                "p75_asin_wape": asin_sum["asin_wape"].quantile(0.75),
+                "p90_asin_wape": asin_sum["asin_wape"].quantile(0.90),
+                "median_sum_ratio": asin_sum["ratio"].median(),
+            }])
+
+            print("\nASIN 20-WEEK SUM")
+            print(asin_table.round(5).to_string(index=False))
+
+        o = overall.iloc[0]
+        summary_row = {
             "target": target,
-            "method": method,
             "ratio": o["ratio"],
             "WAPE": o["WAPE"],
             "underbias": o["underbias"],
             "overbias": o["overbias"],
             "active_AUC": o["active_AUC"],
-            "Pearson": o["Pearson"],
             "Spearman": o["Spearman"],
         }
 
-        if res["asin_diag"] is not None:
-            a = res["asin_diag"].iloc[0]
-            row["asin_sum_Spearman"] = a["asin_sum_Spearman"]
-            row["p90_asin_wape"] = a["p90_asin_wape"]
+        if asin_table is not None:
+            a = asin_table.iloc[0]
+            summary_row["asin_sum_Spearman"] = a["asin_sum_Spearman"]
+            summary_row["p90_asin_wape"] = a["p90_asin_wape"]
 
-        rows.append(row)
+        summary_rows.append(summary_row)
 
-    summary = pd.DataFrame(rows)
+        all_results[target] = {
+            "overall": overall,
+            "length_by_horizon": length_table,
+            "active_by_horizon": active_table,
+            "magnitude_by_horizon": mag_table,
+            "group_table": group_table,
+            "asin_table": asin_table,
+            "scored_df": d,
+        }
 
-    print("\n" + "#" * 110)
-    print("COMPACT SUMMARY: EXPOSURE MODEL DIAGNOSTICS")
-    print("#" * 110)
+    summary = pd.DataFrame(summary_rows)
+
+    print("\n" + "#" * 100)
+    print("FINAL COMPACT SUMMARY")
+    print("#" * 100)
     print(summary.round(5).to_string(index=False))
 
-    results["summary"] = summary
-    return results
+    all_results["summary"] = summary
+    return all_results
 
 
 # ============================================================
-# Recommended diagnostic usage
+# Only usage you need
 # ============================================================
 #
-# # All three exposure targets, using uncalibrated anchor_attention:
-# exposure_diag = diagnose_exposure_anchor_attention_all_targets(result_calib)
+# exposure_diag = diagnose_best_anchor_attention_vs_true(result_calib)
 #
-# # Focus on in_stock only:
-# instock_diag = diagnose_exposure_anchor_attention_target(
-#     result_obj=result_calib,
-#     target="in_stock_dph",
-#     method="attn",
-# )
-#
-# # Compare raw model if available:
-# instock_raw_diag = diagnose_exposure_anchor_attention_target(
-#     result_obj=result_calib,
-#     target="in_stock_dph",
-#     method="raw",
+# If only in_stock:
+# exposure_diag_instock = diagnose_best_anchor_attention_vs_true(
+#     result_calib,
+#     targets=("in_stock_dph",),
 # )
 #
