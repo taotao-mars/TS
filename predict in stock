@@ -3568,3 +3568,480 @@ def run_attention_focused_with_calibration(
 #     patience=8,
 # )
 #
+
+
+
+# ============================================================
+# 16. Exposure-model diagnostics: Anchor Attention vs True
+# ============================================================
+
+try:
+    from sklearn.metrics import roc_auc_score
+except Exception:
+    roc_auc_score = None
+
+
+def _diag_safe_auc(y_binary, score):
+    y_binary = np.asarray(y_binary).astype(int)
+    score = np.asarray(score).astype(float)
+
+    mask = np.isfinite(score)
+    y_binary = y_binary[mask]
+    score = score[mask]
+
+    if len(y_binary) == 0 or len(np.unique(y_binary)) < 2:
+        return np.nan
+
+    if roc_auc_score is None:
+        return np.nan
+
+    return roc_auc_score(y_binary, score)
+
+
+def _diag_safe_corr(y, p, method="pearson"):
+    y = pd.Series(y).astype(float)
+    p = pd.Series(p).astype(float)
+
+    mask = y.notna() & p.notna()
+    y = y[mask]
+    p = p[mask]
+
+    if len(y) < 3:
+        return np.nan
+
+    if y.std() <= 1e-12 or p.std() <= 1e-12:
+        return np.nan
+
+    return y.corr(p, method=method)
+
+
+def get_uncalibrated_anchor_attention_exposure_df(result_obj):
+    """
+    Extract the uncalibrated anchor-attention exposure dataframe.
+
+    Supported inputs:
+      1. result_calib from run_attention_focused_with_calibration(...)
+         Uses:
+             result_calib["result_focus"]["attn_df"]
+         or:
+             result_calib["result_focus"]["exposure_hat_for_demand"]
+
+      2. result_focus from run_attention_only_focused(...)
+         Uses:
+             result_focus["attn_df"]
+         or:
+             result_focus["exposure_hat_for_demand"]
+
+      3. a dataframe directly.
+
+    This intentionally does NOT use:
+        result_calib["exposure_hat_for_demand_calib"]
+    """
+    if isinstance(result_obj, dict) and "result_focus" in result_obj:
+        rf = result_obj["result_focus"]
+        if isinstance(rf, dict) and "attn_df" in rf:
+            df = rf["attn_df"].copy()
+            source = "result_calib['result_focus']['attn_df']"
+        elif isinstance(rf, dict) and "exposure_hat_for_demand" in rf:
+            df = rf["exposure_hat_for_demand"].copy()
+            source = "result_calib['result_focus']['exposure_hat_for_demand']"
+        else:
+            raise ValueError("result_calib['result_focus'] has no attn_df or exposure_hat_for_demand.")
+
+    elif isinstance(result_obj, dict) and "attn_df" in result_obj:
+        df = result_obj["attn_df"].copy()
+        source = "result_focus['attn_df']"
+
+    elif isinstance(result_obj, dict) and "exposure_hat_for_demand" in result_obj:
+        df = result_obj["exposure_hat_for_demand"].copy()
+        source = "result_focus['exposure_hat_for_demand']"
+
+    else:
+        df = result_obj.copy()
+        source = "dataframe input"
+
+    print("\n" + "=" * 100)
+    print("EXPOSURE DIAGNOSTIC INPUT")
+    print("=" * 100)
+    print("Using:", source)
+    print("Rows:", len(df))
+    print("This is uncalibrated anchor_attention, not calibration.")
+
+    return df
+
+
+def _find_target_columns_for_exposure_diag(df, target):
+    """
+    Find true / raw / attention / naive columns for exposure diagnostics.
+
+    target examples:
+      total_dph
+      buy_box_dph
+      in_stock_dph
+    """
+    if target == "total_dph":
+        true_candidates = ["true_total_dph", "true_future_total_dph", "future_total_dph", "total_dph"]
+        raw_candidates = ["pred_total_dph", "raw_total_dph", "model_total_dph"]
+        attn_candidates = ["attn_total_dph", "pred_total_dph"]
+        last_candidates = ["pred_total_dph_last", "total_dph_last", "last_total_dph"]
+        mean13_candidates = ["pred_total_dph_mean13", "total_dph_mean13", "mean13_total_dph"]
+
+    elif target == "buy_box_dph":
+        true_candidates = ["true_buy_box_dph", "true_future_buy_box_dph", "future_buy_box_dph", "buy_box_dph"]
+        raw_candidates = ["pred_buy_box_dph", "raw_buy_box_dph", "model_buy_box_dph"]
+        attn_candidates = ["attn_buy_box_dph", "pred_buy_box_dph"]
+        last_candidates = ["pred_buy_box_dph_last", "buy_box_dph_last", "last_buy_box_dph"]
+        mean13_candidates = ["pred_buy_box_dph_mean13", "buy_box_dph_mean13", "mean13_buy_box_dph"]
+
+    elif target == "in_stock_dph":
+        true_candidates = [
+            "true_instock_dph", "true_in_stock_dph",
+            "true_future_instock", "true_future_instock_dph",
+            "future_instock", "in_stock_dph"
+        ]
+        raw_candidates = [
+            "pred_instock_dph", "pred_in_stock_dph",
+            "raw_instock_dph", "raw_in_stock_dph", "model_instock_dph"
+        ]
+        attn_candidates = [
+            "attn_instock_dph", "attn_in_stock_dph", "pred_instock_dph"
+        ]
+        last_candidates = [
+            "pred_instock_dph_last", "pred_in_stock_dph_last",
+            "in_stock_dph_last", "last_instock_dph"
+        ]
+        mean13_candidates = [
+            "pred_instock_dph_mean13", "pred_in_stock_dph_mean13",
+            "in_stock_dph_mean13", "mean13_instock_dph"
+        ]
+
+    else:
+        raise ValueError(f"Unknown target: {target}")
+
+    def pick(cands):
+        return next((c for c in cands if c in df.columns), None)
+
+    cols = {
+        "true": pick(true_candidates),
+        "raw": pick(raw_candidates),
+        "attn": pick(attn_candidates),
+        "last": pick(last_candidates),
+        "mean13": pick(mean13_candidates),
+    }
+
+    if cols["true"] is None:
+        raise ValueError(
+            f"Cannot find true column for {target}. "
+            f"Tried {true_candidates}. Available: {df.columns.tolist()}"
+        )
+
+    if cols["attn"] is None:
+        raise ValueError(
+            f"Cannot find anchor-attention/pred column for {target}. "
+            f"Tried {attn_candidates}. Available: {df.columns.tolist()}"
+        )
+
+    return cols
+
+
+def _compute_exposure_metrics(g, true_col, pred_col, active_threshold=0.0):
+    yy = pd.to_numeric(g[true_col], errors="coerce").fillna(0.0).clip(lower=0.0).values
+    pp = pd.to_numeric(g[pred_col], errors="coerce").fillna(0.0).clip(lower=0.0).values
+
+    eps = 1e-8
+
+    return {
+        "n": len(g),
+        "true_mean": yy.mean(),
+        "pred_mean": pp.mean(),
+        "ratio": pp.mean() / (yy.mean() + eps),
+        "WAPE": np.abs(pp - yy).sum() / (np.abs(yy).sum() + eps),
+        "MAE": np.abs(pp - yy).mean(),
+        "log_MAE": np.abs(np.log1p(pp) - np.log1p(yy)).mean(),
+        "underbias": np.maximum(yy - pp, 0.0).sum() / (np.abs(yy).sum() + eps),
+        "overbias": np.maximum(pp - yy, 0.0).sum() / (np.abs(yy).sum() + eps),
+        "Pearson": _diag_safe_corr(yy, pp, "pearson"),
+        "Spearman": _diag_safe_corr(yy, pp, "spearman"),
+        "active_rate_true": (yy > active_threshold).mean(),
+        "active_rate_pred_positive": (pp > active_threshold).mean(),
+        "active_AUC": _diag_safe_auc(yy > active_threshold, pp),
+        "p50_true": np.quantile(yy, 0.50),
+        "p50_pred": np.quantile(pp, 0.50),
+        "p90_true": np.quantile(yy, 0.90),
+        "p90_pred": np.quantile(pp, 0.90),
+        "p95_true": np.quantile(yy, 0.95),
+        "p95_pred": np.quantile(pp, 0.95),
+    }
+
+
+def diagnose_exposure_anchor_attention_target(
+    result_obj,
+    target="in_stock_dph",
+    method="attn",
+    active_threshold=0.0,
+    horizon_col="horizon",
+    asin_col="asin",
+    worst_n=20,
+):
+    """
+    Diagnose one exposure target from the exposure model.
+
+    method:
+      "attn"   = anchor_attention prediction
+      "raw"    = raw TCN/direct model prediction, if available
+      "last"   = naive last anchor, if available
+      "mean13" = naive mean13 anchor, if available
+
+    Main output:
+      1. overall active + magnitude
+      2. h1-h20 active / ranking
+      3. h1-h20 magnitude / level
+      4. low/mid/high true exposure
+      5. ASIN 20-week sum diagnostic
+      6. worst ASINs
+    """
+    df = get_uncalibrated_anchor_attention_exposure_df(result_obj)
+    cols = _find_target_columns_for_exposure_diag(df, target)
+
+    true_col = cols["true"]
+    pred_col = cols.get(method)
+
+    if pred_col is None:
+        raise ValueError(
+            f"Method {method} is unavailable for {target}. "
+            f"Found columns: {cols}"
+        )
+
+    print("\n" + "#" * 110)
+    print(f"EXPOSURE MODEL DIAGNOSTIC | target={target} | method={method}")
+    print("#" * 110)
+    print("true_col:", true_col)
+    print("pred_col:", pred_col)
+    print("available method columns:", cols)
+
+    d = df.copy()
+    d["_true"] = pd.to_numeric(d[true_col], errors="coerce").fillna(0.0).clip(lower=0.0)
+    d["_pred"] = pd.to_numeric(d[pred_col], errors="coerce").fillna(0.0).clip(lower=0.0)
+    d["_abs_err"] = (d["_pred"] - d["_true"]).abs()
+    d["_under"] = np.maximum(d["_true"] - d["_pred"], 0.0)
+    d["_over"] = np.maximum(d["_pred"] - d["_true"], 0.0)
+    d["_active_true"] = (d["_true"] > active_threshold).astype(int)
+
+    overall = pd.DataFrame([_compute_exposure_metrics(
+        d, "_true", "_pred", active_threshold=active_threshold
+    )])
+    overall.insert(0, "target", target)
+    overall.insert(1, "method", method)
+
+    print("\n" + "=" * 100)
+    print("1. OVERALL ACTIVE + MAGNITUDE")
+    print("=" * 100)
+    print(overall.round(5).to_string(index=False))
+
+    by_h = None
+    if horizon_col in d.columns:
+        rows = []
+        for h, g in d.groupby(horizon_col):
+            row = _compute_exposure_metrics(
+                g, "_true", "_pred", active_threshold=active_threshold
+            )
+            row["horizon"] = h
+            rows.append(row)
+
+        by_h = pd.DataFrame(rows).sort_values("horizon")
+
+        print("\n" + "=" * 100)
+        print("2. h1-h20 ACTIVE / RANKING")
+        print("=" * 100)
+        print(by_h[[
+            "horizon", "active_rate_true", "active_AUC", "Pearson", "Spearman"
+        ]].round(5).to_string(index=False))
+
+        print("\n" + "=" * 100)
+        print("3. h1-h20 MAGNITUDE / LEVEL")
+        print("=" * 100)
+        print(by_h[[
+            "horizon", "true_mean", "pred_mean", "ratio",
+            "WAPE", "underbias", "overbias", "log_MAE"
+        ]].round(5).to_string(index=False))
+
+    d["_true_group"] = pd.qcut(
+        d["_true"].rank(method="first"),
+        q=3,
+        labels=["low_true", "mid_true", "high_true"],
+    )
+
+    group_rows = []
+    for grp, g in d.groupby("_true_group", observed=True):
+        row = _compute_exposure_metrics(
+            g, "_true", "_pred", active_threshold=active_threshold
+        )
+        row["group"] = str(grp)
+        group_rows.append(row)
+
+    by_group = pd.DataFrame(group_rows)
+
+    print("\n" + "=" * 100)
+    print("4. LOW / MID / HIGH TRUE EXPOSURE")
+    print("=" * 100)
+    print(by_group[[
+        "group", "n", "true_mean", "pred_mean", "ratio", "WAPE",
+        "underbias", "overbias", "active_AUC", "Pearson", "Spearman"
+    ]].round(5).to_string(index=False))
+
+    asin_diag = None
+    asin_sum = None
+    if asin_col in d.columns:
+        eps = 1e-8
+        asin_sum = (
+            d.groupby(asin_col)
+            .agg(
+                true_20wk_sum=("_true", "sum"),
+                pred_20wk_sum=("_pred", "sum"),
+                abs_err_20wk=("_abs_err", "sum"),
+                under_20wk=("_under", "sum"),
+                over_20wk=("_over", "sum"),
+                active_weeks_true=("_active_true", "sum"),
+                n_weeks=("_true", "size"),
+            )
+            .reset_index()
+        )
+
+        asin_sum["sum_ratio"] = asin_sum["pred_20wk_sum"] / (asin_sum["true_20wk_sum"] + eps)
+        asin_sum["asin_wape"] = asin_sum["abs_err_20wk"] / (asin_sum["true_20wk_sum"] + eps)
+        asin_sum["under_rate"] = asin_sum["under_20wk"] / (asin_sum["true_20wk_sum"] + eps)
+        asin_sum["over_rate"] = asin_sum["over_20wk"] / (asin_sum["true_20wk_sum"] + eps)
+
+        asin_diag = pd.DataFrame([{
+            "n_asins": asin_sum[asin_col].nunique(),
+            "asin_sum_Pearson": _diag_safe_corr(
+                asin_sum["true_20wk_sum"], asin_sum["pred_20wk_sum"], "pearson"
+            ),
+            "asin_sum_Spearman": _diag_safe_corr(
+                asin_sum["true_20wk_sum"], asin_sum["pred_20wk_sum"], "spearman"
+            ),
+            "median_asin_wape": asin_sum["asin_wape"].median(),
+            "p75_asin_wape": asin_sum["asin_wape"].quantile(0.75),
+            "p90_asin_wape": asin_sum["asin_wape"].quantile(0.90),
+            "p95_asin_wape": asin_sum["asin_wape"].quantile(0.95),
+            "median_sum_ratio": asin_sum["sum_ratio"].median(),
+            "p10_sum_ratio": asin_sum["sum_ratio"].quantile(0.10),
+            "p90_sum_ratio": asin_sum["sum_ratio"].quantile(0.90),
+        }])
+
+        print("\n" + "=" * 100)
+        print("5. ASIN-LEVEL 20-WEEK SUM")
+        print("=" * 100)
+        print(asin_diag.round(5).to_string(index=False))
+
+        print("\nWorst ASINs by absolute 20-week error:")
+        print(asin_sum.sort_values("abs_err_20wk", ascending=False).head(worst_n).round(4).to_string(index=False))
+
+        print("\nWorst ASINs by ASIN WAPE:")
+        print(asin_sum.sort_values("asin_wape", ascending=False).head(worst_n).round(4).to_string(index=False))
+
+    print("\n" + "=" * 100)
+    print("6. QUICK JUDGMENT")
+    print("=" * 100)
+    o = overall.iloc[0]
+    print(f"{target} ratio:       {o['ratio']:.4f}")
+    print(f"{target} WAPE:        {o['WAPE']:.4f}")
+    print(f"{target} underbias:   {o['underbias']:.4f}")
+    print(f"{target} overbias:    {o['overbias']:.4f}")
+    print(f"{target} active_AUC:  {o['active_AUC']:.4f}")
+    print(f"{target} Spearman:    {o['Spearman']:.4f}")
+
+    if asin_diag is not None:
+        a = asin_diag.iloc[0]
+        print(f"{target} ASIN-sum Spearman: {a['asin_sum_Spearman']:.4f}")
+        print(f"{target} p90 ASIN WAPE:    {a['p90_asin_wape']:.4f}")
+
+    return {
+        "target": target,
+        "method": method,
+        "true_col": true_col,
+        "pred_col": pred_col,
+        "overall": overall,
+        "by_horizon": by_h,
+        "by_true_group": by_group,
+        "asin_diag": asin_diag,
+        "asin_sum": asin_sum,
+        "scored_df": d,
+    }
+
+
+def diagnose_exposure_anchor_attention_all_targets(
+    result_obj,
+    targets=("total_dph", "buy_box_dph", "in_stock_dph"),
+    method="attn",
+    active_threshold=0.0,
+):
+    """
+    Run exposure-model diagnostics for all three exposure targets.
+
+    Default method = "attn":
+        uncalibrated anchor_attention.
+    """
+    results = {}
+    for target in targets:
+        results[target] = diagnose_exposure_anchor_attention_target(
+            result_obj=result_obj,
+            target=target,
+            method=method,
+            active_threshold=active_threshold,
+        )
+
+    rows = []
+    for target, res in results.items():
+        o = res["overall"].iloc[0]
+        row = {
+            "target": target,
+            "method": method,
+            "ratio": o["ratio"],
+            "WAPE": o["WAPE"],
+            "underbias": o["underbias"],
+            "overbias": o["overbias"],
+            "active_AUC": o["active_AUC"],
+            "Pearson": o["Pearson"],
+            "Spearman": o["Spearman"],
+        }
+
+        if res["asin_diag"] is not None:
+            a = res["asin_diag"].iloc[0]
+            row["asin_sum_Spearman"] = a["asin_sum_Spearman"]
+            row["p90_asin_wape"] = a["p90_asin_wape"]
+
+        rows.append(row)
+
+    summary = pd.DataFrame(rows)
+
+    print("\n" + "#" * 110)
+    print("COMPACT SUMMARY: EXPOSURE MODEL DIAGNOSTICS")
+    print("#" * 110)
+    print(summary.round(5).to_string(index=False))
+
+    results["summary"] = summary
+    return results
+
+
+# ============================================================
+# Recommended diagnostic usage
+# ============================================================
+#
+# # All three exposure targets, using uncalibrated anchor_attention:
+# exposure_diag = diagnose_exposure_anchor_attention_all_targets(result_calib)
+#
+# # Focus on in_stock only:
+# instock_diag = diagnose_exposure_anchor_attention_target(
+#     result_obj=result_calib,
+#     target="in_stock_dph",
+#     method="attn",
+# )
+#
+# # Compare raw model if available:
+# instock_raw_diag = diagnose_exposure_anchor_attention_target(
+#     result_obj=result_calib,
+#     target="in_stock_dph",
+#     method="raw",
+# )
+#
